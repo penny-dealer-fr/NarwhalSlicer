@@ -337,6 +337,8 @@ set(SLIC3R_GUI_SOURCES
     GUI/LinuxDisplayBackend.hpp
     GUI/MainFrame.cpp
     GUI/MainFrame.hpp
+    GUI/StrengthAnalysisPanel.cpp
+    GUI/StrengthAnalysisPanel.hpp
     GUI/MarkdownTip.cpp
     GUI/MarkdownTip.hpp
     GUI/MediaFilePanel.cpp

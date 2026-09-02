@@ -8193,6 +8193,13 @@ void PrintConfigDef::init_fff_params()
                      "Otherwise, the rectilinear pattern will be used by default.");
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionBool(true));
+
+    def = this->add("strength_analysis_setup", coString);
+    def->label = L("Strength analysis setup");
+    def->tooltip = L("Versioned load, material, infill, and optimization inputs used by the offline Strength Analysis workflow.");
+    def->mode = comDevelop;
+    def->cli = ConfigOptionDef::nocli;
+    def->set_default_value(new ConfigOptionString());
 }
 
 void PrintConfigDef::init_extruder_option_keys()

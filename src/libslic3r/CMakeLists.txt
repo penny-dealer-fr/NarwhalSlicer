@@ -391,6 +391,8 @@ set(lisbslic3r_sources
     ShortEdgeCollapse.hpp
     ShortestPath.cpp
     ShortestPath.hpp
+    StrengthAnalysis.cpp
+    StrengthAnalysis.hpp
     SLA/AGGRaster.hpp
     SLA/BoostAdapter.hpp
     SLA/Clustering.cpp

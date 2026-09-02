@@ -13,6 +13,7 @@
 
 #include <string>
 #include <map>
+#include <memory>
 
 #include "GUI_Utils.hpp"
 #include "Event.hpp"
@@ -50,6 +51,8 @@
 #define TAB_ID_MULTI_DEVICE  "multi_device"
 #define TAB_ID_PROJECT       "project"
 #define TAB_ID_CALIBRATION   "calibration"
+#define TAB_ID_STRENGTH_LOAD "strength_load"
+#define TAB_ID_STRENGTH_SIMULATION "strength_simulation"
 
 #define ENABEL_PRINT_ALL 0
 
@@ -67,6 +70,9 @@ class PrintHostQueueDialog;
 class Plater;
 class MainFrame;
 class ParamsDialog;
+class StrengthLoadPanel;
+class StrengthSimulationPanel;
+struct StrengthAnalysisSession;
 #ifdef __WXGTK__
 class ResizeEdgePanel;
 #endif
@@ -398,6 +404,9 @@ public:
     wxBoxSizer*           m_side_tools{ nullptr };
     ParamsPanel*          m_param_panel{ nullptr };
     ParamsDialog*         m_param_dialog{ nullptr };
+    std::shared_ptr<StrengthAnalysisSession> m_strength_session;
+    StrengthLoadPanel*       m_strength_load_panel{nullptr};
+    StrengthSimulationPanel* m_strength_simulation_panel{nullptr};
     //BBS
     SettingsDialog        m_settings_dialog;
     DiffPresetDialog      diff_dialog;

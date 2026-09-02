@@ -37,6 +37,7 @@
 #include "I18N.hpp"
 #include "GLCanvas3D.hpp"
 #include "Plater.hpp"
+#include "StrengthAnalysisPanel.hpp"
 #include "WebViewDialog.hpp"
 #include "../Utils/Process.hpp"
 #include "format.hpp"
@@ -1020,7 +1021,13 @@ void MainFrame::update_layout()
         const int home_idx = m_tabpanel->FindPageByName(TAB_ID_HOME);
         const size_t prepare_pos = (home_idx == wxNOT_FOUND) ? 0 : static_cast<size_t>(home_idx) + 1;
         m_tabpanel->InsertPage(prepare_pos, TAB_ID_PREPARE, m_plater, _L("Prepare"), "tab_3d_active");
-        m_tabpanel->InsertPage(prepare_pos + 1, TAB_ID_PREVIEW, m_plater, _L("Preview"), "tab_preview_active");
+        if (m_tabpanel->FindPageByName(TAB_ID_STRENGTH_LOAD) == wxNOT_FOUND)
+            m_tabpanel->InsertPage(prepare_pos + 1, TAB_ID_STRENGTH_LOAD, m_strength_load_panel,
+                                   _L("Load"), "tab_3d_active");
+        if (m_tabpanel->FindPageByName(TAB_ID_STRENGTH_SIMULATION) == wxNOT_FOUND)
+            m_tabpanel->InsertPage(prepare_pos + 2, TAB_ID_STRENGTH_SIMULATION, m_strength_simulation_panel,
+                                   _L("Simulation"), "tab_preview_active");
+        m_tabpanel->InsertPage(prepare_pos + 3, TAB_ID_PREVIEW, m_plater, _L("Preview"), "tab_preview_active");
         m_main_sizer->Add(m_tabpanel, 1, wxEXPAND | wxTOP, 0);
 
         m_tabpanel->Bind(wxCUSTOMEVT_NOTEBOOK_SEL_CHANGED, [this](wxCommandEvent& evt)
@@ -1279,6 +1286,12 @@ void MainFrame::init_tabpanel() {
         else if (panel == m_monitor) {
             //monitor
         }
+        else if (panel == m_strength_load_panel) {
+            m_strength_load_panel->activate();
+        }
+        else if (panel == m_strength_simulation_panel) {
+            m_strength_simulation_panel->activate();
+        }
 #ifndef __APPLE__
         if (m_last_selected_tab == TAB_ID_PREPARE) {
             m_topbar->EnableUndoRedoItems();
@@ -1308,6 +1321,14 @@ void MainFrame::init_tabpanel() {
     m_plater->Hide();
 
     wxGetApp().plater_ = m_plater;
+
+    m_strength_session = std::make_shared<StrengthAnalysisSession>();
+    m_strength_load_panel = new StrengthLoadPanel(m_tabpanel, m_plater, m_strength_session);
+    m_strength_simulation_panel = new StrengthSimulationPanel(m_tabpanel, m_strength_session);
+    m_strength_load_panel->set_result_callback([this] {
+        if (m_strength_simulation_panel != nullptr)
+            m_strength_simulation_panel->activate();
+    });
 
     create_preset_tabs();
 

@@ -2043,7 +2043,8 @@ ModelVolumeType type_from_string(const std::string &s)
             "source_offset_y",
             "source_offset_z",
             "extruder",
-            "modifier"
+            "modifier",
+            "strength_analysis_setup"
         };
 
         auto itor = std::find(valid_keys.begin(), valid_keys.end(), key);

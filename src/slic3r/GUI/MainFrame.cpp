@@ -684,6 +684,17 @@ DPIFrame(NULL, wxID_ANY, "", wxDefaultPosition, wxDefaultSize, BORDERLESS_FRAME_
             });
 ;    }
     this->Bind(wxEVT_CHAR_HOOK, [this](wxKeyEvent &evt) {
+        // Keep the two study workspaces reachable even when a modal/custom toolbar or another
+        // canvas owns keyboard focus. These mirror the direct workspace switching used by CAD
+        // simulation tools and also provide a reliable accessibility path around the tab strip.
+        if (evt.CmdDown() && evt.AltDown() && evt.GetKeyCode() == 'L') {
+            select_tab(TAB_ID_STRENGTH_LOAD);
+            return;
+        }
+        if (evt.CmdDown() && evt.AltDown() && evt.GetKeyCode() == 'S') {
+            select_tab(TAB_ID_STRENGTH_SIMULATION);
+            return;
+        }
 #ifdef __APPLE__
         if (evt.CmdDown() && (evt.GetKeyCode() == 'H')) {
             //call parent_menu hide behavior
@@ -1324,7 +1335,10 @@ void MainFrame::init_tabpanel() {
 
     m_strength_session = std::make_shared<StrengthAnalysisSession>();
     m_strength_load_panel = new StrengthLoadPanel(m_tabpanel, m_plater, m_strength_session);
-    m_strength_simulation_panel = new StrengthSimulationPanel(m_tabpanel, m_strength_session);
+    m_strength_simulation_panel = new StrengthSimulationPanel(m_tabpanel, m_strength_session, [this] {
+        if (m_strength_load_panel != nullptr)
+            m_strength_load_panel->activate();
+    });
     m_strength_load_panel->set_result_callback([this] {
         if (m_strength_simulation_panel != nullptr)
             m_strength_simulation_panel->activate();

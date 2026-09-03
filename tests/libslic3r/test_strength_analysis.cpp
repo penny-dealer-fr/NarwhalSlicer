@@ -46,6 +46,94 @@ Setup cube_setup(const indexed_triangle_set &mesh)
 
 } // namespace
 
+TEST_CASE("Spherical region selection exposes the exact solver vertex set", "[StrengthAnalysis]")
+{
+    const indexed_triangle_set mesh = its_make_cube(20.0, 20.0, 20.0);
+    REQUIRE_FALSE(mesh.vertices.empty());
+
+    SphericalRegion local;
+    local.center_mm = mesh.vertices.front().cast<double>();
+    local.radius_mm = 0.01;
+    const std::vector<size_t> local_vertices = vertices_in_region(mesh, local, false);
+    REQUIRE_FALSE(local_vertices.empty());
+    for (size_t vertex : local_vertices)
+        CHECK((mesh.vertices[vertex].cast<double>() - local.center_mm).norm() <= local.radius_mm);
+
+    local.center_mm = Vec3d(1000.0, 1000.0, 1000.0);
+    CHECK(vertices_in_region(mesh, local, false).empty());
+    CHECK(vertices_in_region(mesh, local, true).size() == 1);
+
+    local.whole_model = true;
+    CHECK(vertices_in_region(mesh, local).size() == mesh.vertices.size());
+}
+
+TEST_CASE("Region shapes select the same exact vertices used by the solver", "[StrengthAnalysis]")
+{
+    const indexed_triangle_set mesh = its_make_cube(20.0, 20.0, 20.0);
+    const BoundingBoxf3 bounds = bounding_box(mesh);
+    const Vec3d center = bounds.center().cast<double>();
+
+    SphericalRegion box;
+    box.shape = RegionShape::Box;
+    box.center_mm = Vec3d(bounds.min.x(), center.y(), center.z());
+    box.size_mm = Vec3d(0.1, 21.0, 21.0);
+    const auto box_vertices = vertices_in_region(mesh, box, false);
+    REQUIRE(box_vertices.size() == 4);
+    for (size_t vertex : box_vertices)
+        CHECK_THAT(double(mesh.vertices[vertex].x()), WithinAbs(bounds.min.x(), 1e-6));
+
+    SphericalRegion cylinder;
+    cylinder.shape = RegionShape::Cylinder;
+    cylinder.center_mm = Vec3d(bounds.min.x(), center.y(), center.z());
+    cylinder.axis = Vec3d::UnitX();
+    cylinder.radius_mm = 15.0;
+    cylinder.size_mm.z() = 0.1;
+    CHECK(vertices_in_region(mesh, cylinder, false).size() == 4);
+
+    SphericalRegion surface;
+    surface.shape = RegionShape::Surface;
+    surface.surface_triangles = {0};
+    const auto surface_vertices = vertices_in_region(mesh, surface, false);
+    REQUIRE(surface_vertices.size() == 3);
+    for (int corner = 0; corner < 3; ++corner)
+        CHECK(std::find(surface_vertices.begin(), surface_vertices.end(), size_t(mesh.indices[0][corner])) != surface_vertices.end());
+
+    surface.surface_triangles = {mesh.indices.size() + 10};
+    CHECK(vertices_in_region(mesh, surface, false).empty());
+    CHECK(vertices_in_region(mesh, surface, true).empty());
+
+    Setup stale_surface = cube_setup(mesh);
+    stale_surface.loads.back().region = surface;
+    const auto errors = validate(mesh, stale_surface);
+    CHECK(std::any_of(errors.begin(), errors.end(), [](const std::string &error) {
+        return error.find("selected surface no longer exists") != std::string::npos;
+    }));
+}
+
+TEST_CASE("Coplanar grouping creates solid-like cube faces without changing the mesh", "[StrengthAnalysis]")
+{
+    const indexed_triangle_set mesh = its_make_cube(20.0, 20.0, 20.0);
+    const auto original_vertices = mesh.vertices;
+    const auto original_indices = mesh.indices;
+    const auto patches = group_coplanar_surfaces(mesh);
+    REQUIRE(patches.size() == 6);
+    for (const SurfacePatch &patch : patches) {
+        CHECK(patch.triangles.size() == 2);
+        CHECK_THAT(patch.area_mm2, WithinRel(400.0, 1e-6));
+        CHECK_THAT(patch.normal.norm(), WithinRel(1.0, 1e-10));
+        CHECK(patch.component_index == 0);
+    }
+    const auto components = mesh_connected_components(mesh);
+    REQUIRE(components.size() == 1);
+    CHECK(components.front().size() == mesh.indices.size());
+    REQUIRE(mesh.vertices.size() == original_vertices.size());
+    REQUIRE(mesh.indices.size() == original_indices.size());
+    for (size_t index = 0; index < mesh.vertices.size(); ++index)
+        CHECK(mesh.vertices[index].isApprox(original_vertices[index]));
+    for (size_t index = 0; index < mesh.indices.size(); ++index)
+        CHECK(mesh.indices[index].isApprox(original_indices[index]));
+}
+
 TEST_CASE("Strength setup survives a versioned JSON round trip", "[StrengthAnalysis]")
 {
     Setup setup;
@@ -57,6 +145,9 @@ TEST_CASE("Strength setup survives a versioned JSON round trip", "[StrengthAnaly
     setup.infill.background_pattern = StrengthAnalysis::InfillPattern::Cubic;
     setup.infill.background_density = 0.37;
     setup.preserve_regions.push_back({Vec3d(1.0, 2.0, 3.0), 4.0, false});
+    setup.preserve_regions.back().shape = RegionShape::Cylinder;
+    setup.preserve_regions.back().size_mm = Vec3d(8.0, 8.0, 12.0);
+    setup.preserve_regions.back().axis = Vec3d::UnitY();
     Load load;
     load.type = LoadType::ImpactForce;
     load.region.center_mm = Vec3d(3.0, 4.0, 5.0);
@@ -84,6 +175,9 @@ TEST_CASE("Strength setup survives a versioned JSON round trip", "[StrengthAnaly
     CHECK_THAT(decoded.loads.front().target_safety_factor, WithinRel(2.2, 1e-12));
     CHECK(decoded.loads.front().strength_basis == StrengthBasis::Ultimate);
     REQUIRE(decoded.preserve_regions.size() == 1);
+    CHECK(decoded.preserve_regions.front().shape == RegionShape::Cylinder);
+    CHECK(decoded.preserve_regions.front().size_mm.isApprox(Vec3d(8.0, 8.0, 12.0)));
+    CHECK(decoded.preserve_regions.front().axis.isApprox(Vec3d::UnitY()));
     CHECK(decoded.preserve_regions.front().center_mm.isApprox(Vec3d(1.0, 2.0, 3.0)));
 }
 

@@ -11,17 +11,22 @@
 #include <wx/checkbox.h>
 #include <wx/choice.h>
 #include <wx/dcbuffer.h>
+#include <wx/dialog.h>
+#include <wx/image.h>
 #include <wx/listbox.h>
 #include <wx/msgdlg.h>
+#include <wx/settings.h>
 #include <wx/sizer.h>
 #include <wx/statbox.h>
 #include <wx/stattext.h>
 #include <wx/textctrl.h>
 #include <wx/thread.h>
+#include <wx/treectrl.h>
 
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <limits>
 #include <numeric>
 #include <sstream>
 
@@ -60,13 +65,14 @@ void add_labeled(wxSizer *sizer, wxWindow *parent, const wxString &label, wxSize
     sizer->Add(control, proportion, proportion ? wxEXPAND : 0);
 }
 
-wxBoxSizer *vector_editor(wxWindow *parent, wxTextCtrl *controls[3], const Vec3d &value, const wxString &unit = {})
+wxBoxSizer *vector_editor(wxWindow *parent, wxTextCtrl *controls[3], const Vec3d &value,
+                          const wxString &unit = {}, int width = 76)
 {
     auto *row = new wxBoxSizer(wxHORIZONTAL);
     static const std::array<wxString, 3> axes{"X", "Y", "Z"};
     for (int axis = 0; axis < 3; ++axis) {
         row->Add(new wxStaticText(parent, wxID_ANY, axes[axis]), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, parent->FromDIP(3));
-        controls[axis] = number_input(parent, value[axis], 76);
+        controls[axis] = number_input(parent, value[axis], width);
         row->Add(controls[axis], 0, wxRIGHT, parent->FromDIP(6));
     }
     if (!unit.empty())
@@ -85,10 +91,26 @@ Vec3d read_vector(wxTextCtrl *const controls[3], const Vec3d &fallback)
     return output;
 }
 
+bool read_vector_strict(wxTextCtrl *const controls[3], Vec3d &output)
+{
+    bool valid = true;
+    for (int axis = 0; axis < 3; ++axis) {
+        double value = 0.0;
+        valid = read_number(controls[axis], value) && valid;
+        output[axis] = value;
+    }
+    return valid;
+}
+
 wxArrayString load_type_names()
 {
     return {_L("Fixed region"), _L("Local force"), _L("Directional force"), _L("Bearing force"),
             _L("Impact force"), _L("Global force")};
+}
+
+wxArrayString region_shape_names()
+{
+    return {_L("Sphere"), _L("Box"), _L("Cylinder"), _L("Selected face")};
 }
 
 wxArrayString infill_names()
@@ -114,6 +136,27 @@ wxString vector_text(const Vec3d &value)
     return wxString::Format("(%.4g, %.4g, %.4g)", value.x(), value.y(), value.z());
 }
 
+wxColour load_colour(SA::LoadType type)
+{
+    switch (type) {
+    case SA::LoadType::Fixed: return wxColour(52, 111, 205);
+    case SA::LoadType::BearingForce: return wxColour(173, 66, 184);
+    case SA::LoadType::ImpactForce: return wxColour(231, 128, 35);
+    case SA::LoadType::GlobalForce: return wxColour(200, 45, 94);
+    default: return wxColour(214, 61, 55);
+    }
+}
+
+wxColour blend_colour(const wxColour &base, const wxColour &overlay, double amount)
+{
+    amount = std::clamp(amount, 0.0, 1.0);
+    const auto channel = [amount](unsigned char lhs, unsigned char rhs) {
+        return static_cast<unsigned char>(std::lround((1.0 - amount) * lhs + amount * rhs));
+    };
+    return wxColour(channel(base.Red(), overlay.Red()), channel(base.Green(), overlay.Green()),
+                    channel(base.Blue(), overlay.Blue()));
+}
+
 bool meshes_equal(const indexed_triangle_set &lhs, const indexed_triangle_set &rhs)
 {
     if (lhs.vertices.size() != rhs.vertices.size() || lhs.indices.size() != rhs.indices.size())
@@ -127,6 +170,13 @@ bool meshes_equal(const indexed_triangle_set &lhs, const indexed_triangle_set &r
             return false;
     }
     return true;
+}
+
+bool valid_triangle(const Vec3i32 &triangle, size_t vertex_count)
+{
+    return triangle[0] >= 0 && triangle[1] >= 0 && triangle[2] >= 0 &&
+           size_t(triangle[0]) < vertex_count && size_t(triangle[1]) < vertex_count &&
+           size_t(triangle[2]) < vertex_count;
 }
 
 bool nearly_equal(double lhs, double rhs)
@@ -150,15 +200,1158 @@ bool material_properties_match(const SA::Material &lhs, const SA::Material &rhs)
         nearly_equal(lhs.shear_strength_xz_pa, rhs.shear_strength_xz_pa);
 }
 
+struct CameraFrame
+{
+    Vec3d center{Vec3d::Zero()};
+    Vec3d right{Vec3d::UnitX()};
+    Vec3d up{Vec3d::UnitZ()};
+    Vec3d forward{Vec3d::UnitY()};
+    double scale{1.0};
+    wxPoint2DDouble origin;
+};
+
+struct ScreenVertex
+{
+    wxPoint point;
+    double depth{0.0};
+};
+
+// A small CPU rasterizer keeps this self-contained wxWidgets viewport depth-correct. Painter's
+// sorting cannot correctly display intersecting or mutually overlapping triangles; the per-pixel
+// depth buffer below can, and also permits smooth barycentric result contours without OpenGL state.
+class DepthBitmap
+{
+public:
+    explicit DepthBitmap(const wxSize &size)
+        : m_width(std::max(1, size.x)), m_height(std::max(1, size.y)),
+          m_depth(size_t(m_width) * size_t(m_height), -std::numeric_limits<double>::infinity()),
+          m_rgb(size_t(m_width) * size_t(m_height) * 3, 0),
+          m_alpha(size_t(m_width) * size_t(m_height), 0)
+    {}
+
+    template<class ColourFunction>
+    void triangle(const ScreenVertex &a, const ScreenVertex &b, const ScreenVertex &c, ColourFunction colour)
+    {
+        const double area = edge(double(a.point.x), double(a.point.y), double(b.point.x), double(b.point.y),
+                                 double(c.point.x), double(c.point.y));
+        if (std::abs(area) < 1e-9)
+            return;
+        const int minimum_x = std::clamp(std::min({a.point.x, b.point.x, c.point.x}), 0, m_width - 1);
+        const int maximum_x = std::clamp(std::max({a.point.x, b.point.x, c.point.x}), 0, m_width - 1);
+        const int minimum_y = std::clamp(std::min({a.point.y, b.point.y, c.point.y}), 0, m_height - 1);
+        const int maximum_y = std::clamp(std::max({a.point.y, b.point.y, c.point.y}), 0, m_height - 1);
+        for (int y = minimum_y; y <= maximum_y; ++y) {
+            for (int x = minimum_x; x <= maximum_x; ++x) {
+                const double px = double(x) + 0.5, py = double(y) + 0.5;
+                const double wa = edge(double(b.point.x), double(b.point.y), double(c.point.x), double(c.point.y), px, py) / area;
+                const double wb = edge(double(c.point.x), double(c.point.y), double(a.point.x), double(a.point.y), px, py) / area;
+                const double wc = 1.0 - wa - wb;
+                constexpr double tolerance = -1e-8;
+                if (wa < tolerance || wb < tolerance || wc < tolerance)
+                    continue;
+                const double depth = wa * a.depth + wb * b.depth + wc * c.depth;
+                const size_t pixel = size_t(y) * size_t(m_width) + size_t(x);
+                if (depth <= m_depth[pixel])
+                    continue;
+                m_depth[pixel] = depth;
+                put(pixel, colour(wa, wb, wc));
+            }
+        }
+    }
+
+    void line(const ScreenVertex &a, const ScreenVertex &b, const wxColour &colour, int width = 1)
+    {
+        const int dx = b.point.x - a.point.x, dy = b.point.y - a.point.y;
+        const int steps = std::max(std::abs(dx), std::abs(dy));
+        if (steps == 0)
+            return;
+        const int radius = std::max(0, width / 2);
+        for (int step = 0; step <= steps; ++step) {
+            const double t = double(step) / double(steps);
+            const int x = int(std::lround(double(a.point.x) + t * dx));
+            const int y = int(std::lround(double(a.point.y) + t * dy));
+            const double depth = (1.0 - t) * a.depth + t * b.depth;
+            for (int oy = -radius; oy <= radius; ++oy)
+                for (int ox = -radius; ox <= radius; ++ox) {
+                    const int sample_x = x + ox, sample_y = y + oy;
+                    if (sample_x < 0 || sample_y < 0 || sample_x >= m_width || sample_y >= m_height)
+                        continue;
+                    const size_t pixel = size_t(sample_y) * size_t(m_width) + size_t(sample_x);
+                    const double tolerance = 1e-5 * std::max(1.0, std::abs(depth));
+                    if (depth + tolerance >= m_depth[pixel])
+                        put(pixel, colour);
+                }
+        }
+    }
+
+    void draw(wxDC &dc) const
+    {
+        wxImage image(m_width, m_height);
+        std::copy(m_rgb.begin(), m_rgb.end(), image.GetData());
+        image.InitAlpha();
+        std::copy(m_alpha.begin(), m_alpha.end(), image.GetAlpha());
+        dc.DrawBitmap(wxBitmap(image), 0, 0, true);
+    }
+
+private:
+    int m_width;
+    int m_height;
+    std::vector<double> m_depth;
+    std::vector<unsigned char> m_rgb;
+    std::vector<unsigned char> m_alpha;
+
+    static double edge(double ax, double ay, double bx, double by, double px, double py)
+    {
+        return (px - ax) * (by - ay) - (py - ay) * (bx - ax);
+    }
+
+    void put(size_t pixel, const wxColour &colour)
+    {
+        m_rgb[pixel * 3] = colour.Red();
+        m_rgb[pixel * 3 + 1] = colour.Green();
+        m_rgb[pixel * 3 + 2] = colour.Blue();
+        m_alpha[pixel] = 255;
+    }
+};
+
+struct StudyTreeItemData final : public wxTreeItemData
+{
+    StudyTreeItemData(int item_kind, int item_index = -1) : kind(item_kind), index(item_index) {}
+    int kind;
+    int index;
+};
+
+class SoftwareViewport3D : public wxPanel
+{
+public:
+    SoftwareViewport3D(wxWindow *parent, const wxSize &minimum_size)
+        : wxPanel(parent, wxID_ANY, wxDefaultPosition, minimum_size, wxBORDER_SIMPLE)
+    {
+        SetMinSize(minimum_size);
+        SetBackgroundStyle(wxBG_STYLE_PAINT);
+        Bind(wxEVT_PAINT, [this](wxPaintEvent &) { paint(); });
+        Bind(wxEVT_LEFT_DOWN, [this](wxMouseEvent &event) { begin_drag(event); });
+        Bind(wxEVT_LEFT_UP, [this](wxMouseEvent &event) { end_drag(event); });
+        Bind(wxEVT_LEFT_DCLICK, [this](wxMouseEvent &event) { clicked(event.GetPosition(), true); });
+        Bind(wxEVT_MIDDLE_DOWN, [this](wxMouseEvent &event) { begin_drag(event); });
+        Bind(wxEVT_MIDDLE_UP, [this](wxMouseEvent &event) { end_drag(event); });
+        Bind(wxEVT_RIGHT_DOWN, [this](wxMouseEvent &event) { begin_drag(event); });
+        Bind(wxEVT_RIGHT_UP, [this](wxMouseEvent &event) { end_drag(event); });
+        Bind(wxEVT_MOTION, [this](wxMouseEvent &event) { drag(event); });
+        Bind(wxEVT_MOUSEWHEEL, [this](wxMouseEvent &event) {
+            const double steps = double(event.GetWheelRotation()) / std::max(1, event.GetWheelDelta());
+            m_zoom = std::clamp(m_zoom * std::pow(1.12, steps), 0.08, 40.0);
+            Refresh();
+        });
+        Bind(wxEVT_MOUSE_CAPTURE_LOST, [this](wxMouseCaptureLostEvent &) {
+            const bool finish_interaction = m_custom_interaction;
+            m_dragging = false;
+            m_custom_interaction = false;
+            if (finish_interaction)
+                end_interaction();
+        });
+    }
+
+    void fit_view()
+    {
+        m_zoom = 1.0;
+        m_pan = wxPoint2DDouble(0.0, 0.0);
+        Refresh();
+    }
+
+    void set_view(int view)
+    {
+        constexpr double pi = 3.14159265358979323846;
+        switch (view) {
+        case 1: m_yaw = -0.5 * pi; m_pitch = 0.0; break;       // Front: X/Z.
+        case 2: m_yaw = -0.5 * pi; m_pitch = 0.5 * pi; break; // Top: X/Y.
+        case 3: m_yaw = 0.0; m_pitch = 0.0; break;            // Right: Y/Z.
+        default: m_yaw = -0.75; m_pitch = 0.48; break;
+        }
+        fit_view();
+    }
+
+protected:
+    virtual std::vector<Vec3d> scene_points() const = 0;
+    virtual void draw_scene(wxDC &dc, const CameraFrame &camera) = 0;
+    virtual void clicked(const wxPoint &, bool) {}
+    virtual void hovered(const wxPoint &) {}
+    virtual bool begin_interaction(const wxPoint &) { return false; }
+    virtual void update_interaction(const wxPoint &) {}
+    virtual void end_interaction() {}
+
+    void set_right_margin(int pixels) { m_right_margin = std::max(0, pixels); }
+
+    CameraFrame camera() const
+    {
+        CameraFrame output;
+        const std::vector<Vec3d> points = scene_points();
+        if (!points.empty()) {
+            Vec3d minimum = points.front();
+            Vec3d maximum = points.front();
+            for (const Vec3d &point : points) {
+                minimum = minimum.cwiseMin(point);
+                maximum = maximum.cwiseMax(point);
+            }
+            output.center = 0.5 * (minimum + maximum);
+            double radius = 0.0;
+            for (const Vec3d &point : points)
+                radius = std::max(radius, (point - output.center).norm());
+            const wxSize size = GetClientSize();
+            const double available_width = std::max(80, size.x - m_right_margin);
+            const double available_height = std::max(80, size.y);
+            output.scale = 0.43 * std::min(available_width, available_height) / std::max(radius, 1e-6) * m_zoom;
+            output.origin = wxPoint2DDouble(0.5 * available_width + m_pan.m_x, 0.5 * available_height + m_pan.m_y);
+        }
+        output.forward = Vec3d(std::cos(m_pitch) * std::cos(m_yaw),
+                               std::cos(m_pitch) * std::sin(m_yaw), std::sin(m_pitch));
+        output.right = Vec3d(-std::sin(m_yaw), std::cos(m_yaw), 0.0);
+        output.up = output.forward.cross(output.right).normalized();
+        return output;
+    }
+
+    ScreenVertex project(const Vec3d &point, const CameraFrame &camera) const
+    {
+        const Vec3d delta = point - camera.center;
+        return {
+            wxPoint(int(std::lround(camera.origin.m_x + delta.dot(camera.right) * camera.scale)),
+                    int(std::lround(camera.origin.m_y - delta.dot(camera.up) * camera.scale))),
+            delta.dot(camera.forward)
+        };
+    }
+
+    static bool barycentric(const wxPoint &point, const wxPoint triangle[3], double weights[3])
+    {
+        const double denominator = double(triangle[1].y - triangle[2].y) * (triangle[0].x - triangle[2].x) +
+            double(triangle[2].x - triangle[1].x) * (triangle[0].y - triangle[2].y);
+        if (std::abs(denominator) < 1e-9)
+            return false;
+        weights[0] = (double(triangle[1].y - triangle[2].y) * (point.x - triangle[2].x) +
+                      double(triangle[2].x - triangle[1].x) * (point.y - triangle[2].y)) / denominator;
+        weights[1] = (double(triangle[2].y - triangle[0].y) * (point.x - triangle[2].x) +
+                      double(triangle[0].x - triangle[2].x) * (point.y - triangle[2].y)) / denominator;
+        weights[2] = 1.0 - weights[0] - weights[1];
+        constexpr double epsilon = -1e-6;
+        return weights[0] >= epsilon && weights[1] >= epsilon && weights[2] >= epsilon;
+    }
+
+    static void draw_arrow(wxDC &dc, const wxPoint &start, const wxPoint &end, const wxColour &colour, int width = 3)
+    {
+        dc.SetPen(wxPen(colour, width));
+        const double dx = double(end.x - start.x), dy = double(end.y - start.y);
+        const double length = std::hypot(dx, dy);
+        if (length < 2.0) {
+            // A vector parallel to the view direction has no projected shaft. Keep its direction
+            // visibly selectable with the conventional target/dot symbol instead of hiding it.
+            dc.SetBrush(*wxTRANSPARENT_BRUSH);
+            dc.DrawCircle(start, 7 + width);
+            dc.SetBrush(wxBrush(colour));
+            dc.DrawCircle(start, 2 + width / 2);
+            return;
+        }
+        dc.DrawLine(start, end);
+        const double ux = dx / length, uy = dy / length;
+        const double head = 11.0 + width;
+        const double wing = 5.0 + width;
+        wxPoint points[3]{
+            end,
+            wxPoint(int(std::lround(end.x - head * ux + wing * uy)), int(std::lround(end.y - head * uy - wing * ux))),
+            wxPoint(int(std::lround(end.x - head * ux - wing * uy)), int(std::lround(end.y - head * uy + wing * ux)))
+        };
+        dc.SetBrush(wxBrush(colour));
+        dc.DrawPolygon(3, points);
+    }
+
+    void draw_region_box(wxDC &dc, const CameraFrame &camera, const Vec3d &center, const Vec3d &half_extent,
+                         const wxColour &colour, bool selected) const
+    {
+        const Vec3d extent = half_extent.cwiseMax(Vec3d::Constant(1e-6));
+        std::array<ScreenVertex, 8> corners;
+        for (int corner = 0; corner < 8; ++corner) {
+            const Vec3d offset((corner & 1) ? extent.x() : -extent.x(),
+                               (corner & 2) ? extent.y() : -extent.y(),
+                               (corner & 4) ? extent.z() : -extent.z());
+            corners[size_t(corner)] = project(center + offset, camera);
+        }
+        static constexpr int face_indices[6][4]{
+            {0, 2, 6, 4}, {1, 5, 7, 3}, {0, 4, 5, 1},
+            {2, 3, 7, 6}, {0, 1, 3, 2}, {4, 6, 7, 5}};
+        std::array<int, 6> order{0, 1, 2, 3, 4, 5};
+        std::stable_sort(order.begin(), order.end(), [&corners](int lhs, int rhs) {
+            double left = 0.0, right = 0.0;
+            for (int corner = 0; corner < 4; ++corner) {
+                left += corners[size_t(face_indices[lhs][corner])].depth;
+                right += corners[size_t(face_indices[rhs][corner])].depth;
+            }
+            return left < right;
+        });
+        dc.SetPen(*wxTRANSPARENT_PEN);
+        dc.SetBrush(wxBrush(wxColour(colour.Red(), colour.Green(), colour.Blue(), selected ? 64 : 34)));
+        for (int face : order) {
+            wxPoint polygon[4];
+            for (int corner = 0; corner < 4; ++corner)
+                polygon[corner] = corners[size_t(face_indices[face][corner])].point;
+            dc.DrawPolygon(4, polygon);
+        }
+        static constexpr int edges[12][2]{
+            {0, 1}, {0, 2}, {0, 4}, {1, 3}, {1, 5}, {2, 3},
+            {2, 6}, {3, 7}, {4, 5}, {4, 6}, {5, 7}, {6, 7}};
+        dc.SetPen(wxPen(colour, selected ? 3 : 2, selected ? wxPENSTYLE_SOLID : wxPENSTYLE_SHORT_DASH));
+        for (const auto &edge : edges)
+            dc.DrawLine(corners[size_t(edge[0])].point, corners[size_t(edge[1])].point);
+    }
+
+    void draw_region_box(wxDC &dc, const CameraFrame &camera, const Vec3d &center, double half_extent,
+                         const wxColour &colour, bool selected) const
+    {
+        draw_region_box(dc, camera, center, Vec3d::Constant(half_extent), colour, selected);
+    }
+
+    void draw_region_sphere(wxDC &dc, const CameraFrame &camera, const Vec3d &center, double radius,
+                            const wxColour &colour, bool selected) const
+    {
+        const ScreenVertex projected_center = project(center, camera);
+        const int screen_radius = std::clamp(int(std::lround(std::max(radius, 1e-6) * camera.scale)),
+                                             FromDIP(4), FromDIP(240));
+        // The circle is the exact orthographic silhouette of the spherical solver region. The
+        // surrounding box is retained as a familiar Fusion-style editable extent/manipulator.
+        dc.SetPen(wxPen(colour, selected ? 3 : 2, selected ? wxPENSTYLE_SOLID : wxPENSTYLE_SHORT_DASH));
+        dc.SetBrush(wxBrush(blend_colour(wxColour(236, 241, 247), colour, selected ? 0.20 : 0.11),
+                            wxBRUSHSTYLE_BDIAGONAL_HATCH));
+        dc.DrawCircle(projected_center.point, screen_radius);
+        dc.DrawLine(projected_center.point + wxPoint(-screen_radius, 0),
+                    projected_center.point + wxPoint(screen_radius, 0));
+        dc.DrawLine(projected_center.point + wxPoint(0, -screen_radius),
+                    projected_center.point + wxPoint(0, screen_radius));
+    }
+
+    void draw_region_shape(wxDC &dc, const CameraFrame &camera, const SA::SphericalRegion &region,
+                           const wxColour &colour, bool selected) const
+    {
+        switch (region.shape) {
+        case SA::RegionShape::Sphere:
+            draw_region_sphere(dc, camera, region.center_mm, region.radius_mm, colour, selected);
+            draw_region_box(dc, camera, region.center_mm, region.radius_mm, colour, selected);
+            break;
+        case SA::RegionShape::Box:
+            draw_region_box(dc, camera, region.center_mm, 0.5 * region.size_mm.cwiseAbs(), colour, selected);
+            break;
+        case SA::RegionShape::Cylinder: {
+            const Vec3d axis = region.axis.squaredNorm() > 1e-12 ? region.axis.normalized() : Vec3d::UnitZ();
+            const Vec3d half_axis = axis * (0.5 * std::max(region.size_mm.z(), 1e-6));
+            const ScreenVertex first = project(region.center_mm - half_axis, camera);
+            const ScreenVertex second = project(region.center_mm + half_axis, camera);
+            const int radius = std::clamp(int(std::lround(std::max(region.radius_mm, 1e-6) * camera.scale)),
+                                          FromDIP(4), FromDIP(240));
+            const double dx = double(second.point.x - first.point.x), dy = double(second.point.y - first.point.y);
+            const double length = std::max(1.0, std::hypot(dx, dy));
+            const wxPoint side(int(std::lround(-dy / length * radius)), int(std::lround(dx / length * radius)));
+            dc.SetPen(wxPen(colour, selected ? 3 : 2, selected ? wxPENSTYLE_SOLID : wxPENSTYLE_SHORT_DASH));
+            dc.SetBrush(wxBrush(blend_colour(wxColour(236, 241, 247), colour, selected ? 0.20 : 0.11),
+                                wxBRUSHSTYLE_BDIAGONAL_HATCH));
+            dc.DrawCircle(first.point, radius);
+            dc.DrawCircle(second.point, radius);
+            dc.DrawLine(first.point + side, second.point + side);
+            dc.DrawLine(first.point - side, second.point - side);
+            break;
+        }
+        case SA::RegionShape::Surface: {
+            const ScreenVertex center = project(region.center_mm, camera);
+            dc.SetPen(wxPen(colour, selected ? 4 : 2));
+            dc.DrawLine(center.point + wxPoint(-FromDIP(7), 0), center.point + wxPoint(FromDIP(7), 0));
+            dc.DrawLine(center.point + wxPoint(0, -FromDIP(7)), center.point + wxPoint(0, FromDIP(7)));
+            break;
+        }
+        }
+    }
+
+    void draw_orientation_gizmo(wxDC &dc, const CameraFrame &camera) const
+    {
+        const wxSize size = GetClientSize();
+        const wxPoint origin(FromDIP(45), size.y - FromDIP(42));
+        const std::array<Vec3d, 3> axes{Vec3d::UnitX(), Vec3d::UnitY(), Vec3d::UnitZ()};
+        const std::array<wxColour, 3> colours{wxColour(220, 55, 55), wxColour(55, 165, 80), wxColour(55, 105, 220)};
+        const std::array<wxString, 3> labels{"X", "Y", "Z"};
+        for (size_t axis = 0; axis < axes.size(); ++axis) {
+            const wxPoint end(origin.x + int(std::lround(axes[axis].dot(camera.right) * FromDIP(28))),
+                              origin.y - int(std::lround(axes[axis].dot(camera.up) * FromDIP(28))));
+            draw_arrow(dc, origin, end, colours[axis], 2);
+            dc.SetTextForeground(colours[axis]);
+            dc.DrawText(labels[axis], end + wxPoint(2, -8));
+        }
+    }
+
+private:
+    double m_yaw{-0.75};
+    double m_pitch{0.48};
+    double m_zoom{1.0};
+    wxPoint2DDouble m_pan{0.0, 0.0};
+    wxPoint m_drag_start;
+    wxPoint m_last_mouse;
+    bool m_dragging{false};
+    bool m_drag_moved{false};
+    bool m_custom_interaction{false};
+    int m_drag_button{0};
+    int m_right_margin{0};
+
+    void paint()
+    {
+        wxAutoBufferedPaintDC dc(this);
+        const wxSize size = GetClientSize();
+        dc.GradientFillLinear(wxRect(wxPoint(0, 0), size), wxColour(247, 249, 252), wxColour(218, 225, 234), wxSOUTH);
+        const CameraFrame frame = camera();
+        draw_scene(dc, frame);
+        draw_orientation_gizmo(dc, frame);
+    }
+
+    void begin_drag(wxMouseEvent &event)
+    {
+        m_dragging = true;
+        m_drag_moved = false;
+        m_drag_start = m_last_mouse = event.GetPosition();
+        m_drag_button = event.LeftIsDown() ? 1 : (event.MiddleIsDown() ? 2 : 3);
+        m_custom_interaction = m_drag_button == 1 && begin_interaction(event.GetPosition());
+        if (!HasCapture())
+            CaptureMouse();
+    }
+
+    void drag(wxMouseEvent &event)
+    {
+        if (!m_dragging) {
+            hovered(event.GetPosition());
+            return;
+        }
+        const wxPoint point = event.GetPosition();
+        const wxPoint delta = point - m_last_mouse;
+        if (std::abs(point.x - m_drag_start.x) + std::abs(point.y - m_drag_start.y) > FromDIP(4))
+            m_drag_moved = true;
+        if (m_custom_interaction) {
+            update_interaction(point);
+        } else if (m_drag_button == 1) {
+            m_yaw += 0.010 * delta.x;
+            m_pitch = std::clamp(m_pitch - 0.010 * delta.y, -1.50, 1.50);
+        } else {
+            m_pan.m_x += delta.x;
+            m_pan.m_y += delta.y;
+        }
+        m_last_mouse = point;
+        Refresh();
+    }
+
+    void end_drag(wxMouseEvent &event)
+    {
+        if (!m_dragging)
+            return;
+        const bool was_click = m_drag_button == 1 && !m_drag_moved;
+        const bool was_custom = m_custom_interaction;
+        m_dragging = false;
+        m_custom_interaction = false;
+        if (HasCapture())
+            ReleaseMouse();
+        if (was_custom)
+            end_interaction();
+        else if (was_click)
+            clicked(event.GetPosition(), false);
+    }
+};
+
 } // namespace
 
+class StrengthLoadPanel::SetupCanvas final : public SoftwareViewport3D
+{
+public:
+    enum class Placement { None = -1, Preserve = 100 };
+
+    SetupCanvas(wxWindow *parent, std::shared_ptr<StrengthAnalysisSession> session,
+                std::function<void(SA::LoadType, const Vec3d &, const Vec3d &, const std::vector<size_t> &)> load_placed,
+                std::function<void(const Vec3d &, const std::vector<size_t> &)> preserve_placed,
+                std::function<void(int, int, bool)> item_selected,
+                std::function<void(bool)> item_changed)
+        : SoftwareViewport3D(parent, parent->FromDIP(wxSize(560, 500)))
+        , m_session(std::move(session))
+        , m_load_placed(std::move(load_placed))
+        , m_preserve_placed(std::move(preserve_placed))
+        , m_item_selected(std::move(item_selected))
+        , m_item_changed(std::move(item_changed))
+    {
+        Bind(wxEVT_CHAR_HOOK, [this](wxKeyEvent &event) {
+            if (event.GetKeyCode() == WXK_ESCAPE && m_placement != int(Placement::None))
+                cancel_placement();
+            else
+                event.Skip();
+        });
+    }
+
+    void rebuild_surface_groups()
+    {
+        m_surface_patches = SA::group_coplanar_surfaces(m_session->mesh);
+        m_components = SA::mesh_connected_components(m_session->mesh);
+        Refresh();
+    }
+
+    void set_selection_mode(int mode)
+    {
+        m_selection_mode = std::clamp(mode, 0, 2);
+        Refresh();
+    }
+
+    void begin_load(SA::LoadType type)
+    {
+        m_placement = int(type);
+        m_hover_surface = false;
+        SetCursor(wxCursor(wxCURSOR_CROSS));
+        SetFocus();
+        Refresh();
+    }
+
+    void begin_preserve()
+    {
+        m_placement = int(Placement::Preserve);
+        m_hover_surface = false;
+        SetCursor(wxCursor(wxCURSOR_CROSS));
+        SetFocus();
+        Refresh();
+    }
+
+    void cancel_placement()
+    {
+        m_placement = int(Placement::None);
+        m_hover_surface = false;
+        SetCursor(wxNullCursor);
+        Refresh();
+    }
+
+    void select_item(int kind, int index)
+    {
+        m_selected_kind = kind;
+        m_selected_index = index;
+        Refresh();
+    }
+
+    void preview_load(const SA::Load &load)
+    {
+        if (!m_preview_region_active || !m_preview_region.center_mm.isApprox(load.region.center_mm))
+            m_preview_face = std::numeric_limits<size_t>::max();
+        m_preview_region_active = true;
+        m_preview_kind = 1;
+        m_preview_load_type = load.type;
+        m_preview_region = load.region;
+        m_preview_direction = load.direction.squaredNorm() > 1e-12 ? load.direction.normalized() : Vec3d::UnitZ();
+        Refresh();
+        Update();
+    }
+
+    void preview_preserve(const SA::SphericalRegion &region)
+    {
+        if (!m_preview_region_active || !m_preview_region.center_mm.isApprox(region.center_mm))
+            m_preview_face = std::numeric_limits<size_t>::max();
+        m_preview_region_active = true;
+        m_preview_kind = 2;
+        m_preview_region = region;
+        Refresh();
+        Update();
+    }
+
+    void clear_preview()
+    {
+        m_preview_region_active = false;
+        m_preview_face = std::numeric_limits<size_t>::max();
+        Refresh();
+    }
+
+protected:
+    std::vector<Vec3d> scene_points() const override
+    {
+        std::vector<Vec3d> points;
+        points.reserve(m_session->mesh.vertices.size());
+        for (const Vec3f &point : m_session->mesh.vertices)
+            points.emplace_back(point.cast<double>());
+        return points;
+    }
+
+    void draw_scene(wxDC &dc, const CameraFrame &camera) override
+    {
+        const indexed_triangle_set &mesh = m_session->mesh;
+        m_glyphs.clear();
+        m_center_handle = m_direction_handle = m_size_handle = m_height_handle = wxPoint(-10000, -10000);
+        if (mesh.vertices.empty() || mesh.indices.empty()) {
+            dc.SetTextForeground(wxColour(65, 72, 82));
+            dc.DrawText(_L("Select a model object in Prepare to begin a simulation study."), FromDIP(22), FromDIP(22));
+            return;
+        }
+
+        std::vector<ScreenVertex> projected;
+        projected.reserve(mesh.vertices.size());
+        for (const Vec3f &point : mesh.vertices)
+            projected.push_back(project(point.cast<double>(), camera));
+
+        std::vector<size_t> faces;
+        faces.reserve(mesh.indices.size());
+        for (size_t face = 0; face < mesh.indices.size(); ++face)
+            if (valid_triangle(mesh.indices[face], projected.size()))
+                faces.push_back(face);
+        const Vec3d light = Vec3d(-0.3, -0.5, 0.82).normalized();
+        const SA::SphericalRegion *highlight_region = nullptr;
+        bool highlight_whole_model = false;
+        wxColour highlight_colour(63, 145, 224);
+        if (m_preview_region_active) {
+            highlight_region = &m_preview_region;
+            highlight_whole_model = m_preview_region.whole_model;
+            highlight_colour = m_preview_kind == 2 ? wxColour(43, 153, 91) : load_colour(m_preview_load_type);
+        } else if (m_hover_surface) {
+            highlight_region = &m_hover_region;
+            highlight_whole_model = false;
+            highlight_colour = m_placement == int(Placement::Preserve) ? wxColour(43, 153, 91) :
+                load_colour(SA::LoadType(m_placement));
+        } else if (m_selected_kind == 1 && m_selected_index >= 0 &&
+                   size_t(m_selected_index) < m_session->setup.loads.size()) {
+            const SA::Load &selected = m_session->setup.loads[size_t(m_selected_index)];
+            highlight_region = &selected.region;
+            highlight_whole_model = selected.region.whole_model;
+            highlight_colour = load_colour(selected.type);
+        } else if (m_selected_kind == 2 && m_selected_index >= 0 &&
+                   size_t(m_selected_index) < m_session->setup.preserve_regions.size()) {
+            highlight_region = &m_session->setup.preserve_regions[size_t(m_selected_index)];
+            highlight_colour = wxColour(43, 153, 91);
+        }
+        std::vector<unsigned char> highlighted_vertices(projected.size(), 0);
+        if (highlight_region != nullptr) {
+            for (size_t vertex : SA::vertices_in_region(mesh, *highlight_region))
+                if (vertex < highlighted_vertices.size())
+                    highlighted_vertices[vertex] = 1;
+        }
+        DepthBitmap surface_bitmap(GetClientSize());
+        for (size_t face : faces) {
+            const Vec3i32 &triangle = mesh.indices[face];
+            const Vec3d a = mesh.vertices[size_t(triangle[0])].cast<double>();
+            const Vec3d b = mesh.vertices[size_t(triangle[1])].cast<double>();
+            const Vec3d c = mesh.vertices[size_t(triangle[2])].cast<double>();
+            const Vec3d cross = (b - a).cross(c - a);
+            const double shade = cross.squaredNorm() > 1e-12 ? 0.55 + 0.35 * std::abs(cross.normalized().dot(light)) : 0.65;
+            const int base = int(std::lround(205.0 * shade));
+            wxColour surface(std::clamp(base + 18, 0, 255), std::clamp(base + 25, 0, 255),
+                             std::clamp(base + 32, 0, 255));
+            if (highlight_region != nullptr) {
+                const int selected_vertices = int(highlighted_vertices[size_t(triangle[0])]) +
+                    int(highlighted_vertices[size_t(triangle[1])]) + int(highlighted_vertices[size_t(triangle[2])]);
+                const bool exact_surface = highlight_region->shape == SA::RegionShape::Surface;
+                const bool selected_surface = exact_surface && std::find(highlight_region->surface_triangles.begin(),
+                    highlight_region->surface_triangles.end(), face) != highlight_region->surface_triangles.end();
+                const bool in_region = highlight_whole_model || selected_surface ||
+                    (!exact_surface && selected_vertices > 0) ||
+                    (m_preview_region_active && m_preview_face == face) ||
+                    (m_hover_surface && m_hover_face == face);
+                if (in_region)
+                    surface = blend_colour(surface, highlight_colour,
+                                           (m_preview_face == face || m_hover_face == face) ? 0.82 :
+                                               std::min(0.72, 0.34 + 0.12 * selected_vertices));
+            }
+            surface_bitmap.triangle(projected[size_t(triangle[0])], projected[size_t(triangle[1])],
+                                    projected[size_t(triangle[2])],
+                                    [surface](double, double, double) { return surface; });
+        }
+        for (size_t face : faces) {
+            const Vec3i32 &triangle = mesh.indices[face];
+            for (int edge = 0; edge < 3; ++edge)
+                surface_bitmap.line(projected[size_t(triangle[edge])], projected[size_t(triangle[(edge + 1) % 3])],
+                                    wxColour(94, 108, 124));
+        }
+        surface_bitmap.draw(dc);
+        if (highlight_region != nullptr && !highlight_whole_model) {
+            dc.SetPen(wxPen(highlight_colour, 1));
+            dc.SetBrush(wxBrush(highlight_colour));
+            for (size_t vertex = 0; vertex < highlighted_vertices.size(); ++vertex)
+                if (highlighted_vertices[vertex])
+                    dc.DrawCircle(projected[vertex].point, FromDIP(2));
+        }
+
+        double radius = 1.0;
+        for (const Vec3f &point : mesh.vertices)
+            radius = std::max(radius, (point.cast<double>() - camera.center).norm());
+        const double glyph_length = 0.30 * radius;
+        double maximum_load = 0.0;
+        for (const SA::Load &load : m_session->setup.loads)
+            if (load.active && load.type != SA::LoadType::Fixed)
+                maximum_load = std::max(maximum_load, load.magnitude_n *
+                    (load.type == SA::LoadType::ImpactForce ? load.impact_factor : 1.0));
+
+        for (size_t index = 0; index < m_session->setup.loads.size(); ++index) {
+            const SA::Load &load = m_session->setup.loads[index];
+            if (!load.active)
+                continue;
+            const Vec3d center = load.region.whole_model ? camera.center : load.region.center_mm;
+            const ScreenVertex anchor = project(center, camera);
+            const bool selected = m_selected_kind == 1 && m_selected_index == int(index);
+            const int width = selected ? 5 : 3;
+            const wxColour colour = load_colour(load.type);
+            wxPoint glyph_end = anchor.point;
+            if (!load.region.whole_model)
+                draw_region_shape(dc, camera, load.region, colour, selected);
+            if (load.type == SA::LoadType::Fixed) {
+                const int half = FromDIP(selected ? 10 : 8);
+                dc.SetPen(wxPen(colour, width));
+                dc.SetBrush(wxBrush(wxColour(213, 228, 252)));
+                wxPoint support[3]{anchor.point + wxPoint(0, -half), anchor.point + wxPoint(-half, half),
+                                   anchor.point + wxPoint(half, half)};
+                dc.DrawPolygon(3, support);
+                dc.DrawLine(anchor.point + wxPoint(-half - 4, half + 3), anchor.point + wxPoint(half + 4, half + 3));
+            } else {
+                const Vec3d direction = load.direction.squaredNorm() > 1e-12 ? load.direction.normalized() : Vec3d::UnitZ();
+                const double effective_magnitude = load.magnitude_n *
+                    (load.type == SA::LoadType::ImpactForce ? load.impact_factor : 1.0);
+                const double length_scale = maximum_load > 0.0 ?
+                    std::clamp(std::sqrt(std::max(0.0, effective_magnitude) / maximum_load), 0.55, 1.35) : 1.0;
+                const ScreenVertex tip = project(center + direction * glyph_length * length_scale, camera);
+                draw_arrow(dc, anchor.point, tip.point, colour, width);
+                glyph_end = tip.point;
+                dc.SetPen(wxPen(colour, width));
+                dc.SetBrush(wxBrush(wxColour(255, 255, 255)));
+                dc.DrawCircle(anchor.point, FromDIP(selected ? 6 : 4));
+            }
+            dc.SetTextForeground(wxColour(43, 49, 58));
+            dc.DrawText(wxString::FromUTF8(load.name), anchor.point + wxPoint(10, -18));
+            m_glyphs.push_back({1, int(index), anchor.point, glyph_end, FromDIP(load.type == SA::LoadType::Fixed ? 14 : 9)});
+            if (selected) {
+                draw_handle(dc, anchor.point, wxColour(35, 129, 211), false);
+                m_center_handle = anchor.point;
+                if (load.type != SA::LoadType::Fixed) {
+                    draw_handle(dc, glyph_end, colour, true);
+                    m_direction_handle = glyph_end;
+                }
+                if (!load.region.whole_model && load.region.shape != SA::RegionShape::Surface) {
+                    const double extent = load.region.shape == SA::RegionShape::Box ?
+                        0.5 * load.region.size_mm.norm() : load.region.radius_mm;
+                    m_size_handle = project(center + camera.right * extent, camera).point;
+                    draw_handle(dc, m_size_handle, colour, false);
+                    if (load.region.shape == SA::RegionShape::Cylinder) {
+                        const Vec3d axis = load.region.axis.squaredNorm() > 1e-12 ?
+                            load.region.axis.normalized() : Vec3d::UnitZ();
+                        Vec3d screen_axis(axis.dot(camera.right), -axis.dot(camera.up), 0.0);
+                        const double projected = screen_axis.head<2>().norm();
+                        if (projected < 0.1)
+                            screen_axis = Vec3d(0.0, -1.0, 0.0);
+                        else
+                            screen_axis /= projected;
+                        m_height_handle = anchor.point + wxPoint(
+                            int(std::lround(screen_axis.x() * 0.5 * load.region.size_mm.z() * camera.scale)),
+                            int(std::lround(screen_axis.y() * 0.5 * load.region.size_mm.z() * camera.scale)));
+                        draw_handle(dc, m_height_handle, colour, true);
+                    }
+                }
+            }
+        }
+
+        if (m_session->setup.gravity.enabled) {
+            const Vec3d direction = m_session->setup.gravity.acceleration_m_s2.squaredNorm() > 1e-12 ?
+                m_session->setup.gravity.acceleration_m_s2.normalized() : -Vec3d::UnitZ();
+            const Vec3d start = camera.center - direction * 0.55 * radius;
+            const ScreenVertex p0 = project(start, camera);
+            const ScreenVertex p1 = project(start + direction * glyph_length, camera);
+            draw_arrow(dc, p0.point, p1.point, wxColour(38, 133, 140), m_selected_kind == 3 ? 5 : 3);
+            dc.SetTextForeground(wxColour(28, 95, 102));
+            dc.DrawText(_L("Gravity"), p0.point + wxPoint(8, -18));
+            m_glyphs.push_back({3, 0, p0.point, p1.point, FromDIP(9)});
+        }
+
+        for (size_t index = 0; index < m_session->setup.preserve_regions.size(); ++index) {
+            const SA::SphericalRegion &region = m_session->setup.preserve_regions[index];
+            const ScreenVertex center = project(region.center_mm, camera);
+            const double world_extent = region.shape == SA::RegionShape::Box ? 0.5 * region.size_mm.norm() : region.radius_mm;
+            const int screen_extent = std::clamp(int(std::lround(world_extent * camera.scale)), FromDIP(6), FromDIP(180));
+            const bool selected = m_selected_kind == 2 && m_selected_index == int(index);
+            draw_region_shape(dc, camera, region, wxColour(43, 153, 91), selected);
+            dc.SetTextForeground(wxColour(31, 113, 66));
+            dc.DrawText(wxString::Format(_L("Preserve %zu"), index + 1), center.point + wxPoint(10, 8));
+            m_glyphs.push_back({2, int(index), center.point, center.point,
+                                std::clamp(screen_extent, FromDIP(12), FromDIP(36))});
+            if (selected) {
+                m_center_handle = center.point;
+                draw_handle(dc, m_center_handle, wxColour(35, 129, 211), false);
+                if (region.shape != SA::RegionShape::Surface) {
+                    m_size_handle = project(region.center_mm + camera.right * world_extent, camera).point;
+                    draw_handle(dc, m_size_handle, wxColour(43, 153, 91), false);
+                    if (region.shape == SA::RegionShape::Cylinder) {
+                        const Vec3d axis = region.axis.squaredNorm() > 1e-12 ? region.axis.normalized() : Vec3d::UnitZ();
+                        Vec3d screen_axis(axis.dot(camera.right), -axis.dot(camera.up), 0.0);
+                        const double projected = screen_axis.head<2>().norm();
+                        if (projected < 0.1)
+                            screen_axis = Vec3d(0.0, -1.0, 0.0);
+                        else
+                            screen_axis /= projected;
+                        m_height_handle = center.point + wxPoint(
+                            int(std::lround(screen_axis.x() * 0.5 * region.size_mm.z() * camera.scale)),
+                            int(std::lround(screen_axis.y() * 0.5 * region.size_mm.z() * camera.scale)));
+                        draw_handle(dc, m_height_handle, wxColour(43, 153, 91), true);
+                    }
+                }
+            }
+        }
+
+        if (m_preview_region_active) {
+            const wxColour colour = m_preview_kind == 2 ? wxColour(43, 153, 91) : load_colour(m_preview_load_type);
+            if (!m_preview_region.whole_model)
+                draw_region_shape(dc, camera, m_preview_region, colour, true);
+            const ScreenVertex center = project(m_preview_region.center_mm, camera);
+            dc.SetPen(wxPen(colour, 4));
+            dc.SetBrush(wxBrush(wxColour(255, 255, 255)));
+            dc.DrawCircle(center.point, FromDIP(6));
+            if (m_preview_kind == 1 && m_preview_load_type == SA::LoadType::Fixed) {
+                const int half = FromDIP(10);
+                dc.SetBrush(wxBrush(wxColour(213, 228, 252)));
+                wxPoint support[3]{center.point + wxPoint(0, -half), center.point + wxPoint(-half, half),
+                                   center.point + wxPoint(half, half)};
+                dc.DrawPolygon(3, support);
+            } else if (m_preview_kind == 1) {
+                const ScreenVertex tip = project(m_preview_region.center_mm + m_preview_direction * glyph_length, camera);
+                draw_arrow(dc, center.point, tip.point, colour, 4);
+            }
+        } else if (m_hover_surface) {
+            const bool preserve = m_placement == int(Placement::Preserve);
+            const SA::LoadType type = preserve ? SA::LoadType::Fixed : SA::LoadType(m_placement);
+            const wxColour colour = preserve ? wxColour(43, 153, 91) : load_colour(type);
+            draw_region_shape(dc, camera, m_hover_region, colour, true);
+            const ScreenVertex center = project(m_hover_region.center_mm, camera);
+            dc.SetPen(wxPen(colour, 3));
+            dc.SetBrush(wxBrush(wxColour(255, 255, 255)));
+            dc.DrawCircle(center.point, FromDIP(5));
+            if (!preserve && type == SA::LoadType::Fixed) {
+                const int half = FromDIP(9);
+                dc.SetBrush(wxBrush(wxColour(213, 228, 252)));
+                wxPoint support[3]{center.point + wxPoint(0, -half), center.point + wxPoint(-half, half),
+                                   center.point + wxPoint(half, half)};
+                dc.DrawPolygon(3, support);
+            } else if (!preserve) {
+                draw_arrow(dc, center.point,
+                           project(m_hover_region.center_mm + m_hover_direction * glyph_length, camera).point,
+                           colour, 3);
+            }
+        }
+
+        dc.SetTextForeground(wxColour(48, 57, 68));
+        dc.DrawText(_L("Drag to orbit • middle/right drag to pan • wheel to zoom • double-click a glyph to edit"),
+                    FromDIP(12), GetClientSize().y - FromDIP(24));
+        if (m_placement != int(Placement::None)) {
+            dc.SetBrush(wxBrush(wxColour(255, 247, 210)));
+            dc.SetPen(wxPen(wxColour(210, 169, 55), 1));
+            const wxString instruction = m_placement == int(Placement::Preserve) ?
+                _L("Placement active: click a model face to center the preserve region. Esc or Cancel Placement to stop.") :
+                _L("Placement active: click a model face to place the load or constraint and open its properties.");
+            const wxSize extent = dc.GetTextExtent(instruction);
+            dc.DrawRoundedRectangle(FromDIP(10), FromDIP(10), extent.x + FromDIP(20), extent.y + FromDIP(12), FromDIP(5));
+            dc.SetTextForeground(wxColour(90, 65, 10));
+            dc.DrawText(instruction, FromDIP(20), FromDIP(16));
+        }
+    }
+
+    void hovered(const wxPoint &point) override
+    {
+        if (m_placement == int(Placement::None)) {
+            if (m_hover_surface) {
+                m_hover_surface = false;
+                Refresh();
+            }
+            return;
+        }
+        if (std::abs(point.x - m_last_hover.x) + std::abs(point.y - m_last_hover.y) < FromDIP(3))
+            return;
+        m_last_hover = point;
+        Vec3d position, normal;
+        size_t face = 0;
+        const bool found = pick_surface(point, position, normal, face);
+        if (found) {
+            m_hover_region.center_mm = position;
+            m_hover_region.radius_mm = 5.0;
+            m_hover_region.shape = SA::RegionShape::Surface;
+            m_hover_region.surface_triangles = selection_faces(face);
+            m_hover_direction = normal.squaredNorm() > 1e-12 ? Vec3d(-normal.normalized()) : Vec3d(0.0, 0.0, -1.0);
+            m_hover_face = face;
+        }
+        if (m_hover_surface != found || found) {
+            m_hover_surface = found;
+            Refresh();
+        }
+    }
+
+    void clicked(const wxPoint &point, bool double_click) override
+    {
+        if (m_placement != int(Placement::None)) {
+            Vec3d position, normal;
+            size_t face = 0;
+            if (!pick_surface(point, position, normal, face))
+                return;
+            const int placement = m_placement;
+            cancel_placement();
+            m_preview_region_active = true;
+            m_preview_kind = placement == int(Placement::Preserve) ? 2 : 1;
+            m_preview_region.center_mm = position;
+            m_preview_region.radius_mm = 5.0;
+            m_preview_region.shape = SA::RegionShape::Surface;
+            m_preview_region.surface_triangles = selection_faces(face);
+            m_preview_face = face;
+            m_preview_load_type = placement == int(Placement::Preserve) ? SA::LoadType::Fixed : SA::LoadType(placement);
+            m_preview_direction = normal.squaredNorm() > 1e-12 ? Vec3d(-normal.normalized()) : Vec3d(0.0, 0.0, -1.0);
+            Refresh();
+            Update();
+            if (placement == int(Placement::Preserve))
+                m_preserve_placed(position, m_preview_region.surface_triangles);
+            else
+                m_load_placed(SA::LoadType(placement), position, normal, m_preview_region.surface_triangles);
+            clear_preview();
+            return;
+        }
+
+        double closest_distance = std::numeric_limits<double>::infinity();
+        const Glyph *closest = nullptr;
+        for (const Glyph &glyph : m_glyphs) {
+            const double distance = distance_to_segment_squared(point, glyph.point, glyph.end);
+            if (distance <= double(glyph.hit_radius * glyph.hit_radius) && distance < closest_distance) {
+                closest_distance = distance;
+                closest = &glyph;
+            }
+        }
+        if (closest != nullptr) {
+            select_item(closest->kind, closest->index);
+            m_item_selected(closest->kind, closest->index, double_click);
+        }
+    }
+
+    bool begin_interaction(const wxPoint &point) override
+    {
+        if (m_placement != int(Placement::None))
+            return false;
+        const double hit = double(FromDIP(11) * FromDIP(11));
+        auto distance = [&point](const wxPoint &handle) {
+            const double dx = double(point.x - handle.x), dy = double(point.y - handle.y);
+            return dx * dx + dy * dy;
+        };
+        if (distance(m_direction_handle) <= hit)
+            m_active_handle = Handle::Direction;
+        else if (distance(m_height_handle) <= hit)
+            m_active_handle = Handle::Height;
+        else if (distance(m_size_handle) <= hit)
+            m_active_handle = Handle::Size;
+        else if (distance(m_center_handle) <= hit)
+            m_active_handle = Handle::Center;
+        else
+            return false;
+
+        m_interaction_start = point;
+        if (m_selected_kind == 1 && m_selected_index >= 0 &&
+            size_t(m_selected_index) < m_session->setup.loads.size()) {
+            const SA::Load &load = m_session->setup.loads[size_t(m_selected_index)];
+            m_original_region = load.region;
+            m_original_direction = load.direction;
+        } else if (m_selected_kind == 2 && m_selected_index >= 0 &&
+                   size_t(m_selected_index) < m_session->setup.preserve_regions.size()) {
+            m_original_region = m_session->setup.preserve_regions[size_t(m_selected_index)];
+        } else {
+            m_active_handle = Handle::None;
+            return false;
+        }
+        SetCursor(wxCursor(wxCURSOR_HAND));
+        return true;
+    }
+
+    void update_interaction(const wxPoint &point) override
+    {
+        SA::SphericalRegion *region = nullptr;
+        SA::Load *load = nullptr;
+        if (m_selected_kind == 1 && m_selected_index >= 0 &&
+            size_t(m_selected_index) < m_session->setup.loads.size()) {
+            load = &m_session->setup.loads[size_t(m_selected_index)];
+            region = &load->region;
+        } else if (m_selected_kind == 2 && m_selected_index >= 0 &&
+                   size_t(m_selected_index) < m_session->setup.preserve_regions.size()) {
+            region = &m_session->setup.preserve_regions[size_t(m_selected_index)];
+        }
+        if (region == nullptr)
+            return;
+        const CameraFrame frame = camera();
+        const double dx = double(point.x - m_interaction_start.x);
+        const double dy = double(point.y - m_interaction_start.y);
+        if (m_active_handle == Handle::Center) {
+            Vec3d position, normal;
+            size_t face = 0;
+            if (pick_surface(point, position, normal, face)) {
+                region->center_mm = position;
+                if (region->shape == SA::RegionShape::Surface)
+                    region->surface_triangles = selection_faces(face);
+            } else if (region->shape != SA::RegionShape::Surface) {
+                region->center_mm = m_original_region.center_mm + (frame.right * dx - frame.up * dy) / frame.scale;
+            }
+        } else if (m_active_handle == Handle::Direction && load != nullptr) {
+            const ScreenVertex center = project(region->center_mm, frame);
+            const double screen_x = double(point.x - center.point.x);
+            const double screen_y = double(point.y - center.point.y);
+            const double projected_length = std::max(1.0, std::hypot(screen_x, screen_y));
+            const Vec3d original_direction = m_original_direction.squaredNorm() > 1e-12 ?
+                m_original_direction.normalized() : Vec3d::UnitZ();
+            const Vec3d candidate = frame.right * screen_x - frame.up * screen_y +
+                frame.forward * (original_direction.dot(frame.forward) * projected_length);
+            if (candidate.squaredNorm() > 1e-12)
+                load->direction = candidate.normalized();
+        } else if (m_active_handle == Handle::Size) {
+            const ScreenVertex center = project(region->center_mm, frame);
+            const double extent = std::max(0.1, std::hypot(double(point.x - center.point.x),
+                                                          double(point.y - center.point.y)) / frame.scale);
+            if (region->shape == SA::RegionShape::Box) {
+                const double original_extent = std::max(1e-9, 0.5 * m_original_region.size_mm.norm());
+                region->size_mm = m_original_region.size_mm * (extent / original_extent);
+            } else {
+                region->radius_mm = extent;
+                if (region->shape == SA::RegionShape::Cylinder) {
+                    region->size_mm.x() = 2.0 * extent;
+                    region->size_mm.y() = 2.0 * extent;
+                }
+            }
+        } else if (m_active_handle == Handle::Height && region->shape == SA::RegionShape::Cylinder) {
+            const Vec3d axis = region->axis.squaredNorm() > 1e-12 ? region->axis.normalized() : Vec3d::UnitZ();
+            Vec2d screen_axis(axis.dot(frame.right), -axis.dot(frame.up));
+            double projected = screen_axis.norm();
+            if (projected < 0.1) {
+                screen_axis = Vec2d(0.0, -1.0);
+                projected = 1.0;
+            } else {
+                screen_axis /= projected;
+            }
+            const ScreenVertex center = project(region->center_mm, frame);
+            const Vec2d cursor(double(point.x - center.point.x), double(point.y - center.point.y));
+            const double half_height = std::abs(cursor.dot(screen_axis)) / frame.scale;
+            region->size_mm.z() = std::max(0.2, 2.0 * half_height);
+        }
+        m_item_changed(false);
+        Refresh();
+    }
+
+    void end_interaction() override
+    {
+        if (m_active_handle == Handle::None)
+            return;
+        m_active_handle = Handle::None;
+        SetCursor(wxNullCursor);
+        m_item_changed(true);
+    }
+
+private:
+    struct Glyph { int kind; int index; wxPoint point; wxPoint end; int hit_radius; };
+    enum class Handle { None, Center, Direction, Size, Height };
+    std::shared_ptr<StrengthAnalysisSession> m_session;
+    std::function<void(SA::LoadType, const Vec3d &, const Vec3d &, const std::vector<size_t> &)> m_load_placed;
+    std::function<void(const Vec3d &, const std::vector<size_t> &)> m_preserve_placed;
+    std::function<void(int, int, bool)> m_item_selected;
+    std::function<void(bool)> m_item_changed;
+    std::vector<Glyph> m_glyphs;
+    std::vector<SA::SurfacePatch> m_surface_patches;
+    std::vector<std::vector<size_t>> m_components;
+    int m_selection_mode{1};
+    int m_placement{int(Placement::None)};
+    int m_selected_kind{0};
+    int m_selected_index{-1};
+    bool m_preview_region_active{false};
+    int m_preview_kind{0};
+    SA::LoadType m_preview_load_type{SA::LoadType::LocalForce};
+    SA::SphericalRegion m_preview_region;
+    Vec3d m_preview_direction{Vec3d::UnitZ()};
+    size_t m_preview_face{std::numeric_limits<size_t>::max()};
+    bool m_hover_surface{false};
+    SA::SphericalRegion m_hover_region;
+    Vec3d m_hover_direction{Vec3d::UnitZ()};
+    size_t m_hover_face{std::numeric_limits<size_t>::max()};
+    wxPoint m_last_hover{-10000, -10000};
+    wxPoint m_center_handle{-10000, -10000};
+    wxPoint m_direction_handle{-10000, -10000};
+    wxPoint m_size_handle{-10000, -10000};
+    wxPoint m_height_handle{-10000, -10000};
+    wxPoint m_interaction_start;
+    Handle m_active_handle{Handle::None};
+    SA::SphericalRegion m_original_region;
+    Vec3d m_original_direction{Vec3d::UnitZ()};
+
+    static void draw_handle(wxDC &dc, const wxPoint &point, const wxColour &colour, bool round)
+    {
+        dc.SetPen(wxPen(colour, 2));
+        dc.SetBrush(wxBrush(*wxWHITE));
+        if (round)
+            dc.DrawCircle(point, 6);
+        else
+            dc.DrawRectangle(point.x - 5, point.y - 5, 10, 10);
+    }
+
+    std::vector<size_t> selection_faces(size_t face) const
+    {
+        if (m_selection_mode == 1)
+            for (const SA::SurfacePatch &patch : m_surface_patches)
+                if (std::find(patch.triangles.begin(), patch.triangles.end(), face) != patch.triangles.end())
+                    return patch.triangles;
+        if (m_selection_mode == 2)
+            for (const auto &component : m_components)
+                if (std::find(component.begin(), component.end(), face) != component.end())
+                    return component;
+        return {face};
+    }
+
+    static double distance_to_segment_squared(const wxPoint &point, const wxPoint &start, const wxPoint &end)
+    {
+        const double dx = double(end.x - start.x), dy = double(end.y - start.y);
+        const double length_squared = dx * dx + dy * dy;
+        const double t = length_squared > 1e-9 ? std::clamp(
+            (double(point.x - start.x) * dx + double(point.y - start.y) * dy) / length_squared, 0.0, 1.0) : 0.0;
+        const double x = double(start.x) + t * dx;
+        const double y = double(start.y) + t * dy;
+        const double ex = double(point.x) - x, ey = double(point.y) - y;
+        return ex * ex + ey * ey;
+    }
+
+    bool pick_surface(const wxPoint &point, Vec3d &position, Vec3d &normal, size_t &face_index) const
+    {
+        const indexed_triangle_set &mesh = m_session->mesh;
+        if (mesh.vertices.empty())
+            return false;
+        const CameraFrame frame = camera();
+        std::vector<ScreenVertex> projected;
+        projected.reserve(mesh.vertices.size());
+        for (const Vec3f &vertex : mesh.vertices)
+            projected.push_back(project(vertex.cast<double>(), frame));
+        bool found = false;
+        double best_depth = -std::numeric_limits<double>::infinity();
+        for (size_t face = 0; face < mesh.indices.size(); ++face) {
+            const Vec3i32 &triangle = mesh.indices[face];
+            const size_t i0 = size_t(triangle[0]), i1 = size_t(triangle[1]), i2 = size_t(triangle[2]);
+            if (i0 >= projected.size() || i1 >= projected.size() || i2 >= projected.size())
+                continue;
+            const wxPoint screen[3]{projected[i0].point, projected[i1].point, projected[i2].point};
+            double weights[3];
+            if (!barycentric(point, screen, weights))
+                continue;
+            const double depth = weights[0] * projected[i0].depth + weights[1] * projected[i1].depth +
+                                 weights[2] * projected[i2].depth;
+            if (depth <= best_depth)
+                continue;
+            const Vec3d a = mesh.vertices[i0].cast<double>();
+            const Vec3d b = mesh.vertices[i1].cast<double>();
+            const Vec3d c = mesh.vertices[i2].cast<double>();
+            const Vec3d cross = (b - a).cross(c - a);
+            if (cross.squaredNorm() < 1e-12)
+                continue;
+            best_depth = depth;
+            position = weights[0] * a + weights[1] * b + weights[2] * c;
+            normal = cross.normalized();
+            if (normal.dot(frame.forward) < 0.0)
+                normal = -normal;
+            face_index = face;
+            found = true;
+        }
+        return found;
+    }
+};
+
 StrengthLoadPanel::StrengthLoadPanel(wxWindow *parent, Plater *plater, std::shared_ptr<StrengthAnalysisSession> session)
-    : wxScrolledWindow(parent, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxVSCROLL | wxTAB_TRAVERSAL)
+    : wxScrolledWindow(parent, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxVSCROLL | wxHSCROLL | wxTAB_TRAVERSAL)
     , m_plater(plater)
     , m_session(std::move(session))
 {
     SetBackgroundColour(*wxWHITE);
-    SetScrollRate(0, FromDIP(12));
+    SetScrollRate(FromDIP(12), FromDIP(12));
     build_ui();
     Bind(EVT_STRENGTH_ANALYSIS_FINISHED, [this](wxThreadEvent &) { on_analysis_finished(); });
 }
@@ -177,6 +1370,158 @@ void StrengthLoadPanel::build_ui()
     root->Add(new wxStaticText(this, wxID_ANY, _L("Strength Analysis — Load Setup")), 0, wxLEFT | wxRIGHT | wxTOP, gap);
     m_object_label = new wxStaticText(this, wxID_ANY, _L("Select one model object in Prepare."));
     root->Add(m_object_label, 0, wxEXPAND | wxALL, gap);
+    m_status_label = new wxStaticText(this, wxID_ANY,
+        _L("Pre-check pending. Results are offline engineering estimates, not certification-grade FEA."));
+    root->Add(m_status_label, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
+
+    auto *workspace = new wxStaticBoxSizer(wxVERTICAL, this, _L("Simulation study workspace"));
+    auto *placement_tools = new wxBoxSizer(wxHORIZONTAL);
+    auto *place_fixed = new wxButton(this, wxID_ANY, _L("Fixed support"));
+    auto *place_force = new wxButton(this, wxID_ANY, _L("Force"));
+    auto *place_bearing = new wxButton(this, wxID_ANY, _L("Bearing"));
+    auto *place_impact = new wxButton(this, wxID_ANY, _L("Impact"));
+    auto *place_global = new wxButton(this, wxID_ANY, _L("Global load"));
+    auto *place_preserve = new wxButton(this, wxID_ANY, _L("Preserve region"));
+    auto *gravity_dialog = new wxButton(this, wxID_ANY, _L("Gravity"));
+    auto *generate_faces = new wxButton(this, wxID_ANY, _L("Generate solid faces"));
+    auto *selection_mode = new wxChoice(this, wxID_ANY, wxDefaultPosition, wxDefaultSize,
+                                        {_L("Triangle"), _L("Solid face"), _L("Component")});
+    selection_mode->SetSelection(1);
+    auto *cancel_placement = new wxButton(this, wxID_ANY, _L("Cancel placement"));
+    for (wxButton *button : {place_fixed, place_force, place_bearing, place_impact, place_global,
+                             place_preserve, gravity_dialog, generate_faces, cancel_placement})
+        placement_tools->Add(button, 0, wxRIGHT, gap);
+    placement_tools->Add(new wxStaticText(this, wxID_ANY, _L("Selection")), 0,
+                         wxALIGN_CENTER_VERTICAL | wxRIGHT, FromDIP(4));
+    placement_tools->Add(selection_mode, 0, wxRIGHT, gap);
+    workspace->Add(placement_tools, 0, wxEXPAND | wxALL, gap);
+
+    auto *study_tools = new wxBoxSizer(wxHORIZONTAL);
+    auto *material_dialog = new wxButton(this, wxID_ANY, _L("Study material"));
+    auto *infill_dialog = new wxButton(this, wxID_ANY, _L("Print structure"));
+    auto *criteria_dialog = new wxButton(this, wxID_ANY, _L("Optimization objectives"));
+    auto *fit_view = new wxButton(this, wxID_ANY, _L("Fit"));
+    auto *view = new wxChoice(this, wxID_ANY, wxDefaultPosition, wxDefaultSize,
+                              {_L("Isometric"), _L("Front"), _L("Top"), _L("Right")});
+    view->SetSelection(0);
+    m_precheck_button = new wxButton(this, wxID_ANY, _L("Pre-check"));
+    m_run_button = new wxButton(this, wxID_ANY, _L("Solve"));
+    m_cancel_button = new wxButton(this, wxID_ANY, _L("Cancel solve"));
+    for (wxButton *button : {material_dialog, infill_dialog, criteria_dialog, fit_view})
+        study_tools->Add(button, 0, wxRIGHT, gap);
+    study_tools->Add(new wxStaticText(this, wxID_ANY, _L("View")), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, FromDIP(4));
+    study_tools->Add(view, 0, wxRIGHT, gap);
+    study_tools->AddStretchSpacer();
+    study_tools->Add(m_precheck_button, 0, wxRIGHT, gap);
+    study_tools->Add(m_run_button, 0, wxRIGHT, gap);
+    study_tools->Add(m_cancel_button, 0);
+    workspace->Add(study_tools, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
+
+    m_setup_canvas = new SetupCanvas(this, m_session,
+        [this](SA::LoadType type, const Vec3d &position, const Vec3d &normal, const std::vector<size_t> &faces) {
+            place_load_at(type, position, normal, faces);
+        },
+        [this](const Vec3d &position, const std::vector<size_t> &faces) { place_preserve_at(position, faces); },
+        [this](int kind, int index, bool edit) { select_canvas_item(kind, index, edit); },
+        [this](bool commit) {
+            refresh_operation_panel();
+            if (commit) {
+                persist_setup();
+                mark_stale();
+                refresh_load_list();
+                refresh_preserve_list();
+                refresh_study_tree();
+            }
+        });
+    auto *workspace_body = new wxBoxSizer(wxHORIZONTAL);
+    m_study_tree = new wxTreeCtrl(this, wxID_ANY, wxDefaultPosition, FromDIP(wxSize(245, 500)),
+                                  wxTR_HIDE_ROOT | wxTR_HAS_BUTTONS | wxTR_SINGLE | wxBORDER_SIMPLE);
+    workspace_body->Add(m_study_tree, 0, wxEXPAND | wxRIGHT, gap);
+    workspace_body->Add(m_setup_canvas, 1, wxEXPAND);
+
+    m_operation_panel = new wxPanel(this, wxID_ANY, wxDefaultPosition, FromDIP(wxSize(330, 500)), wxBORDER_SIMPLE);
+    m_operation_panel->SetMinSize(FromDIP(wxSize(330, 400)));
+    auto *operation = new wxBoxSizer(wxVERTICAL);
+    m_operation_title = new wxStaticText(m_operation_panel, wxID_ANY, _L("Operation details"));
+    operation->Add(m_operation_title, 0, wxEXPAND | wxALL, gap);
+    auto *operation_help = new wxStaticText(m_operation_panel, wxID_ANY,
+        _L("Select a load, support, or preserve region. Drag its white handles in the model or edit exact values here."));
+    operation_help->Wrap(FromDIP(300));
+    operation->Add(operation_help, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
+    auto *operation_grid = new wxFlexGridSizer(2, gap, gap);
+    operation_grid->AddGrowableCol(1, 1);
+    m_operation_name = new wxTextCtrl(m_operation_panel, wxID_ANY);
+    add_labeled(operation_grid, m_operation_panel, _L("Name"), m_operation_name, 1);
+    m_operation_shape = new wxChoice(m_operation_panel, wxID_ANY, wxDefaultPosition, wxDefaultSize, region_shape_names());
+    add_labeled(operation_grid, m_operation_panel, _L("Region shape"), m_operation_shape, 1);
+    add_labeled(operation_grid, m_operation_panel, _L("Position (mm)"),
+                vector_editor(m_operation_panel, m_operation_center, Vec3d::Zero(), {}, 54), 1);
+    add_labeled(operation_grid, m_operation_panel, _L("Box size XYZ / cylinder height Z (mm)"),
+                vector_editor(m_operation_panel, m_operation_size, Vec3d::Constant(10.0), {}, 54), 1);
+    m_operation_radius = number_input(m_operation_panel, 5.0, 100);
+    add_labeled(operation_grid, m_operation_panel, _L("Radius (mm)"), m_operation_radius, 1);
+    add_labeled(operation_grid, m_operation_panel, _L("Region axis"),
+                vector_editor(m_operation_panel, m_operation_axis, Vec3d::UnitZ(), {}, 54), 1);
+    add_labeled(operation_grid, m_operation_panel, _L("Force direction"),
+                vector_editor(m_operation_panel, m_operation_direction, Vec3d::UnitZ(), {}, 54), 1);
+    m_operation_magnitude = number_input(m_operation_panel, 100.0, 100);
+    add_labeled(operation_grid, m_operation_panel, _L("Force (N)"), m_operation_magnitude, 1);
+    operation->Add(operation_grid, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
+    auto *operation_buttons = new wxBoxSizer(wxHORIZONTAL);
+    m_operation_apply = new wxButton(m_operation_panel, wxID_ANY, _L("Apply"));
+    m_operation_popout = new wxButton(m_operation_panel, wxID_ANY, _L("Pop out…"));
+    operation_buttons->Add(m_operation_apply, 0, wxRIGHT, gap);
+    operation_buttons->Add(m_operation_popout, 0);
+    operation->Add(operation_buttons, 0, wxLEFT | wxRIGHT | wxBOTTOM, gap);
+    m_operation_panel->SetSizer(operation);
+    workspace_body->Add(m_operation_panel, 0, wxEXPAND | wxLEFT, gap);
+    workspace->Add(workspace_body, 1, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
+    root->Add(workspace, 1, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
+
+    place_fixed->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { begin_place_load(SA::LoadType::Fixed); });
+    place_force->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { begin_place_load(SA::LoadType::DirectionalForce); });
+    place_bearing->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { begin_place_load(SA::LoadType::BearingForce); });
+    place_impact->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { begin_place_load(SA::LoadType::ImpactForce); });
+    place_global->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { begin_place_load(SA::LoadType::GlobalForce); });
+    place_preserve->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { m_setup_canvas->begin_preserve(); });
+    gravity_dialog->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { edit_gravity_dialog(); });
+    generate_faces->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) {
+        m_setup_canvas->rebuild_surface_groups();
+        const auto patches = SA::group_coplanar_surfaces(m_session->mesh);
+        m_status_label->SetLabel(wxString::Format(
+            _L("Generated %zu solid-like planar faces. The source triangle mesh and shape were not changed."), patches.size()));
+    });
+    selection_mode->Bind(wxEVT_CHOICE, [this, selection_mode](wxCommandEvent &) {
+        m_setup_canvas->set_selection_mode(selection_mode->GetSelection());
+    });
+    cancel_placement->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { m_setup_canvas->cancel_placement(); });
+    material_dialog->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { edit_material_dialog(); });
+    infill_dialog->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { edit_infill_dialog(); });
+    criteria_dialog->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { edit_criteria_dialog(); });
+    m_operation_apply->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { apply_operation_panel(); });
+    m_operation_popout->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) {
+        select_canvas_item(m_selected_kind, m_selected_index, true);
+    });
+    fit_view->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { m_setup_canvas->fit_view(); });
+    view->Bind(wxEVT_CHOICE, [this, view](wxCommandEvent &) { m_setup_canvas->set_view(view->GetSelection()); });
+    m_study_tree->Bind(wxEVT_TREE_SEL_CHANGED, [this](wxTreeEvent &event) {
+        auto *data = dynamic_cast<StudyTreeItemData *>(m_study_tree->GetItemData(event.GetItem()));
+        if (data != nullptr && data->kind >= 1 && data->kind <= 3)
+            select_canvas_item(data->kind, data->index, false);
+    });
+    m_study_tree->Bind(wxEVT_TREE_ITEM_ACTIVATED, [this](wxTreeEvent &event) {
+        auto *data = dynamic_cast<StudyTreeItemData *>(m_study_tree->GetItemData(event.GetItem()));
+        if (data == nullptr)
+            return;
+        if (data->kind >= 1 && data->kind <= 3)
+            select_canvas_item(data->kind, data->index, true);
+        else if (data->kind == 4)
+            edit_material_dialog();
+        else if (data->kind == 5)
+            edit_infill_dialog();
+        else if (data->kind == 6)
+            edit_criteria_dialog();
+    });
 
     auto *material = new wxStaticBoxSizer(wxVERTICAL, this, _L("Material and print direction"));
     auto *material_choice_row = new wxBoxSizer(wxHORIZONTAL);
@@ -312,16 +1657,12 @@ void StrengthLoadPanel::build_ui()
 
     auto *actions = new wxBoxSizer(wxHORIZONTAL);
     auto *save_button = new wxButton(this, wxID_ANY, _L("Save setup"));
-    m_run_button = new wxButton(this, wxID_ANY, _L("Run analysis"));
-    m_cancel_button = new wxButton(this, wxID_ANY, _L("Cancel"));
     m_dense_button = new wxButton(this, wxID_ANY, _L("Create dense modifier"));
     m_orientation_button = new wxButton(this, wxID_ANY, _L("Apply best orientation"));
     m_settings_button = new wxButton(this, wxID_ANY, _L("Apply optimized settings"));
-    for (wxButton *button : {save_button, m_run_button, m_cancel_button, m_dense_button, m_orientation_button, m_settings_button})
+    for (wxButton *button : {save_button, m_dense_button, m_orientation_button, m_settings_button})
         actions->Add(button, 0, wxRIGHT, gap);
     root->Add(actions, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
-    m_status_label = new wxStaticText(this, wxID_ANY, _L("Not run. Results are engineering estimates, not certification-grade FEA."));
-    root->Add(m_status_label, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
     SetSizer(root);
 
     m_material_choice->Bind(wxEVT_CHOICE, [this](wxCommandEvent &) {
@@ -341,15 +1682,20 @@ void StrengthLoadPanel::build_ui()
         const int selected = m_load_list->GetSelection();
         save_current_load_editor();
         refresh_load_list();
-        load_current_load_editor(selected);
+        select_canvas_item(1, selected, false);
+    });
+    m_load_list->Bind(wxEVT_LISTBOX_DCLICK, [this](wxCommandEvent &) {
+        const int selected = m_load_list->GetSelection();
+        select_canvas_item(1, selected, true);
     });
     add_load->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) {
         save_current_load_editor();
         SA::Load load;
         load.name = "Load " + std::to_string(m_session->setup.loads.size() + 1);
         m_session->setup.loads.push_back(load);
-        refresh_load_list();
-        load_current_load_editor(int(m_session->setup.loads.size()) - 1);
+        populate_from_setup();
+        select_canvas_item(1, int(m_session->setup.loads.size()) - 1, false);
+        persist_setup();
         mark_stale();
     });
     remove_load->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) {
@@ -358,7 +1704,14 @@ void StrengthLoadPanel::build_ui()
             m_session->setup.loads.erase(m_session->setup.loads.begin() + selected);
             m_current_load = -1;
             refresh_load_list();
-            load_current_load_editor(std::min(selected, int(m_session->setup.loads.size()) - 1));
+            const int next = std::min(selected, int(m_session->setup.loads.size()) - 1);
+            load_current_load_editor(next);
+            m_selected_kind = next >= 0 ? 1 : 0;
+            m_selected_index = next;
+            m_setup_canvas->select_item(m_selected_kind, m_selected_index);
+            refresh_study_tree();
+            refresh_operation_panel();
+            persist_setup();
             mark_stale();
         }
     });
@@ -366,15 +1719,32 @@ void StrengthLoadPanel::build_ui()
         SA::SphericalRegion region;
         region.center_mm = read_vector(m_preserve_center, Vec3d::Zero());
         read_number(m_preserve_radius, region.radius_mm);
+        region.shape = SA::RegionShape::Box;
         m_session->setup.preserve_regions.push_back(region);
-        refresh_preserve_list();
+        populate_from_setup();
+        select_canvas_item(2, int(m_session->setup.preserve_regions.size()) - 1, false);
+        persist_setup();
         mark_stale();
+    });
+    m_preserve_list->Bind(wxEVT_LISTBOX, [this](wxCommandEvent &) {
+        select_canvas_item(2, m_preserve_list->GetSelection(), false);
+    });
+    m_preserve_list->Bind(wxEVT_LISTBOX_DCLICK, [this](wxCommandEvent &) {
+        const int selected = m_preserve_list->GetSelection();
+        select_canvas_item(2, selected, true);
     });
     remove_preserve->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) {
         const int selected = m_preserve_list->GetSelection();
         if (selected >= 0 && size_t(selected) < m_session->setup.preserve_regions.size()) {
             m_session->setup.preserve_regions.erase(m_session->setup.preserve_regions.begin() + selected);
+            const int next = std::min(selected, int(m_session->setup.preserve_regions.size()) - 1);
+            m_selected_kind = next >= 0 ? 2 : 0;
+            m_selected_index = next;
+            m_setup_canvas->select_item(m_selected_kind, m_selected_index);
             refresh_preserve_list();
+            refresh_study_tree();
+            refresh_operation_panel();
+            persist_setup();
             mark_stale();
         }
     });
@@ -385,6 +1755,7 @@ void StrengthLoadPanel::build_ui()
         }
     });
     m_run_button->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { run_analysis(); });
+    m_precheck_button->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { run_precheck(true); });
     m_cancel_button->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { cancel_analysis(); });
     m_dense_button->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { create_dense_modifier(); });
     m_orientation_button->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { apply_recommended_orientation(); });
@@ -424,6 +1795,8 @@ void StrengthLoadPanel::build_ui()
     m_dense_button->Disable();
     m_orientation_button->Disable();
     m_settings_button->Disable();
+    refresh_study_tree();
+    refresh_operation_panel();
 }
 
 void StrengthLoadPanel::activate()
@@ -439,10 +1812,18 @@ void StrengthLoadPanel::load_selected_object()
     if (index < 0 || size_t(index) >= m_plater->model().objects.size()) {
         m_object_label->SetLabel(_L("Select one model object in Prepare."));
         m_run_button->Disable();
+        m_precheck_button->Disable();
+        if (m_session->object_index != -1) {
+            m_session->object_index = -1;
+            m_session->mesh = {};
+            m_session->stale = true;
+            ++m_session->revision;
+        }
         return;
     }
 
     ModelObject *object = m_plater->model().objects[size_t(index)];
+    const bool new_object = index != m_session->object_index;
     const indexed_triangle_set current_mesh = object->raw_mesh().its;
     const bool changed_geometry = index == m_session->object_index && !meshes_equal(current_mesh, m_session->mesh);
     if (index != m_session->object_index) {
@@ -454,6 +1835,8 @@ void StrengthLoadPanel::load_selected_object()
                 m_status_label->SetLabel(wxString::Format(_L("Saved strength setup could not be read: %s"), wxString::FromUTF8(error)));
         }
         m_session->result = SA::Result{};
+        m_session->solved_mesh = {};
+        m_session->solved_setup = SA::Setup{};
         m_session->stale = true;
         ++m_session->revision;
         m_current_load = -1;
@@ -465,13 +1848,22 @@ void StrengthLoadPanel::load_selected_object()
         m_orientation_button->Disable();
         m_settings_button->Disable();
         m_status_label->SetLabel(_L("Model geometry changed; run the analysis again."));
-        if (m_result_callback)
-            m_result_callback();
     }
     m_session->mesh = current_mesh;
     m_object_label->SetLabel(wxString::Format(_L("Object: %s — %zu vertices, %zu triangles"),
         wxString::FromUTF8(object->name), current_mesh.vertices.size(), current_mesh.indices.size()));
     m_run_button->Enable(!current_mesh.empty());
+    m_precheck_button->Enable(!current_mesh.empty());
+    if (m_setup_canvas != nullptr) {
+        if (new_object || changed_geometry)
+            m_setup_canvas->rebuild_surface_groups();
+        if (new_object)
+            m_setup_canvas->fit_view();
+        else
+            m_setup_canvas->Refresh();
+    }
+    refresh_study_tree();
+    refresh_operation_panel();
 }
 
 void StrengthLoadPanel::populate_material_fields()
@@ -518,6 +1910,13 @@ void StrengthLoadPanel::populate_from_setup()
     refresh_load_list();
     load_current_load_editor(setup.loads.empty() ? -1 : 0);
     refresh_preserve_list();
+    refresh_study_tree();
+    if ((m_selected_kind == 1 && (m_selected_index < 0 || size_t(m_selected_index) >= setup.loads.size())) ||
+        (m_selected_kind == 2 && (m_selected_index < 0 || size_t(m_selected_index) >= setup.preserve_regions.size()))) {
+        m_selected_kind = 0;
+        m_selected_index = -1;
+    }
+    refresh_operation_panel();
 }
 
 bool StrengthLoadPanel::collect_setup(bool show_errors)
@@ -627,6 +2026,9 @@ void StrengthLoadPanel::mark_stale()
         m_status_label->SetLabel(_L("Inputs changed; displayed simulation results are stale until rerun."));
     if (m_result_callback)
         m_result_callback();
+    if (m_setup_canvas != nullptr)
+        m_setup_canvas->Refresh();
+    refresh_study_tree();
 }
 
 void StrengthLoadPanel::refresh_load_list()
@@ -690,13 +2092,867 @@ void StrengthLoadPanel::refresh_preserve_list()
 {
     m_preserve_list->Clear();
     for (const SA::SphericalRegion &region : m_session->setup.preserve_regions)
-        m_preserve_list->Append(wxString::Format(_L("Center %s, radius %.4g mm"), vector_text(region.center_mm), region.radius_mm));
+        m_preserve_list->Append(wxString::Format(_L("%s — center %s"),
+            wxString::FromUTF8(SA::to_string(region.shape)), vector_text(region.center_mm)));
+}
+
+void StrengthLoadPanel::refresh_study_tree()
+{
+    if (m_study_tree == nullptr)
+        return;
+    m_study_tree->Freeze();
+    m_study_tree->DeleteAllItems();
+    const wxTreeItemId root = m_study_tree->AddRoot("study-root");
+    const wxTreeItemId study = m_study_tree->AppendItem(root, _L("Study 1 — Static strength"));
+    m_study_tree->AppendItem(study,
+        wxString::Format(_L("Material — %s"), wxString::FromUTF8(m_session->setup.material.name)),
+        -1, -1, new StudyTreeItemData(4));
+
+    const wxTreeItemId load_case = m_study_tree->AppendItem(study, _L("Load case 1"));
+    if (m_session->setup.loads.empty()) {
+        m_study_tree->AppendItem(load_case, _L("[needs input] Add a support and a load"));
+    } else {
+        for (size_t index = 0; index < m_session->setup.loads.size(); ++index) {
+            const SA::Load &load = m_session->setup.loads[index];
+            const wxString state = load.active ? _L("[configured]") : _L("[suppressed]");
+            m_study_tree->AppendItem(load_case,
+                wxString::Format("%s %s — %s", state, wxString::FromUTF8(load.name),
+                                 wxString::FromUTF8(SA::to_string(load.type))),
+                -1, -1, new StudyTreeItemData(1, int(index)));
+        }
+    }
+
+    const wxTreeItemId preserves = m_study_tree->AppendItem(study, _L("Preserve regions"));
+    if (m_session->setup.preserve_regions.empty()) {
+        m_study_tree->AppendItem(preserves, _L("None"));
+    } else {
+        for (size_t index = 0; index < m_session->setup.preserve_regions.size(); ++index)
+            m_study_tree->AppendItem(preserves, wxString::Format(_L("Preserve %zu"), index + 1),
+                                     -1, -1, new StudyTreeItemData(2, int(index)));
+    }
+
+    m_study_tree->AppendItem(study,
+        m_session->setup.gravity.enabled ? _L("Gravity — enabled") : _L("Gravity — suppressed"),
+        -1, -1, new StudyTreeItemData(3, 0));
+    m_study_tree->AppendItem(study,
+        wxString::Format(_L("Print structure — %.4g%% %s"), m_session->setup.infill.background_density * 100.0,
+                         wxString::FromUTF8(SA::to_string(m_session->setup.infill.background_pattern))),
+        -1, -1, new StudyTreeItemData(5));
+    m_study_tree->AppendItem(study,
+        wxString::Format(_L("Objectives — safety factor %.4g"), m_session->setup.criteria.minimum_safety_factor),
+        -1, -1, new StudyTreeItemData(6));
+    m_study_tree->AppendItem(study,
+        m_session->mesh.empty() ? _L("Mesh — select a model") :
+            wxString::Format(_L("Mesh — %zu triangles"), m_session->mesh.indices.size()));
+    const std::vector<std::string> precheck_errors = SA::validate(m_session->mesh, m_session->setup);
+    m_study_tree->AppendItem(study, precheck_errors.empty() ? _L("Pre-check — READY") :
+        wxString::Format(_L("Pre-check — %zu issue(s)"), precheck_errors.size()));
+    const wxString result_state = m_session->result.status == SA::AnalysisStatus::NotRun ? _L("not solved") :
+        wxString::FromUTF8(SA::to_string(m_session->result.status));
+    m_study_tree->AppendItem(study,
+        wxString::Format(_L("Results — %s%s"), result_state, m_session->stale ? _L(" (stale)") : wxString()));
+    m_study_tree->ExpandAll();
+    m_study_tree->Thaw();
+}
+
+void StrengthLoadPanel::select_study_tree_item(int kind, int index)
+{
+    if (m_study_tree == nullptr)
+        return;
+    std::function<bool(const wxTreeItemId &)> visit = [&](const wxTreeItemId &item) {
+        if (!item.IsOk())
+            return false;
+        if (auto *data = dynamic_cast<StudyTreeItemData *>(m_study_tree->GetItemData(item));
+            data != nullptr && data->kind == kind && data->index == index) {
+            if (m_study_tree->GetSelection() != item)
+                m_study_tree->SelectItem(item);
+            m_study_tree->EnsureVisible(item);
+            return true;
+        }
+        wxTreeItemIdValue cookie;
+        for (wxTreeItemId child = m_study_tree->GetFirstChild(item, cookie); child.IsOk();
+             child = m_study_tree->GetNextChild(item, cookie))
+            if (visit(child))
+                return true;
+        return false;
+    };
+    visit(m_study_tree->GetRootItem());
+}
+
+void StrengthLoadPanel::begin_place_load(SA::LoadType type)
+{
+    load_selected_object();
+    if (m_session->mesh.empty())
+        return;
+    if (type != SA::LoadType::GlobalForce) {
+        m_setup_canvas->begin_load(type);
+        m_status_label->SetLabel(_L("Placement active: click a model face. Dragging still orbits the view."));
+        return;
+    }
+
+    SA::Load load;
+    load.name = "Global load " + std::to_string(m_session->setup.loads.size() + 1);
+    load.type = SA::LoadType::GlobalForce;
+    load.region.whole_model = true;
+    if (!m_session->mesh.vertices.empty()) {
+        Vec3d minimum = m_session->mesh.vertices.front().cast<double>();
+        Vec3d maximum = minimum;
+        for (const Vec3f &vertex : m_session->mesh.vertices) {
+            minimum = minimum.cwiseMin(vertex.cast<double>());
+            maximum = maximum.cwiseMax(vertex.cast<double>());
+        }
+        load.region.center_mm = 0.5 * (minimum + maximum);
+    }
+    m_session->setup.loads.push_back(load);
+    populate_from_setup();
+    const int index = int(m_session->setup.loads.size()) - 1;
+    select_canvas_item(1, index, false);
+    persist_setup();
+    mark_stale();
+}
+
+void StrengthLoadPanel::place_load_at(SA::LoadType type, const Vec3d &position_mm, const Vec3d &normal,
+                                      const std::vector<size_t> &surface_triangles)
+{
+    SA::Load load;
+    load.type = type;
+    load.region.center_mm = position_mm;
+    load.region.shape = SA::RegionShape::Surface;
+    load.region.surface_triangles = surface_triangles;
+    load.direction = normal.squaredNorm() > 1e-12 ? Vec3d(-normal.normalized()) : Vec3d(0.0, 0.0, -1.0);
+    const wxString type_name = wxString::FromUTF8(SA::to_string(type));
+    load.name = wxString::Format("%s %zu", type_name, m_session->setup.loads.size() + 1).utf8_string();
+    if (type == SA::LoadType::Fixed) {
+        load.name = "Fixed support " + std::to_string(m_session->setup.loads.size() + 1);
+        load.magnitude_n = 0.0;
+    }
+    m_session->setup.loads.push_back(load);
+    populate_from_setup();
+    const int index = int(m_session->setup.loads.size()) - 1;
+    select_canvas_item(1, index, false);
+    persist_setup();
+    mark_stale();
+}
+
+void StrengthLoadPanel::refresh_operation_panel()
+{
+    if (m_operation_panel == nullptr)
+        return;
+    SA::SphericalRegion *region = nullptr;
+    SA::Load *load = nullptr;
+    if (m_selected_kind == 1 && m_selected_index >= 0 &&
+        size_t(m_selected_index) < m_session->setup.loads.size()) {
+        load = &m_session->setup.loads[size_t(m_selected_index)];
+        region = &load->region;
+        m_operation_title->SetLabel(wxString::Format(_L("Load / constraint %d"), m_selected_index + 1));
+        m_operation_name->ChangeValue(wxString::FromUTF8(load->name));
+    } else if (m_selected_kind == 2 && m_selected_index >= 0 &&
+               size_t(m_selected_index) < m_session->setup.preserve_regions.size()) {
+        region = &m_session->setup.preserve_regions[size_t(m_selected_index)];
+        m_operation_title->SetLabel(wxString::Format(_L("Preserve region %d"), m_selected_index + 1));
+        m_operation_name->ChangeValue(wxString::Format(_L("Preserve %d"), m_selected_index + 1));
+    } else {
+        m_operation_title->SetLabel(_L("Operation details — nothing selected"));
+    }
+
+    const bool enabled = region != nullptr;
+    const std::array<wxWindow *, 7> controls{m_operation_name, m_operation_shape, m_operation_radius,
+        m_operation_magnitude, m_operation_apply, m_operation_popout, m_operation_panel};
+    for (wxWindow *control : controls)
+        if (control != m_operation_panel)
+            control->Enable(enabled);
+    for (int axis = 0; axis < 3; ++axis) {
+        m_operation_center[axis]->Enable(enabled);
+        m_operation_size[axis]->Enable(enabled);
+        m_operation_axis[axis]->Enable(enabled);
+        m_operation_direction[axis]->Enable(load != nullptr && load->type != SA::LoadType::Fixed);
+    }
+    m_operation_name->Enable(load != nullptr);
+    m_operation_magnitude->Enable(load != nullptr && load->type != SA::LoadType::Fixed);
+    if (!enabled)
+        return;
+
+    m_operation_shape->SetSelection(int(region->shape));
+    for (int axis = 0; axis < 3; ++axis) {
+        m_operation_center[axis]->ChangeValue(number(region->center_mm[axis]));
+        m_operation_size[axis]->ChangeValue(number(region->size_mm[axis]));
+        m_operation_axis[axis]->ChangeValue(number(region->axis[axis]));
+        m_operation_direction[axis]->ChangeValue(number(load != nullptr ? load->direction[axis] : 0.0));
+    }
+    m_operation_radius->ChangeValue(number(region->radius_mm));
+    m_operation_magnitude->ChangeValue(number(load != nullptr ? load->magnitude_n : 0.0));
+}
+
+void StrengthLoadPanel::apply_operation_panel()
+{
+    SA::SphericalRegion *region = nullptr;
+    SA::Load *load = nullptr;
+    if (m_selected_kind == 1 && m_selected_index >= 0 &&
+        size_t(m_selected_index) < m_session->setup.loads.size()) {
+        load = &m_session->setup.loads[size_t(m_selected_index)];
+        region = &load->region;
+    } else if (m_selected_kind == 2 && m_selected_index >= 0 &&
+               size_t(m_selected_index) < m_session->setup.preserve_regions.size()) {
+        region = &m_session->setup.preserve_regions[size_t(m_selected_index)];
+    }
+    if (region == nullptr)
+        return;
+
+    SA::SphericalRegion candidate = *region;
+    bool valid = read_vector_strict(m_operation_center, candidate.center_mm);
+    valid = read_vector_strict(m_operation_size, candidate.size_mm) && valid;
+    valid = read_vector_strict(m_operation_axis, candidate.axis) && valid;
+    valid = read_number(m_operation_radius, candidate.radius_mm) && valid;
+    candidate.shape = SA::RegionShape(std::clamp(m_operation_shape->GetSelection(), 0, 3));
+    Vec3d direction = load != nullptr ? load->direction : Vec3d::UnitZ();
+    double magnitude = load != nullptr ? load->magnitude_n : 0.0;
+    if (load != nullptr && load->type != SA::LoadType::Fixed) {
+        valid = read_vector_strict(m_operation_direction, direction) && valid;
+        valid = read_number(m_operation_magnitude, magnitude) && valid;
+    }
+    wxString error;
+    if (!valid)
+        error += _L("All numeric values must be finite.\n");
+    if (candidate.shape == SA::RegionShape::Sphere && candidate.radius_mm <= 0.0)
+        error += _L("Sphere radius must be greater than zero.\n");
+    if (candidate.shape == SA::RegionShape::Box && (candidate.size_mm.array() <= 0.0).any())
+        error += _L("Every box size must be greater than zero.\n");
+    if (candidate.shape == SA::RegionShape::Cylinder &&
+        (candidate.radius_mm <= 0.0 || candidate.size_mm.z() <= 0.0 || candidate.axis.squaredNorm() <= 1e-12))
+        error += _L("Cylinder radius, height, and axis must be valid.\n");
+    if (candidate.shape == SA::RegionShape::Surface && candidate.surface_triangles.empty())
+        error += _L("Pick a model face before using Selected face.\n");
+    if (load != nullptr && load->type != SA::LoadType::Fixed && direction.squaredNorm() <= 1e-12)
+        error += _L("Force direction must be non-zero.\n");
+    if (load != nullptr && load->type != SA::LoadType::Fixed && magnitude <= 0.0)
+        error += _L("Force magnitude must be greater than zero.\n");
+    if (!error.empty()) {
+        wxMessageBox(error, _L("Operation details are incomplete"), wxOK | wxICON_WARNING, this);
+        return;
+    }
+
+    *region = std::move(candidate);
+    if (load != nullptr) {
+        load->name = m_operation_name->GetValue().utf8_string();
+        if (load->type != SA::LoadType::Fixed) {
+            load->direction = direction.normalized();
+            load->magnitude_n = magnitude;
+        }
+    }
+    persist_setup();
+    mark_stale();
+    refresh_load_list();
+    refresh_preserve_list();
+    refresh_study_tree();
+    refresh_operation_panel();
+    m_setup_canvas->Refresh();
+}
+
+bool StrengthLoadPanel::edit_load_dialog(SA::Load &load, bool creating)
+{
+    wxDialog dialog(this, wxID_ANY, creating ? _L("Create structural load or constraint") : _L("Edit structural load or constraint"),
+                    wxDefaultPosition, wxDefaultSize, wxDEFAULT_DIALOG_STYLE | wxRESIZE_BORDER);
+    const int gap = FromDIP(8);
+    auto *root = new wxBoxSizer(wxVERTICAL);
+    root->Add(new wxStaticText(&dialog, wxID_ANY,
+        _L("Select the load type and define its target region. Direction vectors use model coordinates.")),
+        0, wxEXPAND | wxALL, gap);
+    auto *grid = new wxFlexGridSizer(2, gap, gap);
+    grid->AddGrowableCol(1, 1);
+    auto *name = new wxTextCtrl(&dialog, wxID_ANY, wxString::FromUTF8(load.name));
+    auto *type = new wxChoice(&dialog, wxID_ANY, wxDefaultPosition, wxDefaultSize, load_type_names());
+    type->SetSelection(int(load.type));
+    auto *active = new wxCheckBox(&dialog, wxID_ANY, _L("Enabled in this study"));
+    active->SetValue(load.active);
+    auto *whole_model = new wxCheckBox(&dialog, wxID_ANY, _L("Apply to the whole model"));
+    whole_model->SetValue(load.region.whole_model || load.type == SA::LoadType::GlobalForce);
+    wxTextCtrl *center[3]{};
+    wxTextCtrl *size[3]{};
+    wxTextCtrl *axis[3]{};
+    wxTextCtrl *direction[3]{};
+    auto *shape = new wxChoice(&dialog, wxID_ANY, wxDefaultPosition, wxDefaultSize, region_shape_names());
+    shape->SetSelection(int(load.region.shape));
+    auto *direction_mode = new wxChoice(&dialog, wxID_ANY, wxDefaultPosition, wxDefaultSize,
+        {_L("Picked surface normal / current vector"), _L("+X axis"), _L("-X axis"),
+         _L("+Y axis"), _L("-Y axis"), _L("+Z axis"), _L("-Z axis")});
+    direction_mode->SetSelection(0);
+    auto *flip_direction = new wxButton(&dialog, wxID_ANY, _L("Flip direction"));
+    auto *radius = number_input(&dialog, load.region.radius_mm);
+    auto *magnitude = number_input(&dialog, load.magnitude_n);
+    auto *impact = number_input(&dialog, load.impact_factor);
+    auto *target = number_input(&dialog, load.target_safety_factor);
+    auto *basis = new wxChoice(&dialog, wxID_ANY, wxDefaultPosition, wxDefaultSize,
+                               {_L("Yield"), _L("Ultimate"), _L("Calibrated yield")});
+    basis->SetSelection(int(load.strength_basis));
+    add_labeled(grid, &dialog, _L("Name"), name, 1);
+    add_labeled(grid, &dialog, _L("Type"), type, 1);
+    add_labeled(grid, &dialog, _L("State"), active);
+    add_labeled(grid, &dialog, _L("Target"), whole_model);
+    add_labeled(grid, &dialog, _L("Region shape"), shape, 1);
+    add_labeled(grid, &dialog, _L("Region center (mm)"), vector_editor(&dialog, center, load.region.center_mm), 1);
+    add_labeled(grid, &dialog, _L("Box size XYZ / cylinder height in Z (mm)"),
+                vector_editor(&dialog, size, load.region.size_mm), 1);
+    add_labeled(grid, &dialog, _L("Region radius (mm)"), radius, 1);
+    add_labeled(grid, &dialog, _L("Cylinder axis"), vector_editor(&dialog, axis, load.region.axis), 1);
+    add_labeled(grid, &dialog, _L("Direction preset"), direction_mode, 1);
+    auto *direction_row = vector_editor(&dialog, direction, load.direction);
+    direction_row->Add(flip_direction, 0, wxLEFT, gap);
+    add_labeled(grid, &dialog, _L("Direction / force vector"), direction_row, 1);
+    add_labeled(grid, &dialog, _L("Magnitude (N)"), magnitude, 1);
+    add_labeled(grid, &dialog, _L("Impact multiplier"), impact, 1);
+    add_labeled(grid, &dialog, _L("Required safety factor"), target, 1);
+    add_labeled(grid, &dialog, _L("Strength basis"), basis, 1);
+    root->Add(grid, 1, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
+    root->Add(new wxStaticText(&dialog, wxID_ANY,
+        _L("The arrow in the 3D view shows the applied vector. Double-click it later to reopen this dialog.")),
+        0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
+    root->Add(dialog.CreateStdDialogButtonSizer(wxOK | wxCANCEL), 0, wxEXPAND | wxALL, gap);
+    dialog.SetSizerAndFit(root);
+    dialog.SetMinSize(FromDIP(wxSize(620, 480)));
+    dialog.CentreOnParent();
+
+    const auto set_direction = [direction](const Vec3d &value) {
+        for (int axis = 0; axis < 3; ++axis)
+            direction[axis]->ChangeValue(number(value[axis]));
+    };
+    direction_mode->Bind(wxEVT_CHOICE, [direction_mode, set_direction](wxCommandEvent &) {
+        static const std::array<Vec3d, 6> presets{
+            Vec3d::UnitX(), -Vec3d::UnitX(), Vec3d::UnitY(), -Vec3d::UnitY(), Vec3d::UnitZ(), -Vec3d::UnitZ()};
+        const int selected = direction_mode->GetSelection();
+        if (selected > 0 && size_t(selected - 1) < presets.size())
+            set_direction(presets[size_t(selected - 1)]);
+    });
+    flip_direction->Bind(wxEVT_BUTTON, [direction, set_direction](wxCommandEvent &) {
+        Vec3d value = Vec3d::Zero();
+        if (read_vector_strict(direction, value))
+            set_direction(-value);
+    });
+    const auto refresh_visual = [this, &load, type, whole_model, shape, center, size, radius, axis, direction] {
+        if (m_setup_canvas == nullptr)
+            return;
+        SA::Load preview = load;
+        preview.type = SA::LoadType(std::max(0, type->GetSelection()));
+        preview.region.whole_model = whole_model->GetValue() || preview.type == SA::LoadType::GlobalForce;
+        preview.region.shape = SA::RegionShape(std::clamp(shape->GetSelection(), 0, 3));
+        preview.region.center_mm = read_vector(center, preview.region.center_mm);
+        preview.region.size_mm = read_vector(size, preview.region.size_mm);
+        read_number(radius, preview.region.radius_mm);
+        preview.region.axis = read_vector(axis, preview.region.axis);
+        preview.direction = read_vector(direction, preview.direction);
+        m_setup_canvas->preview_load(preview);
+    };
+    type->Bind(wxEVT_CHOICE, [refresh_visual](wxCommandEvent &) { refresh_visual(); });
+    shape->Bind(wxEVT_CHOICE, [refresh_visual](wxCommandEvent &) { refresh_visual(); });
+    whole_model->Bind(wxEVT_CHECKBOX, [refresh_visual](wxCommandEvent &) { refresh_visual(); });
+    radius->Bind(wxEVT_TEXT, [refresh_visual](wxCommandEvent &) { refresh_visual(); });
+    for (int coordinate = 0; coordinate < 3; ++coordinate) {
+        center[coordinate]->Bind(wxEVT_TEXT, [refresh_visual](wxCommandEvent &) { refresh_visual(); });
+        size[coordinate]->Bind(wxEVT_TEXT, [refresh_visual](wxCommandEvent &) { refresh_visual(); });
+        direction[coordinate]->Bind(wxEVT_TEXT, [refresh_visual](wxCommandEvent &) { refresh_visual(); });
+    }
+    for (wxTextCtrl *field : axis)
+        field->Bind(wxEVT_TEXT, [refresh_visual](wxCommandEvent &) { refresh_visual(); });
+    refresh_visual();
+
+    while (dialog.ShowModal() == wxID_OK) {
+        SA::Load candidate = load;
+        candidate.name = name->GetValue().utf8_string();
+        candidate.type = SA::LoadType(std::max(0, type->GetSelection()));
+        candidate.active = active->GetValue();
+        candidate.region.whole_model = whole_model->GetValue() || candidate.type == SA::LoadType::GlobalForce;
+        candidate.region.shape = SA::RegionShape(std::clamp(shape->GetSelection(), 0, 3));
+        bool numeric = true;
+        numeric = read_vector_strict(center, candidate.region.center_mm) && numeric;
+        numeric = read_vector_strict(size, candidate.region.size_mm) && numeric;
+        numeric = read_number(radius, candidate.region.radius_mm) && numeric;
+        numeric = read_vector_strict(axis, candidate.region.axis) && numeric;
+        numeric = read_vector_strict(direction, candidate.direction) && numeric;
+        numeric = read_number(magnitude, candidate.magnitude_n) && numeric;
+        numeric = read_number(impact, candidate.impact_factor) && numeric;
+        numeric = read_number(target, candidate.target_safety_factor) && numeric;
+        candidate.strength_basis = SA::StrengthBasis(std::max(0, basis->GetSelection()));
+
+        wxString error;
+        if (!numeric) error += _L("All numeric fields must contain finite numbers.\n");
+        if (candidate.name.empty()) error += _L("Enter a name for this study item.\n");
+        if (!candidate.region.whole_model && candidate.region.shape == SA::RegionShape::Sphere && candidate.region.radius_mm <= 0.0)
+            error += _L("Sphere radius must be greater than zero.\n");
+        if (!candidate.region.whole_model && candidate.region.shape == SA::RegionShape::Box &&
+            (candidate.region.size_mm.array() <= 0.0).any())
+            error += _L("Every box size must be greater than zero.\n");
+        if (!candidate.region.whole_model && candidate.region.shape == SA::RegionShape::Cylinder &&
+            (candidate.region.radius_mm <= 0.0 || candidate.region.size_mm.z() <= 0.0 ||
+             candidate.region.axis.squaredNorm() <= 1e-12))
+            error += _L("Cylinder radius, height, and axis must be valid.\n");
+        if (!candidate.region.whole_model && candidate.region.shape == SA::RegionShape::Surface &&
+            candidate.region.surface_triangles.empty())
+            error += _L("A selected-face region needs a face picked in the viewport.\n");
+        if (candidate.type != SA::LoadType::Fixed && candidate.direction.squaredNorm() <= 1e-12)
+            error += _L("Load direction must be non-zero.\n");
+        if (candidate.type != SA::LoadType::Fixed && candidate.magnitude_n <= 0.0)
+            error += _L("Load magnitude must be greater than zero.\n");
+        if (candidate.type == SA::LoadType::ImpactForce && candidate.impact_factor < 1.0)
+            error += _L("Impact multiplier must be at least 1.\n");
+        if (candidate.target_safety_factor <= 0.0)
+            error += _L("Required safety factor must be greater than zero.\n");
+        if (!error.empty()) {
+            wxMessageBox(error, _L("Load properties are incomplete"), wxOK | wxICON_WARNING, &dialog);
+            continue;
+        }
+        if (candidate.type != SA::LoadType::Fixed)
+            candidate.direction.normalize();
+        load = std::move(candidate);
+        if (m_setup_canvas != nullptr)
+            m_setup_canvas->clear_preview();
+        return true;
+    }
+    if (m_setup_canvas != nullptr)
+        m_setup_canvas->clear_preview();
+    return false;
+}
+
+void StrengthLoadPanel::place_preserve_at(const Vec3d &position_mm, const std::vector<size_t> &surface_triangles)
+{
+    SA::SphericalRegion region;
+    region.center_mm = position_mm;
+    region.shape = SA::RegionShape::Box;
+    region.surface_triangles = surface_triangles;
+    m_session->setup.preserve_regions.push_back(region);
+    populate_from_setup();
+    const int index = int(m_session->setup.preserve_regions.size()) - 1;
+    select_canvas_item(2, index, false);
+    persist_setup();
+    mark_stale();
+}
+
+bool StrengthLoadPanel::edit_preserve_dialog(SA::SphericalRegion &region, bool creating)
+{
+    wxDialog dialog(this, wxID_ANY, creating ? _L("Create preserve region") : _L("Edit preserve region"),
+                    wxDefaultPosition, wxDefaultSize, wxDEFAULT_DIALOG_STYLE | wxRESIZE_BORDER);
+    const int gap = FromDIP(8);
+    auto *root = new wxBoxSizer(wxVERTICAL);
+    root->Add(new wxStaticText(&dialog, wxID_ANY,
+        _L("Preserve regions protect load interfaces, mounting features, and other geometry from dense-region replacement.")),
+        0, wxEXPAND | wxALL, gap);
+    auto *grid = new wxFlexGridSizer(2, gap, gap);
+    grid->AddGrowableCol(1, 1);
+    wxTextCtrl *center[3]{};
+    wxTextCtrl *size[3]{};
+    wxTextCtrl *axis[3]{};
+    auto *shape = new wxChoice(&dialog, wxID_ANY, wxDefaultPosition, wxDefaultSize, region_shape_names());
+    shape->SetSelection(int(region.shape));
+    auto *radius = number_input(&dialog, region.radius_mm);
+    add_labeled(grid, &dialog, _L("Shape"), shape, 1);
+    add_labeled(grid, &dialog, _L("Center (mm)"), vector_editor(&dialog, center, region.center_mm), 1);
+    add_labeled(grid, &dialog, _L("Box size XYZ / cylinder height in Z (mm)"),
+                vector_editor(&dialog, size, region.size_mm), 1);
+    add_labeled(grid, &dialog, _L("Radius (mm)"), radius, 1);
+    add_labeled(grid, &dialog, _L("Cylinder axis"), vector_editor(&dialog, axis, region.axis), 1);
+    root->Add(grid, 1, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
+    root->Add(dialog.CreateStdDialogButtonSizer(wxOK | wxCANCEL), 0, wxEXPAND | wxALL, gap);
+    dialog.SetSizerAndFit(root);
+    dialog.SetMinSize(FromDIP(wxSize(560, 230)));
+    dialog.CentreOnParent();
+    const auto refresh_visual = [this, &region, shape, center, size, radius, axis] {
+        if (m_setup_canvas == nullptr)
+            return;
+        SA::SphericalRegion preview = region;
+        preview.shape = SA::RegionShape(std::clamp(shape->GetSelection(), 0, 3));
+        preview.center_mm = read_vector(center, preview.center_mm);
+        preview.size_mm = read_vector(size, preview.size_mm);
+        read_number(radius, preview.radius_mm);
+        preview.axis = read_vector(axis, preview.axis);
+        preview.whole_model = false;
+        m_setup_canvas->preview_preserve(preview);
+    };
+    radius->Bind(wxEVT_TEXT, [refresh_visual](wxCommandEvent &) { refresh_visual(); });
+    shape->Bind(wxEVT_CHOICE, [refresh_visual](wxCommandEvent &) { refresh_visual(); });
+    for (wxTextCtrl *field : center)
+        field->Bind(wxEVT_TEXT, [refresh_visual](wxCommandEvent &) { refresh_visual(); });
+    for (wxTextCtrl *field : size)
+        field->Bind(wxEVT_TEXT, [refresh_visual](wxCommandEvent &) { refresh_visual(); });
+    for (wxTextCtrl *field : axis)
+        field->Bind(wxEVT_TEXT, [refresh_visual](wxCommandEvent &) { refresh_visual(); });
+    refresh_visual();
+    while (dialog.ShowModal() == wxID_OK) {
+        SA::SphericalRegion candidate = region;
+        candidate.shape = SA::RegionShape(std::clamp(shape->GetSelection(), 0, 3));
+        const bool numeric = read_vector_strict(center, candidate.center_mm) &&
+            read_vector_strict(size, candidate.size_mm) && read_number(radius, candidate.radius_mm) &&
+            read_vector_strict(axis, candidate.axis);
+        const bool shape_valid =
+            (candidate.shape == SA::RegionShape::Sphere && candidate.radius_mm > 0.0) ||
+            (candidate.shape == SA::RegionShape::Box && (candidate.size_mm.array() > 0.0).all()) ||
+            (candidate.shape == SA::RegionShape::Cylinder && candidate.radius_mm > 0.0 &&
+             candidate.size_mm.z() > 0.0 && candidate.axis.squaredNorm() > 1e-12) ||
+            (candidate.shape == SA::RegionShape::Surface && !candidate.surface_triangles.empty());
+        if (!numeric || !shape_valid) {
+            wxMessageBox(_L("Enter finite dimensions for the selected shape. Face regions require a face picked in the viewport."), _L("Invalid preserve region"),
+                         wxOK | wxICON_WARNING, &dialog);
+            continue;
+        }
+        candidate.whole_model = false;
+        region = candidate;
+        if (m_setup_canvas != nullptr)
+            m_setup_canvas->clear_preview();
+        return true;
+    }
+    if (m_setup_canvas != nullptr)
+        m_setup_canvas->clear_preview();
+    return false;
+}
+
+void StrengthLoadPanel::edit_gravity_dialog()
+{
+    wxDialog dialog(this, wxID_ANY, _L("Gravity load"), wxDefaultPosition, wxDefaultSize,
+                    wxDEFAULT_DIALOG_STYLE | wxRESIZE_BORDER);
+    const int gap = FromDIP(8);
+    auto *root = new wxBoxSizer(wxVERTICAL);
+    auto *enabled = new wxCheckBox(&dialog, wxID_ANY, _L("Include self-weight from the estimated printed mass"));
+    enabled->SetValue(m_session->setup.gravity.enabled);
+    root->Add(enabled, 0, wxEXPAND | wxALL, gap);
+    auto *grid = new wxFlexGridSizer(2, gap, gap);
+    grid->AddGrowableCol(1, 1);
+    wxTextCtrl *acceleration[3]{};
+    add_labeled(grid, &dialog, _L("Acceleration (m/s²)"),
+                vector_editor(&dialog, acceleration, m_session->setup.gravity.acceleration_m_s2), 1);
+    root->Add(grid, 1, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
+    root->Add(new wxStaticText(&dialog, wxID_ANY,
+        _L("Earth gravity is normally (0, 0, -9.80665). The 3D arrow previews the selected direction.")),
+        0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
+    root->Add(dialog.CreateStdDialogButtonSizer(wxOK | wxCANCEL), 0, wxEXPAND | wxALL, gap);
+    dialog.SetSizerAndFit(root);
+    dialog.SetMinSize(FromDIP(wxSize(570, 250)));
+    dialog.CentreOnParent();
+    while (dialog.ShowModal() == wxID_OK) {
+        Vec3d value = m_session->setup.gravity.acceleration_m_s2;
+        const bool numeric = read_vector_strict(acceleration, value);
+        if (!numeric || (enabled->GetValue() && value.squaredNorm() <= 1e-12)) {
+            wxMessageBox(_L("Acceleration must contain finite numbers, and enabled gravity requires a non-zero vector."), _L("Invalid gravity load"),
+                         wxOK | wxICON_WARNING, &dialog);
+            continue;
+        }
+        m_session->setup.gravity.enabled = enabled->GetValue();
+        m_session->setup.gravity.acceleration_m_s2 = value;
+        populate_from_setup();
+        m_setup_canvas->select_item(3, 0);
+        mark_stale();
+        return;
+    }
+}
+
+void StrengthLoadPanel::edit_material_dialog()
+{
+    wxDialog dialog(this, wxID_ANY, _L("Study material and print direction"), wxDefaultPosition, wxDefaultSize,
+                    wxDEFAULT_DIALOG_STYLE | wxRESIZE_BORDER);
+    const int gap = FromDIP(8);
+    auto *root = new wxBoxSizer(wxVERTICAL);
+    auto *content = new wxScrolledWindow(&dialog, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxVSCROLL | wxTAB_TRAVERSAL);
+    content->SetScrollRate(0, FromDIP(12));
+    auto *content_sizer = new wxBoxSizer(wxVERTICAL);
+    content_sizer->Add(new wxStaticText(content, wxID_ANY,
+        _L("Assign anisotropic printed-material properties. Validate critical values with supplier data and printed coupons.")),
+        0, wxEXPAND | wxALL, gap);
+
+    auto *choice_row = new wxBoxSizer(wxHORIZONTAL);
+    auto *material_choice = new wxChoice(content, wxID_ANY);
+    for (const SA::Material &material : SA::builtin_materials())
+        material_choice->Append(wxString::FromUTF8(material.name));
+    material_choice->Append(_L("Custom material"));
+    int selected = int(SA::builtin_materials().size());
+    for (size_t index = 0; index < SA::builtin_materials().size(); ++index)
+        if (SA::builtin_materials()[index].key == m_session->setup.material.key) selected = int(index);
+    material_choice->SetSelection(selected);
+    add_labeled(choice_row, content, _L("Material"), material_choice, 1);
+    content_sizer->Add(choice_row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
+
+    static const std::array<wxString, 12> labels{
+        _L("Density (kg/m³)"), _L("Elastic modulus XY (GPa)"), _L("Elastic modulus Z (GPa)"), _L("Poisson ratio XY"),
+        _L("Shear modulus XY (GPa)"), _L("Shear modulus XZ (GPa)"), _L("Yield strength XY (MPa)"),
+        _L("Yield strength Z (MPa)"), _L("Ultimate strength XY (MPa)"), _L("Ultimate strength Z (MPa)"),
+        _L("Shear strength XY (MPa)"), _L("Shear strength XZ (MPa)")};
+    auto *properties = new wxFlexGridSizer(2, gap, gap);
+    properties->AddGrowableCol(1, 1);
+    std::array<wxTextCtrl *, 12> fields{};
+    const SA::Material &current = m_session->setup.material;
+    const std::array<double, 12> initial{current.density_kg_m3, current.elastic_modulus_xy_pa / 1e9,
+        current.elastic_modulus_z_pa / 1e9, current.poisson_xy, current.shear_modulus_xy_pa / 1e9,
+        current.shear_modulus_xz_pa / 1e9, current.yield_strength_xy_pa / 1e6, current.yield_strength_z_pa / 1e6,
+        current.ultimate_strength_xy_pa / 1e6, current.ultimate_strength_z_pa / 1e6,
+        current.shear_strength_xy_pa / 1e6, current.shear_strength_xz_pa / 1e6};
+    for (size_t index = 0; index < fields.size(); ++index) {
+        fields[index] = number_input(content, initial[index], 140);
+        add_labeled(properties, content, labels[index], fields[index], 1);
+    }
+    content_sizer->Add(properties, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
+
+    static const std::array<wxString, 5> calibration_labels{
+        _L("Modulus XY calibration"), _L("Modulus Z calibration"), _L("Strength XY calibration"),
+        _L("Strength Z calibration"), _L("Shear calibration")};
+    auto *calibration_grid = new wxFlexGridSizer(2, gap, gap);
+    calibration_grid->AddGrowableCol(1, 1);
+    std::array<wxTextCtrl *, 5> calibration{};
+    const std::array<double, 5> calibration_values{current.calibration.modulus_xy_scale,
+        current.calibration.modulus_z_scale, current.calibration.strength_xy_scale,
+        current.calibration.strength_z_scale, current.calibration.shear_scale};
+    for (size_t index = 0; index < calibration.size(); ++index) {
+        calibration[index] = number_input(content, calibration_values[index], 140);
+        add_labeled(calibration_grid, content, calibration_labels[index], calibration[index], 1);
+    }
+    auto *source = new wxTextCtrl(content, wxID_ANY, wxString::FromUTF8(current.calibration.source));
+    add_labeled(calibration_grid, content, _L("Calibration source / coupon"), source, 1);
+    wxTextCtrl *layer_axis[3]{};
+    add_labeled(calibration_grid, content, _L("Layer-normal axis"),
+                vector_editor(content, layer_axis, m_session->setup.print_layer_axis), 1);
+    content_sizer->Add(calibration_grid, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
+    content->SetSizer(content_sizer);
+    root->Add(content, 1, wxEXPAND);
+    root->Add(dialog.CreateStdDialogButtonSizer(wxOK | wxCANCEL), 0, wxEXPAND | wxALL, gap);
+    dialog.SetSizer(root);
+    dialog.SetSize(FromDIP(wxSize(690, 760)));
+    dialog.CentreOnParent();
+
+    material_choice->Bind(wxEVT_CHOICE, [material_choice, &fields](wxCommandEvent &) {
+        const int index = material_choice->GetSelection();
+        if (index < 0 || size_t(index) >= SA::builtin_materials().size())
+            return;
+        const SA::Material &material = SA::builtin_materials()[size_t(index)];
+        const std::array<double, 12> values{material.density_kg_m3, material.elastic_modulus_xy_pa / 1e9,
+            material.elastic_modulus_z_pa / 1e9, material.poisson_xy, material.shear_modulus_xy_pa / 1e9,
+            material.shear_modulus_xz_pa / 1e9, material.yield_strength_xy_pa / 1e6, material.yield_strength_z_pa / 1e6,
+            material.ultimate_strength_xy_pa / 1e6, material.ultimate_strength_z_pa / 1e6,
+            material.shear_strength_xy_pa / 1e6, material.shear_strength_xz_pa / 1e6};
+        for (size_t field = 0; field < fields.size(); ++field)
+            fields[field]->ChangeValue(number(values[field]));
+    });
+
+    while (dialog.ShowModal() == wxID_OK) {
+        const int material_index = material_choice->GetSelection();
+        SA::Material candidate = material_index >= 0 && size_t(material_index) < SA::builtin_materials().size() ?
+            SA::builtin_materials()[size_t(material_index)] : m_session->setup.material;
+        std::array<double, 12> values{};
+        bool numeric = true;
+        for (size_t index = 0; index < fields.size(); ++index)
+            numeric = read_number(fields[index], values[index]) && numeric;
+        candidate.density_kg_m3 = values[0];
+        candidate.elastic_modulus_xy_pa = values[1] * 1e9;
+        candidate.elastic_modulus_z_pa = values[2] * 1e9;
+        candidate.poisson_xy = values[3];
+        candidate.shear_modulus_xy_pa = values[4] * 1e9;
+        candidate.shear_modulus_xz_pa = values[5] * 1e9;
+        candidate.yield_strength_xy_pa = values[6] * 1e6;
+        candidate.yield_strength_z_pa = values[7] * 1e6;
+        candidate.ultimate_strength_xy_pa = values[8] * 1e6;
+        candidate.ultimate_strength_z_pa = values[9] * 1e6;
+        candidate.shear_strength_xy_pa = values[10] * 1e6;
+        candidate.shear_strength_xz_pa = values[11] * 1e6;
+        std::array<double, 5> scales{};
+        for (size_t index = 0; index < calibration.size(); ++index)
+            numeric = read_number(calibration[index], scales[index]) && numeric;
+        candidate.calibration.modulus_xy_scale = scales[0];
+        candidate.calibration.modulus_z_scale = scales[1];
+        candidate.calibration.strength_xy_scale = scales[2];
+        candidate.calibration.strength_z_scale = scales[3];
+        candidate.calibration.shear_scale = scales[4];
+        candidate.calibration.source = source->GetValue().utf8_string();
+        Vec3d axis = m_session->setup.print_layer_axis;
+        numeric = read_vector_strict(layer_axis, axis) && numeric;
+        if (material_index < 0 || size_t(material_index) >= SA::builtin_materials().size()) {
+            candidate.key = "custom";
+            candidate.name = "Custom material";
+            candidate.provenance = "User-entered material properties; verify against a filament datasheet and printed coupons.";
+        } else if (!material_properties_match(candidate, SA::builtin_materials()[size_t(material_index)])) {
+            candidate.key = "custom";
+            candidate.name = SA::builtin_materials()[size_t(material_index)].name + " (custom)";
+            candidate.provenance = "User-edited bundled estimate; verify against a filament datasheet and printed coupons.";
+        }
+        wxString error;
+        if (!numeric) error += _L("All property and calibration fields must be finite numbers.\n");
+        for (const std::string &item : candidate.validate())
+            error += wxString::FromUTF8(item) + "\n";
+        if (axis.squaredNorm() <= 1e-12)
+            error += _L("Layer-normal axis must be non-zero.\n");
+        if (!error.empty()) {
+            wxMessageBox(error, _L("Material properties are incomplete"), wxOK | wxICON_WARNING, &dialog);
+            continue;
+        }
+        m_session->setup.material = std::move(candidate);
+        m_session->setup.print_layer_axis = axis.normalized();
+        populate_from_setup();
+        mark_stale();
+        return;
+    }
+}
+
+void StrengthLoadPanel::edit_infill_dialog()
+{
+    wxDialog dialog(this, wxID_ANY, _L("Print structure and dense-region strategy"), wxDefaultPosition, wxDefaultSize,
+                    wxDEFAULT_DIALOG_STYLE | wxRESIZE_BORDER);
+    const int gap = FromDIP(8);
+    auto *root = new wxBoxSizer(wxVERTICAL);
+    root->Add(new wxStaticText(&dialog, wxID_ANY,
+        _L("Define the baseline print structure and the stress threshold used to recommend a local dense modifier.")),
+        0, wxEXPAND | wxALL, gap);
+    auto *grid = new wxFlexGridSizer(2, gap, gap);
+    grid->AddGrowableCol(1, 1);
+    auto *background_pattern = new wxChoice(&dialog, wxID_ANY, wxDefaultPosition, wxDefaultSize, infill_names());
+    auto *dense_pattern = new wxChoice(&dialog, wxID_ANY, wxDefaultPosition, wxDefaultSize, infill_names());
+    background_pattern->SetSelection(int(m_session->setup.infill.background_pattern));
+    dense_pattern->SetSelection(int(m_session->setup.infill.dense_pattern));
+    auto *background_density = number_input(&dialog, m_session->setup.infill.background_density * 100.0);
+    auto *dense_density = number_input(&dialog, m_session->setup.infill.dense_density * 100.0);
+    auto *threshold = number_input(&dialog, m_session->setup.infill.dense_stress_threshold * 100.0);
+    add_labeled(grid, &dialog, _L("Background pattern"), background_pattern, 1);
+    add_labeled(grid, &dialog, _L("Background density (%)"), background_density, 1);
+    add_labeled(grid, &dialog, _L("Dense-region pattern"), dense_pattern, 1);
+    add_labeled(grid, &dialog, _L("Dense-region density (%)"), dense_density, 1);
+    add_labeled(grid, &dialog, _L("Stress threshold (% of peak)"), threshold, 1);
+    root->Add(grid, 1, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
+    root->Add(dialog.CreateStdDialogButtonSizer(wxOK | wxCANCEL), 0, wxEXPAND | wxALL, gap);
+    dialog.SetSizerAndFit(root);
+    dialog.SetMinSize(FromDIP(wxSize(590, 350)));
+    dialog.CentreOnParent();
+    while (dialog.ShowModal() == wxID_OK) {
+        double background = 0.0, dense = 0.0, stress = 0.0;
+        const bool numeric = read_number(background_density, background) && read_number(dense_density, dense) &&
+                             read_number(threshold, stress);
+        if (!numeric || background <= 0.0 || background > 100.0 || dense <= 0.0 || dense > 100.0 ||
+            stress <= 0.0 || stress > 100.0 || dense < background) {
+            wxMessageBox(_L("Densities and threshold must be within (0, 100], and dense density must not be below the background."),
+                         _L("Invalid print structure"), wxOK | wxICON_WARNING, &dialog);
+            continue;
+        }
+        m_session->setup.infill.background_pattern = SA::InfillPattern(std::max(0, background_pattern->GetSelection()));
+        m_session->setup.infill.dense_pattern = SA::InfillPattern(std::max(0, dense_pattern->GetSelection()));
+        m_session->setup.infill.background_density = background / 100.0;
+        m_session->setup.infill.dense_density = dense / 100.0;
+        m_session->setup.infill.dense_stress_threshold = stress / 100.0;
+        populate_from_setup();
+        mark_stale();
+        return;
+    }
+}
+
+void StrengthLoadPanel::edit_criteria_dialog()
+{
+    wxDialog dialog(this, wxID_ANY, _L("Optimization objectives"), wxDefaultPosition, wxDefaultSize,
+                    wxDEFAULT_DIALOG_STYLE | wxRESIZE_BORDER);
+    const int gap = FromDIP(8);
+    auto *root = new wxBoxSizer(wxVERTICAL);
+    root->Add(new wxStaticText(&dialog, wxID_ANY,
+        _L("Set feasibility limits first, then tune the relative weights used to rank printable candidates.")),
+        0, wxEXPAND | wxALL, gap);
+    auto *grid = new wxFlexGridSizer(2, gap, gap);
+    grid->AddGrowableCol(1, 1);
+    auto *minimum_sf = number_input(&dialog, m_session->setup.criteria.minimum_safety_factor);
+    auto *maximum_displacement = number_input(&dialog, m_session->setup.criteria.maximum_displacement_mm);
+    std::array<wxTextCtrl *, 4> weights{
+        number_input(&dialog, m_session->setup.criteria.mass_weight),
+        number_input(&dialog, m_session->setup.criteria.stiffness_weight),
+        number_input(&dialog, m_session->setup.criteria.support_weight),
+        number_input(&dialog, m_session->setup.criteria.print_time_weight)};
+    add_labeled(grid, &dialog, _L("Minimum safety factor"), minimum_sf, 1);
+    add_labeled(grid, &dialog, _L("Maximum displacement (mm; 0 disables)"), maximum_displacement, 1);
+    static const std::array<wxString, 4> labels{
+        _L("Mass weight"), _L("Stiffness weight"), _L("Support weight"), _L("Print-time weight")};
+    for (size_t index = 0; index < weights.size(); ++index)
+        add_labeled(grid, &dialog, labels[index], weights[index], 1);
+    root->Add(grid, 1, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
+    root->Add(dialog.CreateStdDialogButtonSizer(wxOK | wxCANCEL), 0, wxEXPAND | wxALL, gap);
+    dialog.SetSizerAndFit(root);
+    dialog.SetMinSize(FromDIP(wxSize(610, 390)));
+    dialog.CentreOnParent();
+    while (dialog.ShowModal() == wxID_OK) {
+        double sf = 0.0, displacement = 0.0;
+        std::array<double, 4> values{};
+        bool numeric = read_number(minimum_sf, sf) && read_number(maximum_displacement, displacement);
+        for (size_t index = 0; index < weights.size(); ++index)
+            numeric = read_number(weights[index], values[index]) && numeric;
+        if (!numeric || sf <= 0.0 || displacement < 0.0 ||
+            std::any_of(values.begin(), values.end(), [](double value) { return value < 0.0; }) ||
+            std::accumulate(values.begin(), values.end(), 0.0) <= 0.0) {
+            wxMessageBox(_L("Safety factor must be positive, displacement and weights cannot be negative, and at least one weight must be positive."),
+                         _L("Invalid optimization objectives"), wxOK | wxICON_WARNING, &dialog);
+            continue;
+        }
+        m_session->setup.criteria.minimum_safety_factor = sf;
+        m_session->setup.criteria.maximum_displacement_mm = displacement;
+        m_session->setup.criteria.mass_weight = values[0];
+        m_session->setup.criteria.stiffness_weight = values[1];
+        m_session->setup.criteria.support_weight = values[2];
+        m_session->setup.criteria.print_time_weight = values[3];
+        populate_from_setup();
+        mark_stale();
+        return;
+    }
+}
+
+void StrengthLoadPanel::select_canvas_item(int kind, int index, bool edit)
+{
+    m_selected_kind = kind;
+    m_selected_index = index;
+    select_study_tree_item(kind, index);
+    if (m_setup_canvas != nullptr && kind >= 1 && kind <= 3)
+        m_setup_canvas->select_item(kind, index);
+    if (kind == 1 && index >= 0 && size_t(index) < m_session->setup.loads.size()) {
+        save_current_load_editor();
+        load_current_load_editor(index);
+        if (edit) {
+            SA::Load candidate = m_session->setup.loads[size_t(index)];
+            if (edit_load_dialog(candidate, false)) {
+                m_session->setup.loads[size_t(index)] = candidate;
+                populate_from_setup();
+                load_current_load_editor(index);
+                m_setup_canvas->select_item(1, index);
+                mark_stale();
+            }
+        }
+    } else if (kind == 2 && index >= 0 && size_t(index) < m_session->setup.preserve_regions.size()) {
+        m_preserve_list->SetSelection(index);
+        if (edit) {
+            SA::SphericalRegion candidate = m_session->setup.preserve_regions[size_t(index)];
+            if (edit_preserve_dialog(candidate, false)) {
+                m_session->setup.preserve_regions[size_t(index)] = candidate;
+                populate_from_setup();
+                m_preserve_list->SetSelection(index);
+                m_setup_canvas->select_item(2, index);
+                mark_stale();
+            }
+        }
+    } else if (kind == 3 && edit) {
+        edit_gravity_dialog();
+    }
+    refresh_operation_panel();
+}
+
+bool StrengthLoadPanel::run_precheck(bool show_success)
+{
+    load_selected_object();
+    if (m_session->mesh.empty())
+        return false;
+    if (!collect_setup(true)) {
+        m_status_label->SetLabel(_L("Pre-check found setup issues. Correct the highlighted study inputs before solving."));
+        refresh_study_tree();
+        return false;
+    }
+    const std::vector<std::string> errors = SA::validate(m_session->mesh, m_session->setup);
+    if (!errors.empty()) {
+        m_status_label->SetLabel(wxString::Format(_L("Pre-check found %zu issue(s)."), errors.size()));
+        refresh_study_tree();
+        return false;
+    }
+    m_status_label->SetLabel(_L("Pre-check READY — material, mesh, supports, loads, and objectives are valid."));
+    refresh_study_tree();
+    if (show_success)
+        wxMessageBox(_L("Pre-check is ready. The study has a valid mesh, material, support, and applied load."),
+                     _L("Strength study pre-check"), wxOK | wxICON_INFORMATION, this);
+    return true;
 }
 
 void StrengthLoadPanel::run_analysis()
 {
     load_selected_object();
-    if (!collect_setup(true))
+    if (!run_precheck(false))
         return;
     persist_setup();
     if (m_worker.joinable())
@@ -706,6 +2962,7 @@ void StrengthLoadPanel::run_analysis()
     const uint64_t revision = m_session->revision;
     m_cancel = false;
     m_run_button->Disable();
+    m_precheck_button->Disable();
     m_cancel_button->Enable();
     m_status_label->SetLabel(_L("Running offline linear-static engineering estimate…"));
     m_worker = std::thread([this, setup, mesh, revision] {
@@ -737,6 +2994,7 @@ void StrengthLoadPanel::on_analysis_finished()
         revision = m_pending_revision;
     }
     m_run_button->Enable();
+    m_precheck_button->Enable();
     m_cancel_button->Disable();
     if (revision != m_session->revision) {
         m_status_label->SetLabel(_L("Analysis finished, but inputs changed while it was running; results were discarded."));
@@ -745,6 +3003,13 @@ void StrengthLoadPanel::on_analysis_finished()
     m_session->result = std::move(result);
     m_session->stale = false;
     const SA::Result &stored = m_session->result;
+    if (stored.succeeded()) {
+        m_session->solved_mesh = m_session->mesh;
+        m_session->solved_setup = m_session->setup;
+    } else {
+        m_session->solved_mesh = {};
+        m_session->solved_setup = SA::Setup{};
+    }
     m_status_label->SetLabel(wxString::Format("%s — %s", wxString::FromUTF8(SA::to_string(stored.status)),
                                               wxString::FromUTF8(stored.message)));
     const bool ready = stored.succeeded();
@@ -752,6 +3017,7 @@ void StrengthLoadPanel::on_analysis_finished()
     m_orientation_button->Enable(ready && !stored.orientation_recommendations.empty());
     m_settings_button->Enable(ready && !stored.print_settings_candidates.empty() &&
                               stored.print_settings_candidates.front().feasible);
+    refresh_study_tree();
     if (m_result_callback)
         m_result_callback();
 }
@@ -831,29 +3097,195 @@ void StrengthLoadPanel::apply_optimized_settings()
         wxString::FromUTF8(SA::to_string(candidate.pattern))));
 }
 
-class StrengthSimulationPanel::ResultCanvas final : public wxPanel
+class StrengthSimulationPanel::ResultCanvas final : public SoftwareViewport3D
 {
 public:
     ResultCanvas(wxWindow *parent, std::shared_ptr<StrengthAnalysisSession> session, std::function<void(size_t)> probe)
-        : wxPanel(parent, wxID_ANY, wxDefaultPosition, parent->FromDIP(wxSize(720, 520)), wxBORDER_SIMPLE)
+        : SoftwareViewport3D(parent, parent->FromDIP(wxSize(560, 560)))
         , m_session(std::move(session)), m_probe(std::move(probe))
     {
-        SetBackgroundStyle(wxBG_STYLE_PAINT);
-        Bind(wxEVT_PAINT, [this](wxPaintEvent &) { paint(); });
-        Bind(wxEVT_LEFT_DOWN, [this](wxMouseEvent &event) { click(event.GetPosition()); });
+        set_right_margin(parent->FromDIP(112));
     }
 
     void set_mode(int mode) { m_mode = mode; Refresh(); }
-    void set_projection(int projection) { m_projection = projection; Refresh(); }
-    void set_deformation_scale(double scale) { m_deformation_scale = std::max(0.0, scale); Refresh(); }
+    void set_projection(int projection) { set_view(projection); }
+    void set_deformation_scale(double scale) { m_deformation_scale = std::clamp(scale, 0.0, 10000.0); Refresh(); }
+    void set_show_setup(bool value) { m_show_setup = value; Refresh(); }
+    void set_show_wireframe(bool value) { m_show_wireframe = value; Refresh(); }
+    void set_banded(bool value) { m_banded = value; Refresh(); }
+
+protected:
+    std::vector<Vec3d> scene_points() const override
+    {
+        std::vector<Vec3d> points;
+        const indexed_triangle_set &mesh = display_mesh();
+        if (m_session->result.succeeded() && m_session->result.vertices.size() == mesh.vertices.size()) {
+            points.reserve(m_session->result.vertices.size());
+            for (const SA::VertexResult &vertex : m_session->result.vertices) {
+                const Vec3d offset = vertex.displacement_m * (1000.0 * m_deformation_scale);
+                points.push_back(vertex.position_mm + (offset.allFinite() ? offset : Vec3d::Zero()));
+            }
+        } else {
+            points.reserve(mesh.vertices.size());
+            for (const Vec3f &vertex : mesh.vertices)
+                points.push_back(vertex.cast<double>());
+        }
+        return points;
+    }
+
+    void draw_scene(wxDC &dc, const CameraFrame &camera) override
+    {
+        const SA::Result &result = m_session->result;
+        const indexed_triangle_set &mesh = display_mesh();
+        m_projected.clear();
+        if (mesh.vertices.empty() || mesh.indices.empty()) {
+            dc.SetTextForeground(wxColour(65, 72, 82));
+            dc.DrawText(_L("Select a model and solve its study from the Load tab."), FromDIP(22), FromDIP(22));
+            return;
+        }
+        if (!result.succeeded() || result.vertices.size() != mesh.vertices.size()) {
+            draw_reference_mesh(dc, camera, false);
+            if (m_show_setup)
+                draw_setup_glyphs(dc, camera);
+            dc.SetTextForeground(wxColour(65, 72, 82));
+            dc.DrawText(_L("Solve the study from the Load tab to display contour results."), FromDIP(22), FromDIP(22));
+            return;
+        }
+
+        std::vector<Vec3d> deformed;
+        deformed.reserve(result.vertices.size());
+        m_projected.reserve(result.vertices.size());
+        double minimum = std::numeric_limits<double>::infinity();
+        double maximum = -minimum;
+        size_t minimum_vertex = 0, maximum_vertex = 0;
+        for (size_t index = 0; index < result.vertices.size(); ++index) {
+            const SA::VertexResult &vertex = result.vertices[index];
+            const Vec3d offset = vertex.displacement_m * (1000.0 * m_deformation_scale);
+            deformed.push_back(vertex.position_mm + (offset.allFinite() ? offset : Vec3d::Zero()));
+            m_projected.push_back(project(deformed.back(), camera));
+            const double value = scalar(vertex);
+            if (std::isfinite(value)) {
+                if (value < minimum) { minimum = value; minimum_vertex = index; }
+                if (value > maximum) { maximum = value; maximum_vertex = index; }
+            }
+        }
+        if (!std::isfinite(minimum) || !std::isfinite(maximum)) {
+            minimum = maximum = 0.0;
+        }
+        if (m_mode == 0) {
+            const double useful_ceiling = std::max(2.0, result.governing_target_safety_factor * 2.0);
+            maximum = std::max(minimum, std::min(maximum, useful_ceiling));
+        } else if (m_mode >= 4) {
+            const double magnitude = std::max(std::abs(minimum), std::abs(maximum));
+            minimum = -magnitude;
+            maximum = magnitude;
+        }
+        const double range = std::max(maximum - minimum, 1e-12);
+
+        std::vector<size_t> faces;
+        faces.reserve(mesh.indices.size());
+        for (size_t face = 0; face < mesh.indices.size(); ++face)
+            if (valid_triangle(mesh.indices[face], m_projected.size()))
+                faces.push_back(face);
+        DepthBitmap result_bitmap(GetClientSize());
+        for (size_t face : faces) {
+            const Vec3i32 &triangle = mesh.indices[face];
+            std::array<double, 3> values{};
+            bool finite = true;
+            for (int corner = 0; corner < 3; ++corner) {
+                const size_t vertex = size_t(triangle[corner]);
+                values[corner] = scalar(result.vertices[vertex]);
+                finite = std::isfinite(values[corner]) && finite;
+            }
+            result_bitmap.triangle(m_projected[size_t(triangle[0])], m_projected[size_t(triangle[1])],
+                                   m_projected[size_t(triangle[2])],
+                [this, finite, values, minimum, maximum, range](double a, double b, double c) {
+                    return finite ? contour_colour(a * values[0] + b * values[1] + c * values[2],
+                                                   minimum, maximum, range) : wxColour(150, 150, 150);
+                });
+        }
+        if (m_show_wireframe)
+            for (size_t face : faces) {
+                const Vec3i32 &triangle = mesh.indices[face];
+                for (int edge = 0; edge < 3; ++edge)
+                    result_bitmap.line(m_projected[size_t(triangle[edge])],
+                                       m_projected[size_t(triangle[(edge + 1) % 3])], wxColour(62, 67, 73));
+            }
+        result_bitmap.draw(dc);
+
+        if (m_show_wireframe)
+            draw_reference_mesh(dc, camera, true);
+        if (m_show_setup)
+            draw_setup_glyphs(dc, camera);
+
+        draw_extreme_marker(dc, minimum_vertex, _L("MIN"),
+                            m_mode == 0 ? wxColour(215, 52, 48) : wxColour(42, 92, 210));
+        draw_extreme_marker(dc, maximum_vertex, _L("MAX"),
+                            m_mode == 0 ? wxColour(42, 92, 210) : wxColour(215, 52, 48));
+        draw_legend(dc, minimum, maximum);
+
+        dc.SetTextForeground(wxColour(48, 57, 68));
+        dc.DrawText(_L("Drag to orbit • middle/right drag to pan • wheel to zoom • click the model to probe"),
+                    FromDIP(12), GetClientSize().y - FromDIP(24));
+        if (m_session->stale) {
+            dc.SetBrush(wxBrush(wxColour(255, 234, 203)));
+            dc.SetPen(wxPen(wxColour(202, 119, 30), 1));
+            dc.DrawRoundedRectangle(FromDIP(10), FromDIP(10), FromDIP(310), FromDIP(32), FromDIP(5));
+            dc.SetTextForeground(wxColour(145, 72, 8));
+            dc.DrawText(_L("STALE RESULT — rerun after setup or geometry changes"), FromDIP(20), FromDIP(18));
+        }
+    }
+
+    void clicked(const wxPoint &point, bool) override
+    {
+        if (m_projected.empty())
+            return;
+        const indexed_triangle_set &mesh = display_mesh();
+        bool found = false;
+        double nearest_depth = -std::numeric_limits<double>::infinity();
+        size_t picked_vertex = 0;
+        for (const Vec3i32 &triangle : mesh.indices) {
+            if (!valid_triangle(triangle, m_projected.size()))
+                continue;
+            const size_t indices[3]{size_t(triangle[0]), size_t(triangle[1]), size_t(triangle[2])};
+            const wxPoint screen[3]{m_projected[indices[0]].point, m_projected[indices[1]].point,
+                                    m_projected[indices[2]].point};
+            double weights[3];
+            if (!barycentric(point, screen, weights))
+                continue;
+            const double depth = weights[0] * m_projected[indices[0]].depth +
+                weights[1] * m_projected[indices[1]].depth + weights[2] * m_projected[indices[2]].depth;
+            if (depth <= nearest_depth)
+                continue;
+            nearest_depth = depth;
+            picked_vertex = indices[std::distance(weights, std::max_element(weights, weights + 3))];
+            found = true;
+        }
+        if (found)
+            m_probe(picked_vertex);
+    }
 
 private:
     std::shared_ptr<StrengthAnalysisSession> m_session;
     std::function<void(size_t)> m_probe;
     int m_mode{0};
-    int m_projection{0};
     double m_deformation_scale{1.0};
-    std::vector<wxPoint> m_projected;
+    bool m_show_setup{true};
+    bool m_show_wireframe{true};
+    bool m_banded{false};
+    std::vector<ScreenVertex> m_projected;
+
+    const indexed_triangle_set &display_mesh() const
+    {
+        return m_session->result.succeeded() && !m_session->solved_mesh.empty() ?
+            m_session->solved_mesh : m_session->mesh;
+    }
+
+    const SA::Setup &display_setup() const
+    {
+        return m_session->result.succeeded() && !m_session->solved_mesh.empty() ?
+            m_session->solved_setup : m_session->setup;
+    }
 
     double scalar(const SA::VertexResult &vertex) const
     {
@@ -872,14 +3304,7 @@ private:
         }
     }
 
-    std::pair<double, double> project(const Vec3d &value) const
-    {
-        if (m_projection == 1) return {value.x(), value.z()};
-        if (m_projection == 2) return {value.y(), value.z()};
-        return {value.x(), value.y()};
-    }
-
-    static wxColour heat(double fraction)
+    static wxColour rainbow(double fraction)
     {
         fraction = std::clamp(fraction, 0.0, 1.0);
         const double r = std::clamp(1.5 - std::abs(4.0 * fraction - 3.0), 0.0, 1.0);
@@ -888,111 +3313,180 @@ private:
         return wxColour(int(255.0 * r), int(255.0 * g), int(255.0 * b));
     }
 
-    void paint()
+    wxColour contour_colour(double value, double minimum, double maximum, double range) const
     {
-        wxAutoBufferedPaintDC dc(this);
-        dc.SetBackground(wxBrush(wxColour(250, 250, 250)));
-        dc.Clear();
-        const SA::Result &result = m_session->result;
-        if (!result.succeeded() || result.vertices.empty() || m_session->mesh.indices.empty()) {
-            dc.DrawText(_L("Run an analysis from the Load tab to display coupled results."), FromDIP(20), FromDIP(20));
-            return;
-        }
+        if (!std::isfinite(value))
+            return wxColour(150, 150, 150);
+        double fraction = (std::clamp(value, minimum, maximum) - minimum) / range;
+        if (m_mode == 0)
+            fraction = 1.0 - fraction;
+        if (m_banded)
+            fraction = std::round(fraction * 10.0) / 10.0;
+        return rainbow(fraction);
+    }
 
-        std::vector<std::pair<double, double>> coordinates;
-        coordinates.reserve(result.vertices.size());
-        double min_u = std::numeric_limits<double>::infinity(), max_u = -min_u;
-        double min_v = min_u, max_v = -min_u;
-        double min_value = std::numeric_limits<double>::infinity(), max_value = -min_value;
-        for (const SA::VertexResult &vertex : result.vertices) {
-            const Vec3d deformed = vertex.position_mm + vertex.displacement_m * (1000.0 * m_deformation_scale);
-            const auto projected = project(deformed);
-            coordinates.push_back(projected);
-            min_u = std::min(min_u, projected.first); max_u = std::max(max_u, projected.first);
-            min_v = std::min(min_v, projected.second); max_v = std::max(max_v, projected.second);
-            const double value = scalar(vertex);
-            if (std::isfinite(value)) { min_value = std::min(min_value, value); max_value = std::max(max_value, value); }
-        }
-        if (m_mode == 0) max_value = std::min(max_value, 10.0);
-        const wxSize size = GetClientSize();
-        const int margin = FromDIP(42);
-        const double width = std::max(max_u - min_u, 1e-9), height = std::max(max_v - min_v, 1e-9);
-        const double scale = std::min(double(size.x - 2 * margin) / width, double(size.y - 2 * margin) / height);
-        const double offset_x = 0.5 * (size.x - scale * width);
-        const double offset_y = 0.5 * (size.y + scale * height);
-        m_projected.resize(coordinates.size());
-        for (size_t index = 0; index < coordinates.size(); ++index)
-            m_projected[index] = wxPoint(int(offset_x + (coordinates[index].first - min_u) * scale),
-                                         int(offset_y - (coordinates[index].second - min_v) * scale));
-
-        std::vector<size_t> faces(m_session->mesh.indices.size());
-        std::iota(faces.begin(), faces.end(), size_t(0));
-        std::stable_sort(faces.begin(), faces.end(), [this, &result](size_t lhs, size_t rhs) {
-            auto depth = [this, &result](size_t face) {
-                const Vec3i32 &triangle = m_session->mesh.indices[face];
-                double sum = 0.0;
-                for (int corner = 0; corner < 3; ++corner) {
-                    const Vec3d &position = result.vertices[size_t(triangle[corner])].position_mm;
-                    sum += m_projection == 0 ? position.z() : (m_projection == 1 ? position.y() : position.x());
-                }
-                return sum;
-            };
-            return depth(lhs) < depth(rhs);
-        });
-        const double range = std::max(max_value - min_value, 1e-12);
-        dc.SetPen(wxPen(wxColour(80, 80, 80), 1));
-        for (size_t face : faces) {
-            const Vec3i32 &triangle = m_session->mesh.indices[face];
-            wxPoint points[3];
-            double value = 0.0;
-            bool valid = true;
-            for (int corner = 0; corner < 3; ++corner) {
-                const size_t vertex = size_t(triangle[corner]);
-                if (vertex >= m_projected.size()) { valid = false; break; }
-                points[corner] = m_projected[vertex];
-                value += scalar(result.vertices[vertex]);
+    void draw_reference_mesh(wxDC &dc, const CameraFrame &camera, bool undeformed_overlay)
+    {
+        const indexed_triangle_set &mesh = display_mesh();
+        std::vector<ScreenVertex> original;
+        original.reserve(mesh.vertices.size());
+        for (const Vec3f &vertex : mesh.vertices)
+            original.push_back(project(vertex.cast<double>(), camera));
+        if (undeformed_overlay) {
+            dc.SetPen(wxPen(wxColour(80, 88, 98), 1, wxPENSTYLE_SHORT_DASH));
+            dc.SetBrush(*wxTRANSPARENT_BRUSH);
+            for (const Vec3i32 &triangle : mesh.indices) {
+                if (!valid_triangle(triangle, original.size()))
+                    continue;
+                wxPoint polygon[4]{original[size_t(triangle[0])].point, original[size_t(triangle[1])].point,
+                                   original[size_t(triangle[2])].point, original[size_t(triangle[0])].point};
+                dc.DrawLines(4, polygon);
             }
-            if (!valid) continue;
-            value /= 3.0;
-            double fraction = (std::clamp(value, min_value, max_value) - min_value) / range;
-            if (m_mode == 0)
-                fraction = 1.0 - fraction;
-            dc.SetBrush(wxBrush(heat(fraction)));
-            dc.DrawPolygon(3, points);
-        }
-        dc.SetTextForeground(*wxBLACK);
-        dc.DrawText(wxString::Format(_L("Range: %.5g to %.5g"), min_value, max_value), FromDIP(8), FromDIP(8));
-        if (m_session->stale) {
-            dc.SetTextForeground(wxColour(180, 70, 0));
-            dc.DrawText(_L("STALE — rerun after input or geometry changes"), FromDIP(8), FromDIP(27));
+        } else {
+            DepthBitmap reference(GetClientSize());
+            for (const Vec3i32 &triangle : mesh.indices) {
+                if (!valid_triangle(triangle, original.size()))
+                    continue;
+                reference.triangle(original[size_t(triangle[0])], original[size_t(triangle[1])],
+                                   original[size_t(triangle[2])],
+                                   [](double, double, double) { return wxColour(188, 199, 212); });
+            }
+            for (const Vec3i32 &triangle : mesh.indices) {
+                if (!valid_triangle(triangle, original.size()))
+                    continue;
+                for (int edge = 0; edge < 3; ++edge)
+                    reference.line(original[size_t(triangle[edge])], original[size_t(triangle[(edge + 1) % 3])],
+                                   wxColour(95, 106, 119));
+            }
+            reference.draw(dc);
         }
     }
 
-    void click(const wxPoint &point)
+    void draw_setup_glyphs(wxDC &dc, const CameraFrame &camera)
     {
-        if (m_projected.empty()) return;
-        size_t closest = 0;
-        long closest_distance = std::numeric_limits<long>::max();
-        for (size_t index = 0; index < m_projected.size(); ++index) {
-            const long dx = point.x - m_projected[index].x;
-            const long dy = point.y - m_projected[index].y;
-            const long distance = dx * dx + dy * dy;
-            if (distance < closest_distance) { closest_distance = distance; closest = index; }
+        const indexed_triangle_set &mesh = display_mesh();
+        const SA::Setup &setup = display_setup();
+        double radius = 1.0;
+        for (const Vec3f &point : mesh.vertices)
+            radius = std::max(radius, (point.cast<double>() - camera.center).norm());
+        const double length = 0.24 * radius;
+        for (const SA::Load &load : setup.loads) {
+            if (!load.active)
+                continue;
+            const Vec3d center = load.region.whole_model ? camera.center : load.region.center_mm;
+            const ScreenVertex anchor = project(center, camera);
+            const wxColour colour = load_colour(load.type);
+            if (!load.region.whole_model) {
+                draw_region_shape(dc, camera, load.region, colour, false);
+            }
+            if (load.type == SA::LoadType::Fixed) {
+                dc.SetPen(wxPen(colour, 3));
+                dc.SetBrush(wxBrush(wxColour(214, 228, 252)));
+                const int half = FromDIP(7);
+                wxPoint support[3]{anchor.point + wxPoint(0, -half), anchor.point + wxPoint(-half, half),
+                                   anchor.point + wxPoint(half, half)};
+                dc.DrawPolygon(3, support);
+                dc.SetTextForeground(colour);
+            } else {
+                const Vec3d direction = load.direction.squaredNorm() > 1e-12 ? load.direction.normalized() : Vec3d::UnitZ();
+                const ScreenVertex tip = project(center + direction * length, camera);
+                draw_arrow(dc, anchor.point, tip.point, colour, 3);
+                dc.SetPen(wxPen(colour, 3));
+                dc.SetBrush(wxBrush(wxColour(255, 255, 255)));
+                dc.DrawCircle(anchor.point, FromDIP(4));
+                dc.SetTextForeground(colour);
+            }
+            dc.DrawText(wxString::FromUTF8(load.name), anchor.point + wxPoint(9, -17));
         }
-        if (closest_distance <= long(FromDIP(20) * FromDIP(20)))
-            m_probe(closest);
+        if (setup.gravity.enabled) {
+            const Vec3d direction = setup.gravity.acceleration_m_s2.normalized();
+            const Vec3d start = camera.center - direction * 0.5 * radius;
+            const wxPoint anchor = project(start, camera).point;
+            draw_arrow(dc, anchor, project(start + direction * length, camera).point, wxColour(38, 133, 140), 3);
+            dc.SetTextForeground(wxColour(28, 95, 102));
+            dc.DrawText(_L("Gravity"), anchor + wxPoint(9, -17));
+        }
+        for (size_t index = 0; index < setup.preserve_regions.size(); ++index) {
+            const SA::SphericalRegion &region = setup.preserve_regions[index];
+            const ScreenVertex center = project(region.center_mm, camera);
+            draw_region_shape(dc, camera, region, wxColour(43, 153, 91), false);
+            dc.SetTextForeground(wxColour(31, 113, 66));
+            dc.DrawText(wxString::Format(_L("Preserve %zu"), index + 1), center.point + wxPoint(9, 7));
+        }
+    }
+
+    void draw_extreme_marker(wxDC &dc, size_t vertex, const wxString &label, const wxColour &colour)
+    {
+        if (vertex >= m_projected.size())
+            return;
+        const wxPoint point = m_projected[vertex].point;
+        dc.SetPen(wxPen(colour, 3));
+        dc.SetBrush(wxBrush(wxColour(255, 255, 255)));
+        dc.DrawCircle(point, FromDIP(5));
+        dc.SetTextForeground(colour);
+        dc.DrawText(label, point + wxPoint(7, -14));
+    }
+
+    void draw_legend(wxDC &dc, double minimum, double maximum)
+    {
+        const wxSize size = GetClientSize();
+        int label_width = 0;
+        for (int tick = 0; tick <= 5; ++tick) {
+            const double fraction = double(tick) / 5.0;
+            label_width = std::max(label_width,
+                dc.GetTextExtent(wxString::Format("%.4g", maximum - fraction * (maximum - minimum))).x);
+        }
+        const int width = FromDIP(24);
+        const int x = std::max(FromDIP(20), size.x - width - label_width - FromDIP(24));
+        const int top = FromDIP(70);
+        const int height = std::max(FromDIP(180), size.y - FromDIP(150));
+        constexpr int bands = 32;
+        dc.SetPen(*wxTRANSPARENT_PEN);
+        for (int band = 0; band < bands; ++band) {
+            const double value_fraction = 1.0 - double(band) / double(bands - 1);
+            double fraction = m_mode == 0 ? 1.0 - value_fraction : value_fraction;
+            if (m_banded)
+                fraction = std::round(fraction * 10.0) / 10.0;
+            const int y0 = top + band * height / bands;
+            const int y1 = top + (band + 1) * height / bands;
+            dc.SetBrush(wxBrush(rainbow(fraction)));
+            dc.DrawRectangle(x, y0, width, std::max(1, y1 - y0));
+        }
+        dc.SetPen(wxPen(wxColour(50, 55, 62), 1));
+        dc.SetBrush(*wxTRANSPARENT_BRUSH);
+        dc.DrawRectangle(x, top, width, height);
+        dc.SetTextForeground(wxColour(35, 40, 48));
+        dc.DrawText(result_title(), x - FromDIP(24), FromDIP(26));
+        for (int tick = 0; tick <= 5; ++tick) {
+            const double fraction = double(tick) / 5.0;
+            const double value = maximum - fraction * (maximum - minimum);
+            const int y = top + int(std::lround(fraction * height));
+            dc.DrawLine(x + width, y, x + width + FromDIP(4), y);
+            dc.DrawText(wxString::Format("%.4g", value), x + width + FromDIP(7), y - FromDIP(7));
+        }
+    }
+
+    wxString result_title() const
+    {
+        static const std::array<wxString, 10> titles{
+            _L("Safety factor"), _L("Displacement (mm)"), _L("Von Mises (MPa)"), _L("Max shear (MPa)"),
+            _L("Normal X (MPa)"), _L("Normal Y (MPa)"), _L("Normal Z (MPa)"),
+            _L("Shear XY (MPa)"), _L("Shear XZ (MPa)"), _L("Shear YZ (MPa)")};
+        return titles[size_t(std::clamp(m_mode, 0, int(titles.size()) - 1))];
     }
 };
 
-StrengthSimulationPanel::StrengthSimulationPanel(wxWindow *parent, std::shared_ptr<StrengthAnalysisSession> session)
-    : wxScrolledWindow(parent, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxVSCROLL | wxTAB_TRAVERSAL)
+StrengthSimulationPanel::StrengthSimulationPanel(wxWindow *parent, std::shared_ptr<StrengthAnalysisSession> session,
+                                                 std::function<void()> synchronize_session)
+    : wxScrolledWindow(parent, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxVSCROLL | wxHSCROLL | wxTAB_TRAVERSAL)
     , m_session(std::move(session))
+    , m_synchronize_session(std::move(synchronize_session))
 {
     SetBackgroundColour(*wxWHITE);
-    SetScrollRate(0, FromDIP(12));
+    SetScrollRate(FromDIP(12), FromDIP(12));
     const int gap = FromDIP(8);
     auto *root = new wxBoxSizer(wxVERTICAL);
-    root->Add(new wxStaticText(this, wxID_ANY, _L("Strength Analysis — Simulation Results")), 0, wxALL, gap);
+    root->Add(new wxStaticText(this, wxID_ANY, _L("Strength Analysis — 3D Results Workspace")), 0, wxALL, gap);
     m_status = new wxStaticText(this, wxID_ANY, _L("No analysis has been run."));
     root->Add(m_status, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
     auto *controls = new wxBoxSizer(wxHORIZONTAL);
@@ -1001,15 +3495,33 @@ StrengthSimulationPanel::StrengthSimulationPanel(wxWindow *parent, std::shared_p
          _L("Normal stress X (MPa)"), _L("Normal stress Y (MPa)"), _L("Normal stress Z (MPa)"),
          _L("Shear stress XY (MPa)"), _L("Shear stress XZ (MPa)"), _L("Shear stress YZ (MPa)")});
     m_result_mode->SetSelection(0);
-    m_projection = new wxChoice(this, wxID_ANY, wxDefaultPosition, wxDefaultSize, {_L("XY view"), _L("XZ view"), _L("YZ view")});
+    m_projection = new wxChoice(this, wxID_ANY, wxDefaultPosition, wxDefaultSize,
+                                {_L("Isometric"), _L("Front"), _L("Top"), _L("Right")});
     m_projection->SetSelection(0);
     m_deformation_scale = number_input(this, 1.0, 78);
     add_labeled(controls, this, _L("Result"), m_result_mode);
     controls->AddSpacer(gap);
-    add_labeled(controls, this, _L("Projection"), m_projection);
+    add_labeled(controls, this, _L("View"), m_projection);
     controls->AddSpacer(gap);
     add_labeled(controls, this, _L("Deformation scale"), m_deformation_scale);
+    auto *fit_view = new wxButton(this, wxID_ANY, _L("Fit"));
+    controls->AddSpacer(gap);
+    controls->Add(fit_view, 0);
     root->Add(controls, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
+    auto *display = new wxBoxSizer(wxHORIZONTAL);
+    m_show_setup = new wxCheckBox(this, wxID_ANY, _L("Show loads and constraints"));
+    m_show_wireframe = new wxCheckBox(this, wxID_ANY, _L("Undeformed wireframe"));
+    m_banded_contours = new wxCheckBox(this, wxID_ANY, _L("Banded contours"));
+    m_show_setup->SetValue(true);
+    m_show_wireframe->SetValue(true);
+    m_banded_contours->SetValue(false);
+    for (wxCheckBox *checkbox : {m_show_setup, m_show_wireframe, m_banded_contours})
+        display->Add(checkbox, 0, wxRIGHT, FromDIP(16));
+    display->AddStretchSpacer();
+    display->Add(new wxStaticText(this, wxID_ANY,
+        _L("Rainbow contours map the legend range; safety factor is reversed and signed stresses are centered on zero.")),
+        0, wxALIGN_CENTER_VERTICAL);
+    root->Add(display, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
     m_canvas = new ResultCanvas(this, m_session, [this](size_t vertex) { update_probe(vertex); });
     root->Add(m_canvas, 1, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
     m_probe = new wxStaticText(this, wxID_ANY, _L("Point probe: click near a mesh vertex."));
@@ -1021,6 +3533,10 @@ StrengthSimulationPanel::StrengthSimulationPanel(wxWindow *parent, std::shared_p
 
     m_result_mode->Bind(wxEVT_CHOICE, [this](wxCommandEvent &) { m_canvas->set_mode(m_result_mode->GetSelection()); });
     m_projection->Bind(wxEVT_CHOICE, [this](wxCommandEvent &) { m_canvas->set_projection(m_projection->GetSelection()); });
+    fit_view->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { m_canvas->fit_view(); });
+    m_show_setup->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent &) { m_canvas->set_show_setup(m_show_setup->GetValue()); });
+    m_show_wireframe->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent &) { m_canvas->set_show_wireframe(m_show_wireframe->GetValue()); });
+    m_banded_contours->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent &) { m_canvas->set_banded(m_banded_contours->GetValue()); });
     m_deformation_scale->Bind(wxEVT_TEXT, [this](wxCommandEvent &) {
         double value = 1.0;
         if (read_number(m_deformation_scale, value)) m_canvas->set_deformation_scale(value);
@@ -1029,6 +3545,8 @@ StrengthSimulationPanel::StrengthSimulationPanel(wxWindow *parent, std::shared_p
 
 void StrengthSimulationPanel::activate()
 {
+    if (m_synchronize_session)
+        m_synchronize_session();
     refresh();
 }
 
@@ -1051,9 +3569,10 @@ void StrengthSimulationPanel::refresh()
     text += wxString::Format(_L("Minimum safety factor: %.6g\n"), result.minimum_safety_factor);
     text += wxString::Format(_L("Governing safety-factor target: %.6g — %s\n"), result.governing_target_safety_factor,
         result.safety_factor_target_met ? _L("met") : _L("not met"));
-    if (m_session->setup.criteria.maximum_displacement_mm > 0.0)
+    const SA::Setup &display_setup = !m_session->solved_mesh.empty() ? m_session->solved_setup : m_session->setup;
+    if (display_setup.criteria.maximum_displacement_mm > 0.0)
         text += wxString::Format(_L("Maximum-displacement target: %.6g mm — %s\n"),
-            m_session->setup.criteria.maximum_displacement_mm, result.displacement_target_met ? _L("met") : _L("not met"));
+            display_setup.criteria.maximum_displacement_mm, result.displacement_target_met ? _L("met") : _L("not met"));
     text += wxString::Format(_L("Requested resultant force: %s N\n\n"), vector_text(result.requested_resultant_force_n));
     if (result.dense_region.available)
         text += wxString::Format(_L("Dense-region recommendation: center %s mm, radius %.5g mm, %.4g%% %s "

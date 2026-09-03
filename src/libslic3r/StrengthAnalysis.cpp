@@ -12,6 +12,7 @@
 #include <iterator>
 #include <map>
 #include <numeric>
+#include <queue>
 #include <set>
 #include <sstream>
 #include <string_view>
@@ -57,6 +58,24 @@ double effective_solid_fraction(double density)
 
 bool finite_positive(double value) { return std::isfinite(value) && value > 0.0; }
 
+bool valid_region_extent(const SphericalRegion &region)
+{
+    if (region.whole_model)
+        return true;
+    switch (region.shape) {
+    case RegionShape::Sphere:
+        return finite_positive(region.radius_mm);
+    case RegionShape::Box:
+        return region.size_mm.allFinite() && (region.size_mm.array() > 0.0).all();
+    case RegionShape::Cylinder:
+        return finite_positive(region.radius_mm) && std::isfinite(region.size_mm.z()) && region.size_mm.z() > 0.0 &&
+            region.axis.allFinite() && region.axis.squaredNorm() > NUMERIC_EPSILON;
+    case RegionShape::Surface:
+        return !region.surface_triangles.empty();
+    }
+    return false;
+}
+
 Vec3d normalized_or_zero(const Vec3d &v)
 {
     const double norm = v.norm();
@@ -73,7 +92,7 @@ double anisotropic_mix(double xy, double z, const Vec3d &direction, const Vec3d 
     return xy * (1.0 - z_weight) + z * z_weight;
 }
 
-std::vector<size_t> region_vertices(const indexed_triangle_set &mesh, const SphericalRegion &region, bool select_nearest = true)
+std::vector<size_t> region_vertices_impl(const indexed_triangle_set &mesh, const SphericalRegion &region, bool select_nearest)
 {
     std::vector<size_t> selected;
     if (region.whole_model) {
@@ -82,12 +101,28 @@ std::vector<size_t> region_vertices(const indexed_triangle_set &mesh, const Sphe
         return selected;
     }
 
+    if (region.shape == RegionShape::Surface && !region.surface_triangles.empty()) {
+        std::set<size_t> vertices;
+        for (size_t face : region.surface_triangles) {
+            if (face >= mesh.indices.size())
+                continue;
+            const Vec3i32 &triangle = mesh.indices[face];
+            for (int corner = 0; corner < 3; ++corner)
+                if (triangle[corner] >= 0 && size_t(triangle[corner]) < mesh.vertices.size())
+                    vertices.insert(size_t(triangle[corner]));
+        }
+        selected.assign(vertices.begin(), vertices.end());
+        // Surface regions are an exact topological selection. Falling back to a nearby vertex
+        // would silently move a load after a mesh topology change.
+        return selected;
+    }
+
     double nearest_distance = std::numeric_limits<double>::infinity();
     size_t nearest = 0;
     for (size_t index = 0; index < mesh.vertices.size(); ++index) {
         const Vec3d position = mesh.vertices[index].cast<double>();
         const double distance = (position - region.center_mm).norm();
-        if (distance <= region.radius_mm)
+        if (region.contains(position))
             selected.push_back(index);
         if (distance < nearest_distance) {
             nearest_distance = distance;
@@ -116,7 +151,10 @@ template<class Enum> Enum enum_from_string(const std::string &value, const std::
 
 nlohmann::json region_json(const SphericalRegion &region)
 {
-    return {{"center_mm", vec_to_array(region.center_mm)}, {"radius_mm", region.radius_mm}, {"whole_model", region.whole_model}};
+    return {{"center_mm", vec_to_array(region.center_mm)}, {"radius_mm", region.radius_mm},
+            {"whole_model", region.whole_model}, {"shape", to_string(region.shape)},
+            {"size_mm", vec_to_array(region.size_mm)}, {"axis", vec_to_array(region.axis)},
+            {"surface_triangles", region.surface_triangles}};
 }
 
 SphericalRegion region_from_json(const nlohmann::json &j)
@@ -128,6 +166,15 @@ SphericalRegion region_from_json(const nlohmann::json &j)
         region.center_mm = array_to_vec(j["center_mm"], region.center_mm);
     region.radius_mm = j.value("radius_mm", region.radius_mm);
     region.whole_model = j.value("whole_model", region.whole_model);
+    static const std::map<std::string, RegionShape> shapes{{"sphere", RegionShape::Sphere}, {"box", RegionShape::Box},
+        {"cylinder", RegionShape::Cylinder}, {"surface", RegionShape::Surface}};
+    region.shape = enum_from_string(j.value("shape", "sphere"), shapes, region.shape);
+    if (j.contains("size_mm"))
+        region.size_mm = array_to_vec(j["size_mm"], region.size_mm);
+    if (j.contains("axis"))
+        region.axis = array_to_vec(j["axis"], region.axis);
+    if (j.contains("surface_triangles"))
+        region.surface_triangles = j["surface_triangles"].get<std::vector<size_t>>();
     return region;
 }
 
@@ -212,9 +259,187 @@ double directional_strength(const Setup &setup, StrengthBasis basis, const Vec3d
 
 } // namespace
 
+std::vector<size_t> vertices_in_region(const indexed_triangle_set &mesh, const SphericalRegion &region, bool select_nearest)
+{
+    return region_vertices_impl(mesh, region, select_nearest);
+}
+
 bool SphericalRegion::contains(const Vec3d &position_mm) const
 {
-    return whole_model || (finite_positive(radius_mm) && (position_mm - center_mm).squaredNorm() <= radius_mm * radius_mm);
+    if (whole_model)
+        return true;
+    const Vec3d delta = position_mm - center_mm;
+    switch (shape) {
+    case RegionShape::Sphere:
+        return finite_positive(radius_mm) && delta.squaredNorm() <= radius_mm * radius_mm;
+    case RegionShape::Box:
+        return size_mm.allFinite() && (size_mm.array() > 0.0).all() &&
+            (delta.array().abs() <= 0.5 * size_mm.array()).all();
+    case RegionShape::Cylinder: {
+        const Vec3d direction = normalized_or_zero(axis);
+        if (direction.isZero(NUMERIC_EPSILON) || !finite_positive(radius_mm) ||
+            !std::isfinite(size_mm.z()) || size_mm.z() <= 0.0)
+            return false;
+        const double axial = delta.dot(direction);
+        const Vec3d radial = delta - axial * direction;
+        return std::abs(axial) <= 0.5 * size_mm.z() && radial.squaredNorm() <= radius_mm * radius_mm;
+    }
+    case RegionShape::Surface:
+        return false;
+    }
+    return false;
+}
+
+namespace {
+
+using MeshEdge = std::pair<int32_t, int32_t>;
+
+MeshEdge normalized_edge(int32_t first, int32_t second)
+{
+    return first < second ? MeshEdge{first, second} : MeshEdge{second, first};
+}
+
+bool valid_mesh_triangle(const indexed_triangle_set &mesh, const Vec3i32 &triangle)
+{
+    return triangle[0] >= 0 && triangle[1] >= 0 && triangle[2] >= 0 &&
+        size_t(triangle[0]) < mesh.vertices.size() && size_t(triangle[1]) < mesh.vertices.size() &&
+        size_t(triangle[2]) < mesh.vertices.size();
+}
+
+std::vector<std::vector<size_t>> face_adjacency(const indexed_triangle_set &mesh)
+{
+    std::map<MeshEdge, std::vector<size_t>> edge_faces;
+    for (size_t face = 0; face < mesh.indices.size(); ++face) {
+        const Vec3i32 &triangle = mesh.indices[face];
+        if (!valid_mesh_triangle(mesh, triangle))
+            continue;
+        for (int edge = 0; edge < 3; ++edge)
+            edge_faces[normalized_edge(triangle[edge], triangle[(edge + 1) % 3])].push_back(face);
+    }
+    std::vector<std::vector<size_t>> adjacency(mesh.indices.size());
+    for (const auto &[edge, faces] : edge_faces) {
+        (void) edge;
+        for (size_t first = 0; first < faces.size(); ++first)
+            for (size_t second = first + 1; second < faces.size(); ++second) {
+                adjacency[faces[first]].push_back(faces[second]);
+                adjacency[faces[second]].push_back(faces[first]);
+            }
+    }
+    return adjacency;
+}
+
+} // namespace
+
+std::vector<std::vector<size_t>> mesh_connected_components(const indexed_triangle_set &mesh)
+{
+    const auto adjacency = face_adjacency(mesh);
+    std::vector<unsigned char> visited(mesh.indices.size(), 0);
+    std::vector<std::vector<size_t>> components;
+    for (size_t seed = 0; seed < mesh.indices.size(); ++seed) {
+        if (visited[seed] || !valid_mesh_triangle(mesh, mesh.indices[seed]))
+            continue;
+        components.emplace_back();
+        std::queue<size_t> pending;
+        pending.push(seed);
+        visited[seed] = 1;
+        while (!pending.empty()) {
+            const size_t face = pending.front();
+            pending.pop();
+            components.back().push_back(face);
+            for (size_t neighbor : adjacency[face])
+                if (!visited[neighbor]) {
+                    visited[neighbor] = 1;
+                    pending.push(neighbor);
+                }
+        }
+    }
+    return components;
+}
+
+std::vector<SurfacePatch> group_coplanar_surfaces(const indexed_triangle_set &mesh,
+                                                  const SurfaceGroupingSettings &settings)
+{
+    if (!std::isfinite(settings.coplanar_angle_degrees) || settings.coplanar_angle_degrees < 0.0 ||
+        settings.coplanar_angle_degrees >= 90.0 || !std::isfinite(settings.plane_tolerance_mm) ||
+        settings.plane_tolerance_mm < 0.0)
+        return {};
+
+    const auto adjacency = face_adjacency(mesh);
+    std::vector<Vec3d> normals(mesh.indices.size(), Vec3d::Zero());
+    std::vector<double> areas(mesh.indices.size(), 0.0);
+    std::vector<Vec3d> centroids(mesh.indices.size(), Vec3d::Zero());
+    for (size_t face = 0; face < mesh.indices.size(); ++face) {
+        const Vec3i32 &triangle = mesh.indices[face];
+        if (!valid_mesh_triangle(mesh, triangle))
+            continue;
+        const Vec3d a = mesh.vertices[size_t(triangle[0])].cast<double>();
+        const Vec3d b = mesh.vertices[size_t(triangle[1])].cast<double>();
+        const Vec3d c = mesh.vertices[size_t(triangle[2])].cast<double>();
+        const Vec3d cross = (b - a).cross(c - a);
+        areas[face] = 0.5 * cross.norm();
+        if (areas[face] > NUMERIC_EPSILON)
+            normals[face] = cross.normalized();
+        centroids[face] = (a + b + c) / 3.0;
+    }
+
+    std::vector<size_t> component_for_face(mesh.indices.size(), 0);
+    const auto components = mesh_connected_components(mesh);
+    for (size_t component = 0; component < components.size(); ++component)
+        for (size_t face : components[component])
+            component_for_face[face] = component;
+
+    constexpr double pi = 3.14159265358979323846;
+    const double cosine_limit = std::cos(settings.coplanar_angle_degrees * pi / 180.0);
+    std::vector<unsigned char> visited(mesh.indices.size(), 0);
+    std::vector<SurfacePatch> patches;
+    for (size_t seed = 0; seed < mesh.indices.size(); ++seed) {
+        if (visited[seed] || areas[seed] <= NUMERIC_EPSILON)
+            continue;
+        SurfacePatch patch;
+        patch.component_index = component_for_face[seed];
+        const Vec3d seed_normal = normals[seed];
+        const double seed_plane = seed_normal.dot(centroids[seed]);
+        std::queue<size_t> pending;
+        pending.push(seed);
+        visited[seed] = 1;
+        Vec3d weighted_normal = Vec3d::Zero();
+        Vec3d weighted_centroid = Vec3d::Zero();
+        while (!pending.empty()) {
+            const size_t face = pending.front();
+            pending.pop();
+            patch.triangles.push_back(face);
+            patch.area_mm2 += areas[face];
+            Vec3d aligned_normal = normals[face];
+            if (aligned_normal.dot(seed_normal) < 0.0)
+                aligned_normal = -aligned_normal;
+            weighted_normal += aligned_normal * areas[face];
+            weighted_centroid += centroids[face] * areas[face];
+            for (size_t neighbor : adjacency[face]) {
+                if (visited[neighbor] || areas[neighbor] <= NUMERIC_EPSILON ||
+                    std::abs(normals[neighbor].dot(seed_normal)) < cosine_limit)
+                    continue;
+                const Vec3i32 &candidate = mesh.indices[neighbor];
+                bool on_plane = true;
+                for (int corner = 0; corner < 3; ++corner) {
+                    const Vec3d point = mesh.vertices[size_t(candidate[corner])].cast<double>();
+                    if (std::abs(seed_normal.dot(point) - seed_plane) > settings.plane_tolerance_mm) {
+                        on_plane = false;
+                        break;
+                    }
+                }
+                if (on_plane) {
+                    visited[neighbor] = 1;
+                    pending.push(neighbor);
+                }
+            }
+        }
+        if (patch.area_mm2 > NUMERIC_EPSILON) {
+            patch.centroid_mm = weighted_centroid / patch.area_mm2;
+            patch.normal = normalized_or_zero(weighted_normal);
+        }
+        patches.push_back(std::move(patch));
+    }
+    return patches;
 }
 
 std::vector<std::string> Material::validate() const
@@ -374,6 +599,17 @@ std::string to_string(InfillPattern pattern)
     return "gyroid";
 }
 
+std::string to_string(RegionShape shape)
+{
+    switch (shape) {
+    case RegionShape::Sphere: return "sphere";
+    case RegionShape::Box: return "box";
+    case RegionShape::Cylinder: return "cylinder";
+    case RegionShape::Surface: return "surface";
+    }
+    return "sphere";
+}
+
 std::string to_string(AnalysisStatus status)
 {
     switch (status) {
@@ -425,8 +661,10 @@ std::vector<std::string> validate(const indexed_triangle_set &mesh, const Setup 
         errors.emplace_back("Regularization ratio must be in (0, 1].");
 
     for (const SphericalRegion &region : setup.preserve_regions) {
-        if (!region.whole_model && !finite_positive(region.radius_mm))
-            errors.emplace_back("Preserve-region radius must be finite and greater than zero.");
+        if (!valid_region_extent(region))
+            errors.emplace_back("Preserve-region dimensions or selected surface are invalid.");
+        else if (region.shape == RegionShape::Surface && vertices_in_region(mesh, region, false).empty())
+            errors.emplace_back("A preserve-region selected surface no longer exists in this mesh.");
         if (!region.center_mm.allFinite())
             errors.emplace_back("Preserve-region center must be finite.");
     }
@@ -443,16 +681,20 @@ std::vector<std::string> validate(const indexed_triangle_set &mesh, const Setup 
             has_fixed = true;
             if (load.region.whole_model) {
                 errors.emplace_back("A fixed constraint cannot cover the whole model.");
-            } else if (!finite_positive(load.region.radius_mm)) {
-                errors.emplace_back("Fixed-region radius must be finite and greater than zero.");
+            } else if (!valid_region_extent(load.region)) {
+                errors.emplace_back("Fixed-region dimensions or selected surface are invalid.");
             } else {
-                const std::vector<size_t> selected = region_vertices(mesh, load.region, false);
+                const std::vector<size_t> selected = vertices_in_region(mesh, load.region, false);
+                if (load.region.shape == RegionShape::Surface && selected.empty())
+                    errors.emplace_back("A fixed selected surface no longer exists in this mesh.");
                 constrained_vertices.insert(selected.begin(), selected.end());
             }
         } else {
             has_force = true;
-            if (!load.region.whole_model && !finite_positive(load.region.radius_mm))
-                errors.emplace_back("Load-region radius must be finite and greater than zero.");
+            if (!valid_region_extent(load.region))
+                errors.emplace_back("Load-region dimensions or selected surface are invalid.");
+            else if (load.region.shape == RegionShape::Surface && vertices_in_region(mesh, load.region, false).empty())
+                errors.emplace_back("A load selected surface no longer exists in this mesh.");
             if (!finite_positive(load.magnitude_n))
                 errors.emplace_back("Active load magnitude must be finite and greater than zero.");
             if (normalized_or_zero(load.direction).isZero(NUMERIC_EPSILON))
@@ -763,7 +1005,7 @@ Result analyze(const indexed_triangle_set &mesh, const Setup &setup, const Cance
     std::set<size_t> fixed_vertices;
     for (const Load &load : setup.loads) {
         if (!load.active || load.type != LoadType::Fixed) continue;
-        const std::vector<size_t> selected = region_vertices(mesh, load.region);
+        const std::vector<size_t> selected = vertices_in_region(mesh, load.region);
         fixed_vertices.insert(selected.begin(), selected.end());
     }
     const double reference_stiffness = std::max(maximum_edge_stiffness, 1.0);
@@ -786,11 +1028,11 @@ Result analyze(const indexed_triangle_set &mesh, const Setup &setup, const Cance
         result.requested_resultant_force_n += resultant;
         SphericalRegion region = load.region;
         if (load.type == LoadType::GlobalForce) region.whole_model = true;
-        std::vector<size_t> selected = region_vertices(mesh, region);
+        std::vector<size_t> selected = vertices_in_region(mesh, region);
         selected.erase(std::remove_if(selected.begin(), selected.end(), [&fixed_vertices](size_t index) {
             return fixed_vertices.count(index) != 0;
         }), selected.end());
-        if (selected.empty()) selected = region_vertices(mesh, region);
+        if (selected.empty()) selected = vertices_in_region(mesh, region);
         const Vec3d per_vertex = resultant / double(selected.size());
         for (size_t vertex : selected)
             for (int axis = 0; axis < 3; ++axis)
@@ -937,9 +1179,20 @@ Result analyze(const indexed_triangle_set &mesh, const Setup &setup, const Cance
         result.dense_region.recommended_density = setup.infill.dense_density;
         result.dense_region.recommended_pattern = setup.infill.dense_pattern;
         for (const SphericalRegion &preserve : setup.preserve_regions) {
-            const bool overlap = preserve.whole_model ||
+            double preserve_extent = preserve.radius_mm;
+            if (preserve.shape == RegionShape::Box)
+                preserve_extent = 0.5 * preserve.size_mm.norm();
+            else if (preserve.shape == RegionShape::Cylinder)
+                preserve_extent = std::hypot(preserve.radius_mm, 0.5 * preserve.size_mm.z());
+            else if (preserve.shape == RegionShape::Surface) {
+                preserve_extent = 0.0;
+                for (size_t vertex : vertices_in_region(mesh, preserve, false))
+                    preserve_extent = std::max(preserve_extent,
+                        (mesh.vertices[vertex].cast<double>() - preserve.center_mm).norm());
+            }
+            const bool overlap = preserve.whole_model || preserve.contains(result.dense_region.region.center_mm) ||
                 (result.dense_region.region.center_mm - preserve.center_mm).norm() <=
-                    result.dense_region.region.radius_mm + preserve.radius_mm;
+                    result.dense_region.region.radius_mm + preserve_extent;
             if (overlap) {
                 result.dense_region.available = false;
                 result.warnings.emplace_back("The threshold-based dense-region candidate overlaps a preserve region and was not recommended.");

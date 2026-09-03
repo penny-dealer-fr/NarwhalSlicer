@@ -37,12 +37,33 @@ enum class InfillPattern {
 
 enum class AnalysisStatus { NotRun, Success, InvalidInput, Singular, Cancelled, NumericalFailure };
 
+enum class RegionShape { Sphere, Box, Cylinder, Surface };
+
 struct SphericalRegion {
     Vec3d center_mm{Vec3d::Zero()};
     double radius_mm{5.0};
     bool whole_model{false};
+    RegionShape shape{RegionShape::Sphere};
+    // Full dimensions for box regions. Cylinders use Z as height and radius_mm radially.
+    Vec3d size_mm{Vec3d::Constant(10.0)};
+    Vec3d axis{Vec3d::UnitZ()};
+    // Triangle indices for a non-destructive, solid-like surface selection.
+    std::vector<size_t> surface_triangles;
 
     bool contains(const Vec3d &position_mm) const;
+};
+
+struct SurfacePatch {
+    std::vector<size_t> triangles;
+    Vec3d normal{Vec3d::Zero()};
+    Vec3d centroid_mm{Vec3d::Zero()};
+    double area_mm2{0.0};
+    size_t component_index{0};
+};
+
+struct SurfaceGroupingSettings {
+    double coplanar_angle_degrees{2.0};
+    double plane_tolerance_mm{0.02};
 };
 
 struct MaterialCalibration {
@@ -221,6 +242,15 @@ struct Result {
 using CancelPredicate = std::function<bool()>;
 
 std::vector<std::string> validate(const indexed_triangle_set &mesh, const Setup &setup);
+// Returns the exact vertex set used by validation and the solver for a target region. Geometric
+// regions may select the nearest vertex when requested; selected-surface regions never fall back.
+std::vector<size_t> vertices_in_region(const indexed_triangle_set &mesh, const SphericalRegion &region,
+                                       bool select_nearest = true);
+// Groups edge-connected, coplanar triangles into selectable solid-like faces. The source mesh is
+// never modified, so grouping cannot alter the printable or analyzed shape.
+std::vector<SurfacePatch> group_coplanar_surfaces(const indexed_triangle_set &mesh,
+                                                  const SurfaceGroupingSettings &settings = {});
+std::vector<std::vector<size_t>> mesh_connected_components(const indexed_triangle_set &mesh);
 Result analyze(const indexed_triangle_set &mesh, const Setup &setup, const CancelPredicate &cancel = {});
 
 std::vector<InfillComparison> compare_infill_patterns(double solid_volume_m3, const Setup &setup, double reference_safety_factor);
@@ -242,6 +272,7 @@ std::string to_string(LoadType type);
 std::string to_string(StrengthBasis basis);
 std::string to_string(InfillPattern pattern);
 std::string to_string(AnalysisStatus status);
+std::string to_string(RegionShape shape);
 
 } // namespace Slic3r::StrengthAnalysis
 

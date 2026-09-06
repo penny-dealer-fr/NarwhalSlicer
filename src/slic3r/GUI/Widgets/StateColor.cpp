@@ -45,6 +45,11 @@ static std::map<wxColour, wxColour> gDarkColors{
     {"#D9D9D9", "#27272A"}, // rgb(217, 217, 217)  Sidebar > Toggle button track color
     {"#FFFEFE", "#D9D9D9"}, // rgb(255, 254, 254)  Sidebar > Toggle button thumb color
     {"#EBF9F0", "#293F34"},
+    // Strength pre-check: muted pass / issue tints with readable text in both themes.
+    {"#E0F4E5", "#293F35"},
+    {"#216837", "#A2DBB1"},
+    {"#FFECCF", "#433120"},
+    {"#8B4B0F", "#F6C284"},
     //{"#F0F0F0", "#4C4C54"},
     // ORCA
     {"#BFE1DE", "#223C3C"}, // rgb(191, 225, 222)  Dropdown checked item background color > ORCA color with %25 opacity

@@ -5,12 +5,15 @@
 #include "libslic3r/Format/3mf.hpp"
 #include "libslic3r/Format/bbs_3mf.hpp"
 #include "libslic3r/Model.hpp"
+#include "libslic3r/TriangleMeshSlicer.hpp"
+#include "libslic3r/ClipperUtils.hpp"
 
 #include "test_utils.hpp"
 
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <limits>
 
 using namespace Slic3r;
 using namespace Slic3r::StrengthAnalysis;
@@ -42,6 +45,54 @@ Setup cube_setup(const indexed_triangle_set &mesh)
     force.magnitude_n = 100.0;
     setup.loads.push_back(force);
     return setup;
+}
+
+Result synthetic_result(const indexed_triangle_set &mesh, size_t hotspot = 0)
+{
+    Result result;
+    result.status = AnalysisStatus::Success;
+    result.message = "Synthetic solved field";
+    result.vertices.resize(mesh.vertices.size());
+    hotspot = std::min(hotspot, mesh.vertices.empty() ? size_t(0) : mesh.vertices.size() - 1);
+    for (size_t vertex = 0; vertex < mesh.vertices.size(); ++vertex) {
+        VertexResult &value = result.vertices[vertex];
+        value.position_mm = mesh.vertices[vertex].cast<double>();
+        value.von_mises_pa = vertex == hotspot ? 2.0e6 : 1.0e6;
+        value.maximum_shear_pa = 0.5 * value.von_mises_pa;
+        value.safety_factor = vertex == hotspot ? 2.0 : 4.0;
+        value.displacement_m = Vec3d::Constant(vertex == hotspot ? 2.0e-4 : 1.0e-4);
+    }
+    result.maximum_stress_vertex = hotspot;
+    result.maximum_von_mises_pa = 2.0e6;
+    result.minimum_safety_factor_vertex = hotspot;
+    result.minimum_safety_factor = 2.0;
+    result.maximum_displacement_vertex = hotspot;
+    result.maximum_displacement_m = result.vertices.empty() ? 0.0 : result.vertices[hotspot].displacement_m.norm();
+    result.estimated_mass_kg = std::abs(its_volume(mesh)) * 1e-9 * 1240.0 * (0.18 + 0.82 * 0.20);
+    return result;
+}
+
+double sliced_dense_volume(const indexed_triangle_set &model, const DenseRegionPreview &preview,
+                           const DenseRegionPreviewProfile &profile)
+{
+    std::vector<float> zs;
+    std::vector<double> weights;
+    const auto &planes = profile.grid_planes_mm[2];
+    for (size_t i = 1; i < planes.size(); ++i) {
+        const double midpoint = 0.5 * (planes[i - 1] + planes[i]);
+        const double half_height = 0.5 * (planes[i] - planes[i - 1]);
+        for (double direction : {-1.0, 1.0}) {
+            zs.push_back(float(midpoint + direction * half_height / std::sqrt(3.0)));
+            weights.push_back(half_height);
+        }
+    }
+    const auto model_slices = slice_mesh_ex(model, zs);
+    const auto modifier_slices = slice_mesh_ex(preview.modifier_mesh, zs);
+    double volume = 0.0;
+    for (size_t i = 0; i < zs.size(); ++i)
+        for (const ExPolygon &polygon : intersection_ex(model_slices[i], modifier_slices[i]))
+            volume += polygon.area() * SCALING_FACTOR * SCALING_FACTOR * weights[i];
+    return volume;
 }
 
 } // namespace
@@ -197,6 +248,11 @@ TEST_CASE("Strength setup travels with its model object through 3MF", "[Strength
     const std::string encoded = serialize_setup_for_config(setup);
     REQUIRE(encoded.rfind("sa1:", 0) == 0);
     source_object->config.set_key_value("strength_analysis_setup", new ConfigOptionString(encoded));
+    ModelVolume *modifier = source_object->add_volume(
+        TriangleMesh(its_make_sphere(2.0, PI / 12.0)), ModelVolumeType::PARAMETER_MODIFIER);
+    modifier->config.set_key_value("strength_analysis_modifier", new ConfigOptionBool(true));
+    modifier->config.set_key_value("sparse_infill_density", new ConfigOptionPercent(65.0));
+    modifier->config.set_key_value("sparse_infill_pattern", new ConfigOptionEnum<Slic3r::InfillPattern>(ipGyroid));
 
     ScopedTemporaryFile file(".3mf");
     REQUIRE(store_3mf(file.string().c_str(), &source, nullptr, false));
@@ -216,6 +272,20 @@ TEST_CASE("Strength setup travels with its model object through 3MF", "[Strength
     CHECK(decoded.gravity.enabled);
     REQUIRE(decoded.loads.size() == 1);
     CHECK(decoded.loads.front().type == LoadType::Fixed);
+    const auto restored_modifier = std::find_if(restored.objects.front()->volumes.begin(), restored.objects.front()->volumes.end(),
+        [](const ModelVolume *volume) {
+            const auto *marker = dynamic_cast<const ConfigOptionBool *>(
+                volume->config.option("strength_analysis_modifier"));
+            return marker != nullptr && marker->value;
+        });
+    REQUIRE(restored_modifier != restored.objects.front()->volumes.end());
+    REQUIRE((*restored_modifier)->is_modifier());
+    const auto *density = (*restored_modifier)->config.get().option<ConfigOptionPercent>("sparse_infill_density");
+    const auto *pattern = (*restored_modifier)->config.get().option<ConfigOptionEnum<Slic3r::InfillPattern>>("sparse_infill_pattern");
+    REQUIRE(density != nullptr);
+    REQUIRE(pattern != nullptr);
+    CHECK_THAT(density->value, WithinAbs(65.0, 1e-8));
+    CHECK(pattern->value == ipGyroid);
 }
 
 TEST_CASE("Strength setup survives the Orca project 3MF path", "[StrengthAnalysis][3mf]")
@@ -230,6 +300,14 @@ TEST_CASE("Strength setup survives the Orca project 3MF path", "[StrengthAnalysi
     source_object->add_volume(TriangleMesh(its_make_cube(12.0, 8.0, 4.0)));
     source_object->add_instance();
     source_object->config.set_key_value("strength_analysis_setup", new ConfigOptionString(encoded));
+    const auto source_mesh = source_object->raw_mesh().its;
+    const auto source_result = synthetic_result(source_mesh);
+    const auto preview = preview_dense_region(source_mesh, setup, source_result, 0.25);
+    REQUIRE(preview.applicable());
+    auto *modifier = source_object->add_volume(TriangleMesh(preview.modifier_mesh), ModelVolumeType::PARAMETER_MODIFIER, false);
+    modifier->config.set_key_value("strength_analysis_modifier", new ConfigOptionBool(true));
+    modifier->config.set_key_value("sparse_infill_density", new ConfigOptionPercent(65.0));
+    modifier->config.set_key_value("sparse_infill_pattern", new ConfigOptionEnum<Slic3r::InfillPattern>(ipGyroid));
     ScopedTemporaryDir backup_dir("orca_strength");
     source.set_backup_path(backup_dir.string());
 
@@ -267,6 +345,21 @@ TEST_CASE("Strength setup survives the Orca project 3MF path", "[StrengthAnalysi
     REQUIRE(deserialize_setup_from_config(option->value, decoded));
     CHECK(decoded.material.key == "pc_generic");
     CHECK_THAT(decoded.criteria.minimum_safety_factor, WithinRel(2.25, 1e-12));
+    const auto restored_modifier = std::find_if(restored.objects.front()->volumes.begin(), restored.objects.front()->volumes.end(),
+        [](const ModelVolume *volume) { return volume->is_modifier(); });
+    REQUIRE(restored_modifier != restored.objects.front()->volumes.end());
+    const auto &modifier_config = (*restored_modifier)->config.get();
+    const auto *marker = modifier_config.option<ConfigOptionBool>("strength_analysis_modifier");
+    const auto *density = modifier_config.option<ConfigOptionPercent>("sparse_infill_density");
+    const auto *pattern = modifier_config.option<ConfigOptionEnum<Slic3r::InfillPattern>>("sparse_infill_pattern");
+    REQUIRE(marker != nullptr);
+    CHECK(marker->value);
+    REQUIRE(density != nullptr);
+    REQUIRE(pattern != nullptr);
+    CHECK_THAT(density->value, WithinAbs(65.0, 1e-8));
+    CHECK(pattern->value == ipGyroid);
+    CHECK_THAT(std::abs(its_volume((*restored_modifier)->mesh().its)),
+               WithinRel(double(std::abs(its_volume(preview.modifier_mesh))), 1e-6));
 
     release_PlateData_list(restored_plates);
     delete plate;
@@ -436,6 +529,405 @@ TEST_CASE("Dense recommendations respect full preserve-region overlap", "[Streng
     const Result preserved = analyze(mesh, setup);
     REQUIRE(preserved.succeeded());
     CHECK_FALSE(preserved.dense_region.available);
+}
+
+TEST_CASE("Dense-region preview maps volume endpoints to baseline and fully dense estimates", "[StrengthAnalysis]")
+{
+    const indexed_triangle_set mesh = its_make_cube(20.0, 20.0, 20.0);
+    const Setup setup = cube_setup(mesh);
+    const Result result = analyze(mesh, setup);
+    REQUIRE(result.succeeded());
+    const DenseRegionPreviewProfile profile = build_dense_region_preview_profile(mesh, result);
+    REQUIRE(profile.available);
+
+    const DenseRegionPreview zero = preview_dense_region(mesh, setup, result, 0.0, &profile);
+    REQUIRE(zero.available);
+    CHECK_FALSE(zero.applicable());
+    CHECK(zero.affected_vertices.empty());
+    CHECK_THAT(zero.estimated_volume_fraction, WithinAbs(0.0, 1e-12));
+    CHECK_THAT(zero.estimated_total_mass_kg, WithinRel(result.estimated_mass_kg, 1e-12));
+    CHECK_THAT(zero.predicted_minimum_safety_factor, WithinRel(result.minimum_safety_factor, 1e-12));
+
+    const DenseRegionPreview full = preview_dense_region(mesh, setup, result, 1.0, &profile);
+    REQUIRE(full.applicable());
+    CHECK(full.affected_vertices.size() == mesh.vertices.size());
+    CHECK_THAT(full.estimated_volume_fraction, WithinRel(1.0, 1e-12));
+    CHECK(full.estimated_total_mass_kg >= result.estimated_mass_kg);
+    CHECK(full.predicted_minimum_safety_factor >= result.minimum_safety_factor);
+    CHECK(full.predicted_maximum_displacement_mm <= result.maximum_displacement_m * 1000.0 + 1e-12);
+
+    const DenseRegionPreview below = preview_dense_region(mesh, setup, result, -5.0, &profile);
+    const DenseRegionPreview above = preview_dense_region(mesh, setup, result, 5.0, &profile);
+    CHECK_THAT(below.target_volume_fraction, WithinAbs(0.0, 1e-12));
+    CHECK_THAT(above.target_volume_fraction, WithinRel(1.0, 1e-12));
+    CHECK_THAT(above.estimated_total_mass_kg, WithinRel(full.estimated_total_mass_kg, 1e-12));
+}
+
+TEST_CASE("Dense-region preview grows monotonically from the solved stress hotspot", "[StrengthAnalysis]")
+{
+    const indexed_triangle_set mesh = its_make_cube(20.0, 20.0, 20.0);
+    const Setup setup = cube_setup(mesh);
+    const Result result = analyze(mesh, setup);
+    REQUIRE(result.succeeded());
+    const DenseRegionPreviewProfile profile = build_dense_region_preview_profile(mesh, result);
+    REQUIRE(profile.available);
+
+    double previous_radius = 0.0;
+    double previous_volume = 0.0;
+    double previous_mass = result.estimated_mass_kg;
+    double previous_safety_factor = result.minimum_safety_factor;
+    for (double target : {0.01, 0.10, 0.25, 0.50, 0.75, 1.0}) {
+        const DenseRegionPreview first = preview_dense_region(mesh, setup, result, target, &profile);
+        const DenseRegionPreview second = preview_dense_region(mesh, setup, result, target, &profile);
+        REQUIRE(first.available);
+        CHECK(first.region.radius_mm + 1e-12 >= previous_radius);
+        CHECK(first.estimated_volume_fraction + 1e-12 >= previous_volume);
+        CHECK(first.estimated_total_mass_kg + 1e-12 >= previous_mass);
+        CHECK(first.predicted_minimum_safety_factor + 1e-12 >= previous_safety_factor);
+        CHECK_THAT(first.region.radius_mm, WithinAbs(second.region.radius_mm, 1e-12));
+        CHECK_THAT(first.estimated_volume_fraction, WithinAbs(second.estimated_volume_fraction, 1e-12));
+        CHECK(first.affected_vertices == second.affected_vertices);
+        CHECK(std::binary_search(first.affected_vertices.begin(), first.affected_vertices.end(), result.maximum_stress_vertex));
+        previous_radius = first.region.radius_mm;
+        previous_volume = first.estimated_volume_fraction;
+        previous_mass = first.estimated_total_mass_kg;
+        previous_safety_factor = first.predicted_minimum_safety_factor;
+    }
+}
+
+TEST_CASE("Dense-region profile integrates disconnected solids without filling the gap", "[StrengthAnalysis]")
+{
+    indexed_triangle_set mesh = its_make_cube(10.0, 10.0, 10.0);
+    indexed_triangle_set second = its_make_cube(10.0, 10.0, 10.0);
+    its_transform(second, identity3f().translate(Vec3f(40.0f, 0.0f, 0.0f)));
+    its_merge(mesh, second);
+    const Result result = synthetic_result(mesh, 0);
+
+    const DenseRegionPreviewProfile profile = build_dense_region_preview_profile(mesh, result);
+    REQUIRE(profile.available);
+    CHECK_THAT(profile.solid_volume_m3, WithinRel(2.0e-6, 1e-6));
+    CHECK_THAT(profile.sampled_volume_mm3, WithinRel(2000.0, 1e-6));
+
+    const Setup setup;
+    const DenseRegionPreview half = preview_dense_region(mesh, setup, result, 0.5, &profile);
+    REQUIRE(half.available);
+    CHECK_THAT(half.estimated_volume_fraction, WithinAbs(0.5, 0.02));
+    CHECK(half.region.radius_mm < 30.0);
+}
+
+TEST_CASE("Dense-region preview withholds response predictions when self-weight changes", "[StrengthAnalysis]")
+{
+    const indexed_triangle_set mesh = its_make_cube(20.0, 20.0, 20.0);
+    Setup setup = cube_setup(mesh);
+    const Result result = analyze(mesh, setup);
+    REQUIRE(result.succeeded());
+    const DenseRegionPreviewProfile profile = build_dense_region_preview_profile(mesh, result);
+    REQUIRE(profile.available);
+
+    const DenseRegionPreview without_gravity = preview_dense_region(mesh, setup, result, 0.5, &profile);
+    REQUIRE(without_gravity.applicable());
+    REQUIRE(without_gravity.estimated_added_mass_kg > 0.0);
+    Setup with_gravity = setup;
+    with_gravity.gravity.enabled = true;
+    const DenseRegionPreview gravity = preview_dense_region(mesh, with_gravity, result, 0.5, &profile);
+    REQUIRE(gravity.applicable());
+    CHECK(gravity.estimated_total_mass_kg > result.estimated_mass_kg);
+    CHECK_FALSE(gravity.response_estimate_available);
+    CHECK(std::isnan(gravity.predicted_minimum_safety_factor));
+    CHECK(std::isnan(gravity.predicted_maximum_displacement_mm));
+    const auto baseline_preview = preview_dense_region(mesh, with_gravity, result, 0.0, &profile);
+    CHECK(baseline_preview.response_estimate_available);
+    CHECK(gravity.warning.find("self-weight") != std::string::npos);
+}
+
+TEST_CASE("Dense-region preview fails closed and never crosses a preserve region", "[StrengthAnalysis]")
+{
+    const indexed_triangle_set mesh = its_make_cube(20.0, 20.0, 20.0);
+    Setup setup = cube_setup(mesh);
+    const Result baseline = analyze(mesh, setup);
+    REQUIRE(baseline.succeeded());
+    const DenseRegionPreviewProfile profile = build_dense_region_preview_profile(mesh, baseline);
+    REQUIRE(profile.available);
+
+    const Vec3d hotspot = baseline.vertices[baseline.maximum_stress_vertex].position_mm;
+    SphericalRegion nearby_preserve;
+    nearby_preserve.center_mm = bounding_box(mesh).center().cast<double>();
+    nearby_preserve.radius_mm = 5.0;
+    Setup limited_setup = setup;
+    limited_setup.preserve_regions.push_back(nearby_preserve);
+    const DenseRegionPreview limited = preview_dense_region(mesh, limited_setup, baseline, 1.0, &profile);
+    REQUIRE(limited.available);
+    CHECK_FALSE(limited.overlaps_preserve);
+    for (const Vec3f &vertex : limited.modifier_mesh.vertices)
+        CHECK_FALSE(nearby_preserve.contains(vertex.cast<double>()));
+    CHECK(limited.estimated_volume_fraction < 1.0);
+    CHECK_FALSE(limited.warning.empty());
+
+    SphericalRegion preserve;
+    preserve.center_mm = hotspot;
+    preserve.radius_mm = 2.0;
+    preserve.whole_model = true;
+    setup.preserve_regions.push_back(preserve);
+    const DenseRegionPreview blocked = preview_dense_region(mesh, setup, baseline, 0.5, &profile);
+    REQUIRE(blocked.available);
+    CHECK_FALSE(blocked.applicable());
+    CHECK(blocked.affected_vertices.empty());
+    CHECK_FALSE(blocked.warning.empty());
+
+    Result mismatched = baseline;
+    mismatched.vertices.pop_back();
+    const DenseRegionPreview invalid = preview_dense_region(mesh, setup, mismatched, 0.5, &profile);
+    CHECK_FALSE(invalid.available);
+    CHECK_FALSE(invalid.warning.empty());
+
+    const DenseRegionPreview non_finite = preview_dense_region(
+        mesh, setup, baseline, std::numeric_limits<double>::quiet_NaN(), &profile);
+    CHECK_FALSE(non_finite.available);
+    CHECK_FALSE(non_finite.warning.empty());
+}
+
+TEST_CASE("Dense-region mesh excludes box cylinder and selected-face preserve regions", "[StrengthAnalysis]")
+{
+    const indexed_triangle_set mesh = its_make_cube(20.0, 20.0, 20.0);
+    const Setup base_setup = cube_setup(mesh);
+    const Result result = analyze(mesh, base_setup);
+    REQUIRE(result.succeeded());
+    const DenseRegionPreviewProfile profile = build_dense_region_preview_profile(mesh, result);
+    REQUIRE(profile.available);
+    const Vec3d hotspot = profile.hotspot_center_mm;
+
+    SphericalRegion box;
+    box.shape = RegionShape::Box;
+    box.center_mm = bounding_box(mesh).center().cast<double>();
+    box.size_mm = Vec3d(10.0, 2.0, 2.0);
+    Setup box_setup = base_setup;
+    box_setup.preserve_regions.push_back(box);
+    const DenseRegionPreview box_limited = preview_dense_region(mesh, box_setup, result, 1.0, &profile);
+    REQUIRE(box_limited.available);
+    CHECK(box_limited.estimated_volume_fraction < 1.0);
+    for (const Vec3f &vertex : box_limited.modifier_mesh.vertices)
+        CHECK_FALSE(box.contains(vertex.cast<double>()));
+
+    SphericalRegion cylinder;
+    cylinder.shape = RegionShape::Cylinder;
+    cylinder.center_mm = bounding_box(mesh).center().cast<double>();
+    cylinder.axis = Vec3d(1.0, 1.0, 1.0).normalized();
+    cylinder.radius_mm = 5.0;
+    cylinder.size_mm.z() = 4.0;
+    Setup cylinder_setup = base_setup;
+    cylinder_setup.preserve_regions.push_back(cylinder);
+    const DenseRegionPreview cylinder_limited = preview_dense_region(mesh, cylinder_setup, result, 1.0, &profile);
+    REQUIRE(cylinder_limited.available);
+    CHECK(cylinder_limited.estimated_volume_fraction < 1.0);
+    for (const Vec3f &vertex : cylinder_limited.modifier_mesh.vertices)
+        CHECK_FALSE(cylinder.contains(vertex.cast<double>()));
+
+    const auto patches = group_coplanar_surfaces(mesh);
+    const auto opposite = std::max_element(patches.begin(), patches.end(), [&hotspot](const SurfacePatch &lhs,
+                                                                                     const SurfacePatch &rhs) {
+        return (lhs.centroid_mm - hotspot).norm() < (rhs.centroid_mm - hotspot).norm();
+    });
+    REQUIRE(opposite != patches.end());
+    SphericalRegion surface;
+    surface.shape = RegionShape::Surface;
+    surface.surface_triangles = opposite->triangles;
+    Setup surface_setup = base_setup;
+    surface_setup.preserve_regions.push_back(surface);
+    const DenseRegionPreview surface_limited = preview_dense_region(mesh, surface_setup, result, 1.0, &profile);
+    REQUIRE(surface_limited.available);
+    CHECK(surface_limited.estimated_volume_fraction < 1.0);
+    for (const Vec3f &vertex : surface_limited.modifier_mesh.vertices)
+        CHECK(std::abs((vertex.cast<double>() - opposite->centroid_mm).dot(opposite->normal)) > 1e-5);
+}
+
+TEST_CASE("Reinforcement selects separate high-stress bodies before a low-stress body", "[StrengthAnalysis]")
+{
+    indexed_triangle_set mesh;
+    for (float x : {0.0f, 15.0f, 30.0f}) {
+        auto body = its_make_cube(5.0, 5.0, 5.0);
+        its_transform(body, identity3f().translate(Vec3f(x, 0.0f, 0.0f)));
+        its_merge(mesh, body);
+    }
+    Result result = synthetic_result(mesh);
+    for (auto &vertex : result.vertices)
+        vertex.von_mises_pa = vertex.position_mm.x() < 10.0 ? 100e6 : vertex.position_mm.x() > 25.0 ? 80e6 : 1e6;
+    const auto profile = build_dense_region_preview_profile(mesh, result);
+    INFO(profile.warning);
+    REQUIRE(profile.available);
+    const auto preview = preview_dense_region(mesh, Setup{}, result, 0.5, &profile);
+    REQUIRE(preview.applicable());
+    REQUIRE_FALSE(preview.modifier_mesh.empty());
+    bool left = false, right = false;
+    for (const Vec3f &vertex : preview.modifier_mesh.vertices) {
+        left = left || vertex.x() <= 5.0f;
+        right = right || vertex.x() >= 30.0f;
+        const bool in_low_stress_body = vertex.x() > 10.0f && vertex.x() < 25.0f;
+        CHECK_FALSE(in_low_stress_body);
+    }
+    CHECK(left);
+    CHECK(right);
+    CHECK(preview.equivalent_stress_threshold > 0.79);
+    CHECK_THAT(preview.estimated_volume_fraction, WithinAbs(0.5, 0.002));
+    CHECK_THAT(sliced_dense_volume(mesh, preview, profile), WithinRel(preview.estimated_volume_m3 * 1e9, 1e-5));
+}
+
+TEST_CASE("Stress threshold maps to eligible model volume after preserving features", "[StrengthAnalysis]")
+{
+    indexed_triangle_set mesh;
+    for (float x : {0.0f, 15.0f, 30.0f}) {
+        auto body = its_make_cube(5.0, 5.0, 5.0);
+        its_transform(body, identity3f().translate(Vec3f(x, 0.0f, 0.0f)));
+        its_merge(mesh, body);
+    }
+    Result result = synthetic_result(mesh);
+    for (auto &vertex : result.vertices)
+        vertex.von_mises_pa = vertex.position_mm.x() < 10.0 ? 100e6 : vertex.position_mm.x() > 25.0 ? 80e6 : 1e6;
+    const auto profile = build_dense_region_preview_profile(mesh, result);
+    REQUIRE(profile.available);
+    Setup setup;
+    const auto threshold = preview_dense_region(mesh, setup, result, 1.0, &profile, true, 0.7);
+    REQUIRE(threshold.applicable());
+    CHECK_THAT(threshold.estimated_volume_fraction, WithinAbs(2.0 / 3.0, 1e-6));
+    CHECK(threshold.equivalent_stress_threshold >= 0.7);
+    CHECK_THAT(sliced_dense_volume(mesh, threshold, profile), WithinRel(threshold.estimated_volume_m3 * 1e9, 1e-5));
+
+    SphericalRegion preserve;
+    preserve.shape = RegionShape::Box;
+    preserve.center_mm = Vec3d(2.5, 2.5, 2.5);
+    preserve.size_mm = Vec3d::Constant(6.0);
+    setup.preserve_regions.push_back(preserve);
+    const auto limited = preview_dense_region(mesh, setup, result, 1.0, &profile, false, 0.7);
+    REQUIRE(limited.applicable());
+    CHECK(limited.modifier_mesh.empty());
+    CHECK_THAT(limited.estimated_volume_fraction, WithinAbs(1.0 / 3.0, 1e-6));
+    const auto sized = preview_dense_region(mesh, setup, result, limited.estimated_volume_fraction, &profile);
+    REQUIRE(sized.applicable());
+    CHECK_THAT(sized.estimated_volume_fraction, WithinAbs(limited.estimated_volume_fraction, 0.001));
+    CHECK_FALSE(preview_dense_region(mesh, setup, result, 1.0, &profile, false, -0.1).available);
+    CHECK_FALSE(preview_dense_region(mesh, setup, result, 1.0, &profile, false, 1.1).available);
+    CHECK_FALSE(preview_dense_region(mesh, setup, result, 1.0, &profile, false,
+                                    std::numeric_limits<double>::quiet_NaN()).available);
+}
+
+TEST_CASE("Interior-cell volumes retain sloped walls cavities and thin separated solids", "[StrengthAnalysis]")
+{
+    indexed_triangle_set mesh;
+    double expected = 0.0;
+    SECTION("Sloped triangular prism") {
+        mesh.vertices = {{0, 0, 0}, {100, 0, 0}, {0, 100, 0}, {0, 0, 1}, {100, 0, 1}, {0, 100, 1}};
+        mesh.indices = {{0, 2, 1}, {3, 4, 5}, {0, 1, 4}, {0, 4, 3}, {1, 2, 5}, {1, 5, 4}, {2, 0, 3}, {2, 3, 5}};
+        expected = 5000.0;
+    }
+    SECTION("Tetrahedron sloping through three grid axes") {
+        mesh.vertices = {{0, 0, 0}, {20, 0, 0}, {0, 20, 0}, {0, 0, 20}};
+        mesh.indices = {{0, 2, 1}, {0, 1, 3}, {0, 3, 2}, {1, 2, 3}};
+        expected = 8000.0 / 6.0;
+    }
+    SECTION("Hollow cube with an off-grid cavity") {
+        mesh = its_make_cube(20.0, 20.0, 20.0);
+        auto cavity = its_make_cube(10.0, 10.0, 10.0);
+        its_transform(cavity, identity3f().translate(Vec3f(3.7f, 4.3f, 5.1f)));
+        for (Vec3i32 &triangle : cavity.indices)
+            std::swap(triangle[0], triangle[1]);
+        its_merge(mesh, cavity);
+        expected = 7000.0;
+    }
+    SECTION("Thin plate below a distant solid") {
+        mesh = its_make_cube(10.0, 10.0, 0.2);
+        auto upper = its_make_cube(10.0, 10.0, 1.0);
+        its_transform(upper, identity3f().translate(Vec3f(0.0f, 0.0f, 99.0f)));
+        its_merge(mesh, upper);
+        expected = 120.0;
+    }
+    const auto result = synthetic_result(mesh);
+    const auto profile = build_dense_region_preview_profile(mesh, result);
+    INFO(profile.warning);
+    REQUIRE(profile.available);
+    CHECK_THAT(profile.sampled_volume_mm3, WithinRel(expected, 1e-6));
+    for (double fraction : {0.01, 0.15, 0.5, 1.0}) {
+        const auto preview = preview_dense_region(mesh, Setup{}, result, fraction, &profile);
+        REQUIRE(preview.applicable());
+        CHECK_THAT(preview.estimated_volume_fraction, WithinAbs(fraction, 0.02));
+        CHECK_THAT(sliced_dense_volume(mesh, preview, profile), WithinRel(preview.estimated_volume_m3 * 1e9, 1e-5));
+    }
+}
+
+TEST_CASE("Dense-region profiles reject changed geometry and stress and support cancellation", "[StrengthAnalysis]")
+{
+    auto mesh = its_make_cube(20.0, 20.0, 20.0);
+    auto result = synthetic_result(mesh);
+    const auto profile = build_dense_region_preview_profile(mesh, result);
+    REQUIRE(profile.available);
+    auto changed = result;
+    changed.vertices.back().von_mises_pa = 10e6;
+    CHECK_FALSE(preview_dense_region(mesh, Setup{}, changed, 0.5, &profile).available);
+    mesh.vertices.back().x() += 1.0f;
+    result.vertices.back().position_mm = mesh.vertices.back().cast<double>();
+    CHECK_FALSE(preview_dense_region(mesh, Setup{}, result, 0.5, &profile).available);
+    const auto cancelled = build_dense_region_preview_profile(mesh, result, [] { return true; });
+    CHECK_FALSE(cancelled.available);
+    CHECK(cancelled.warning.find("cancelled") != std::string::npos);
+    size_t checks = 0;
+    const auto interrupted = build_dense_region_preview_profile(mesh, result, [&] { return ++checks > 20; });
+    CHECK_FALSE(interrupted.available);
+    CHECK(interrupted.warning.find("cancelled") != std::string::npos);
+}
+
+TEST_CASE("Strength orientation alignment respects existing instance transforms", "[StrengthAnalysis]")
+{
+    Model model;
+    ModelObject *object = model.add_object();
+    object->add_volume(TriangleMesh(its_make_cube(10.0, 10.0, 10.0)));
+    const Vec3d layer_axis = Vec3d(1.0, 2.0, 3.0).normalized();
+    for (bool mirrored : {false, true}) {
+        INFO("Mirrored: " << mirrored);
+        ModelInstance *instance = object->add_instance();
+        instance->set_rotation(Vec3d(0.7, 0.4, 1.2));
+        instance->set_scaling_factor(Vec3d(1.5, 0.8, 2.0));
+        instance->set_mirror(Vec3d(mirrored ? -1.0 : 1.0, 1.0, 1.0));
+        instance->set_offset(Vec3d(42.0, 37.0, 20.0));
+        const Vec3d scaling = instance->get_scaling_factor();
+        const Vec3d offset = instance->get_offset();
+        // Use the same plane-normal alignment and native rotate operation as the GUI action.
+        for (int application = 0; application < 2; ++application) {
+            const Vec3d current_axis = instance->get_matrix().linear().inverse().transpose() * layer_axis;
+            Vec3d rotation_axis;
+            double angle = 0.0;
+            Matrix3d rotation;
+            Geometry::rotation_from_two_vectors(current_axis, Vec3d::UnitZ(), rotation_axis, angle, &rotation);
+            instance->rotate(rotation);
+            const Vec3d aligned = (instance->get_matrix().linear().inverse().transpose() * layer_axis).normalized();
+            CHECK_THAT((aligned - Vec3d::UnitZ()).norm(), WithinAbs(0.0, 1e-8));
+            CHECK_THAT((instance->get_scaling_factor() - scaling).norm(), WithinAbs(0.0, 1e-8));
+            CHECK_THAT((instance->get_offset() - offset).norm(), WithinAbs(0.0, 1e-8));
+            CHECK(instance->is_left_handed() == mirrored);
+        }
+    }
+}
+
+TEST_CASE("Dense-region settings cannot weaken or soften the background", "[StrengthAnalysis]")
+{
+    const indexed_triangle_set mesh = its_make_cube(20.0, 20.0, 20.0);
+    Setup weaker = cube_setup(mesh);
+    weaker.infill.background_pattern = StrengthAnalysis::InfillPattern::Gyroid;
+    weaker.infill.background_density = 0.65;
+    weaker.infill.dense_pattern = StrengthAnalysis::InfillPattern::Rectilinear;
+    weaker.infill.dense_density = 0.65;
+    const std::vector<std::string> errors = validate(mesh, weaker);
+    CHECK(std::any_of(errors.begin(), errors.end(), [](const std::string &error) {
+        return error.find("must not be weaker or less stiff") != std::string::npos;
+    }));
+    CHECK(analyze(mesh, weaker).status == AnalysisStatus::InvalidInput);
+
+    Setup stronger = cube_setup(mesh);
+    stronger.infill.background_pattern = StrengthAnalysis::InfillPattern::Rectilinear;
+    stronger.infill.background_density = 0.65;
+    stronger.infill.dense_pattern = StrengthAnalysis::InfillPattern::Gyroid;
+    stronger.infill.dense_density = 0.65;
+    const std::vector<std::string> stronger_errors = validate(mesh, stronger);
+    CHECK(std::none_of(stronger_errors.begin(), stronger_errors.end(), [](const std::string &error) {
+        return error.find("must not be weaker or less stiff") != std::string::npos;
+    }));
 }
 
 TEST_CASE("Invalid and cancelled analyses fail explicitly", "[StrengthAnalysis]")

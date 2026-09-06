@@ -2,6 +2,7 @@
 
 #include "I18N.hpp"
 #include "Plater.hpp"
+#include "Widgets/Button.hpp"
 
 #include "libslic3r/Geometry.hpp"
 #include "libslic3r/Model.hpp"
@@ -17,6 +18,7 @@
 #include <wx/msgdlg.h>
 #include <wx/settings.h>
 #include <wx/sizer.h>
+#include <wx/slider.h>
 #include <wx/statbox.h>
 #include <wx/stattext.h>
 #include <wx/textctrl.h>
@@ -38,6 +40,17 @@ namespace {
 
 namespace SA = StrengthAnalysis;
 
+constexpr const char *STRENGTH_MODIFIER_NAME = "Strength dense region";
+
+bool is_strength_dense_modifier(const ModelVolume *volume)
+{
+    if (volume == nullptr || !volume->is_modifier())
+        return false;
+    const auto *marker = dynamic_cast<const ConfigOptionBool *>(
+        volume->config.option("strength_analysis_modifier"));
+    return marker != nullptr && marker->value;
+}
+
 wxString number(double value)
 {
     return wxString::Format("%.8g", value);
@@ -45,7 +58,16 @@ wxString number(double value)
 
 bool read_number(wxTextCtrl *control, double &value)
 {
-    return control != nullptr && control->GetValue().ToDouble(&value) && std::isfinite(value);
+    if (control == nullptr)
+        return false;
+    // Keep exact stored values when the user has not changed their rounded display text.
+    if (std::isfinite(value) && control->GetValue() == number(value))
+        return true;
+    double parsed = 0.0;
+    if (!control->GetValue().ToDouble(&parsed) || !std::isfinite(parsed))
+        return false;
+    value = parsed;
+    return true;
 }
 
 wxTextCtrl *number_input(wxWindow *parent, double value, int width = 92)
@@ -94,11 +116,12 @@ Vec3d read_vector(wxTextCtrl *const controls[3], const Vec3d &fallback)
 bool read_vector_strict(wxTextCtrl *const controls[3], Vec3d &output)
 {
     bool valid = true;
+    Vec3d parsed = output;
     for (int axis = 0; axis < 3; ++axis) {
-        double value = 0.0;
-        valid = read_number(controls[axis], value) && valid;
-        output[axis] = value;
+        valid = read_number(controls[axis], parsed[axis]) && valid;
     }
+    if (valid)
+        output = parsed;
     return valid;
 }
 
@@ -310,7 +333,7 @@ private:
         m_rgb[pixel * 3] = colour.Red();
         m_rgb[pixel * 3 + 1] = colour.Green();
         m_rgb[pixel * 3 + 2] = colour.Blue();
-        m_alpha[pixel] = 255;
+        m_alpha[pixel] = colour.Alpha();
     }
 };
 
@@ -1401,16 +1424,23 @@ void StrengthLoadPanel::build_ui()
     auto *infill_dialog = new wxButton(this, wxID_ANY, _L("Print structure"));
     auto *criteria_dialog = new wxButton(this, wxID_ANY, _L("Optimization objectives"));
     auto *fit_view = new wxButton(this, wxID_ANY, _L("Fit"));
+    m_setup_undo = new wxButton(this, wxID_ANY, _L("Undo setup"));
+    m_setup_redo = new wxButton(this, wxID_ANY, _L("Redo setup"));
     auto *view = new wxChoice(this, wxID_ANY, wxDefaultPosition, wxDefaultSize,
                               {_L("Isometric"), _L("Front"), _L("Top"), _L("Right")});
     view->SetSelection(0);
-    m_precheck_button = new wxButton(this, wxID_ANY, _L("Pre-check"));
+    m_precheck_button = new Button(this, _L("Pre-check"));
+    m_precheck_button->SetStyle(ButtonStyle::Regular, ButtonType::Compact);
+    m_precheck_button->SetPaddingSize(FromDIP(wxSize(12, 5)));
+    set_precheck_state(0);
     m_run_button = new wxButton(this, wxID_ANY, _L("Solve"));
     m_cancel_button = new wxButton(this, wxID_ANY, _L("Cancel solve"));
     for (wxButton *button : {material_dialog, infill_dialog, criteria_dialog, fit_view})
         study_tools->Add(button, 0, wxRIGHT, gap);
     study_tools->Add(new wxStaticText(this, wxID_ANY, _L("View")), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, FromDIP(4));
     study_tools->Add(view, 0, wxRIGHT, gap);
+    study_tools->Add(m_setup_undo, 0, wxRIGHT, gap);
+    study_tools->Add(m_setup_redo, 0, wxRIGHT, gap);
     study_tools->AddStretchSpacer();
     study_tools->Add(m_precheck_button, 0, wxRIGHT, gap);
     study_tools->Add(m_run_button, 0, wxRIGHT, gap);
@@ -1426,6 +1456,9 @@ void StrengthLoadPanel::build_ui()
         [this](bool commit) {
             refresh_operation_panel();
             if (commit) {
+                // Dragging changes the model directly. Synchronize the secondary editor before
+                // a later pre-check can accidentally write its old coordinates back to the load.
+                load_current_load_editor(m_current_load);
                 persist_setup();
                 mark_stale();
                 refresh_load_list();
@@ -1470,8 +1503,10 @@ void StrengthLoadPanel::build_ui()
     auto *operation_buttons = new wxBoxSizer(wxHORIZONTAL);
     m_operation_apply = new wxButton(m_operation_panel, wxID_ANY, _L("Apply"));
     m_operation_popout = new wxButton(m_operation_panel, wxID_ANY, _L("Pop out…"));
+    m_operation_delete = new wxButton(m_operation_panel, wxID_ANY, _L("Delete"));
     operation_buttons->Add(m_operation_apply, 0, wxRIGHT, gap);
-    operation_buttons->Add(m_operation_popout, 0);
+    operation_buttons->Add(m_operation_popout, 0, wxRIGHT, gap);
+    operation_buttons->Add(m_operation_delete, 0);
     operation->Add(operation_buttons, 0, wxLEFT | wxRIGHT | wxBOTTOM, gap);
     m_operation_panel->SetSizer(operation);
     workspace_body->Add(m_operation_panel, 0, wxEXPAND | wxLEFT, gap);
@@ -1502,12 +1537,31 @@ void StrengthLoadPanel::build_ui()
     m_operation_popout->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) {
         select_canvas_item(m_selected_kind, m_selected_index, true);
     });
+    m_operation_delete->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { delete_selected_operation(); });
+    m_setup_undo->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) {
+        if (m_setup_history_index > 0)
+            restore_setup_history(m_setup_history_index - 1);
+    });
+    m_setup_redo->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) {
+        if (m_setup_history_index + 1 < m_setup_history.size())
+            restore_setup_history(m_setup_history_index + 1);
+    });
     fit_view->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { m_setup_canvas->fit_view(); });
     view->Bind(wxEVT_CHOICE, [this, view](wxCommandEvent &) { m_setup_canvas->set_view(view->GetSelection()); });
     m_study_tree->Bind(wxEVT_TREE_SEL_CHANGED, [this](wxTreeEvent &event) {
-        auto *data = dynamic_cast<StudyTreeItemData *>(m_study_tree->GetItemData(event.GetItem()));
+        if (m_refreshing_tree)
+            return;
+        auto *data = event.GetItem().IsOk() ?
+            dynamic_cast<StudyTreeItemData *>(m_study_tree->GetItemData(event.GetItem())) : nullptr;
         if (data != nullptr && data->kind >= 1 && data->kind <= 3)
             select_canvas_item(data->kind, data->index, false);
+        else {
+            m_selected_kind = 0;
+            m_selected_index = -1;
+            if (m_setup_canvas != nullptr)
+                m_setup_canvas->select_item(0, -1);
+            refresh_operation_panel();
+        }
     });
     m_study_tree->Bind(wxEVT_TREE_ITEM_ACTIVATED, [this](wxTreeEvent &event) {
         auto *data = dynamic_cast<StudyTreeItemData *>(m_study_tree->GetItemData(event.GetItem()));
@@ -1521,6 +1575,20 @@ void StrengthLoadPanel::build_ui()
             edit_infill_dialog();
         else if (data->kind == 6)
             edit_criteria_dialog();
+    });
+    m_study_tree->Bind(wxEVT_KEY_DOWN, [this](wxKeyEvent &event) {
+        if (event.GetKeyCode() != WXK_DELETE && event.GetKeyCode() != WXK_BACK) {
+            event.Skip();
+            return;
+        }
+        const wxTreeItemId selected = m_study_tree->GetSelection();
+        auto *data = selected.IsOk() ? dynamic_cast<StudyTreeItemData *>(m_study_tree->GetItemData(selected)) : nullptr;
+        if (data == nullptr || data->kind < 1 || data->kind > 3) {
+            event.Skip();
+            return;
+        }
+        select_canvas_item(data->kind, data->index, false);
+        delete_selected_operation();
     });
 
     auto *material = new wxStaticBoxSizer(wxVERTICAL, this, _L("Material and print direction"));
@@ -1657,10 +1725,11 @@ void StrengthLoadPanel::build_ui()
 
     auto *actions = new wxBoxSizer(wxHORIZONTAL);
     auto *save_button = new wxButton(this, wxID_ANY, _L("Save setup"));
-    m_dense_button = new wxButton(this, wxID_ANY, _L("Create dense modifier"));
+    m_dense_button = new wxButton(this, wxID_ANY, _L("Preview dense region"));
+    m_remove_dense_button = new wxButton(this, wxID_ANY, _L("Remove dense modifier"));
     m_orientation_button = new wxButton(this, wxID_ANY, _L("Apply best orientation"));
     m_settings_button = new wxButton(this, wxID_ANY, _L("Apply optimized settings"));
-    for (wxButton *button : {save_button, m_dense_button, m_orientation_button, m_settings_button})
+    for (wxButton *button : {save_button, m_dense_button, m_remove_dense_button, m_orientation_button, m_settings_button})
         actions->Add(button, 0, wxRIGHT, gap);
     root->Add(actions, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
     SetSizer(root);
@@ -1680,7 +1749,11 @@ void StrengthLoadPanel::build_ui()
     });
     m_load_list->Bind(wxEVT_LISTBOX, [this](wxCommandEvent &) {
         const int selected = m_load_list->GetSelection();
-        save_current_load_editor();
+        if (!save_current_load_editor()) {
+            m_load_list->SetSelection(m_current_load);
+            m_status_label->SetLabel(_L("Correct the invalid numeric load fields before selecting another operation."));
+            return;
+        }
         refresh_load_list();
         select_canvas_item(1, selected, false);
     });
@@ -1689,7 +1762,8 @@ void StrengthLoadPanel::build_ui()
         select_canvas_item(1, selected, true);
     });
     add_load->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) {
-        save_current_load_editor();
+        if (!collect_setup(true, false))
+            return;
         SA::Load load;
         load.name = "Load " + std::to_string(m_session->setup.loads.size() + 1);
         m_session->setup.loads.push_back(load);
@@ -1717,9 +1791,13 @@ void StrengthLoadPanel::build_ui()
     });
     add_preserve->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) {
         SA::SphericalRegion region;
-        region.center_mm = read_vector(m_preserve_center, Vec3d::Zero());
-        read_number(m_preserve_radius, region.radius_mm);
-        region.shape = SA::RegionShape::Box;
+        if (!read_vector_strict(m_preserve_center, region.center_mm) ||
+            !read_number(m_preserve_radius, region.radius_mm) || region.radius_mm <= 0.0) {
+            wxMessageBox(_L("Enter a finite preserve center and a radius greater than zero."),
+                         _L("Invalid preserve region"), wxOK | wxICON_WARNING, this);
+            return;
+        }
+        region.shape = SA::RegionShape::Sphere;
         m_session->setup.preserve_regions.push_back(region);
         populate_from_setup();
         select_canvas_item(2, int(m_session->setup.preserve_regions.size()) - 1, false);
@@ -1757,7 +1835,8 @@ void StrengthLoadPanel::build_ui()
     m_run_button->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { run_analysis(); });
     m_precheck_button->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { run_precheck(true); });
     m_cancel_button->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { cancel_analysis(); });
-    m_dense_button->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { create_dense_modifier(); });
+    m_dense_button->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { preview_dense_region(); });
+    m_remove_dense_button->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { remove_dense_modifier(); });
     m_orientation_button->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { apply_recommended_orientation(); });
     m_settings_button->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { apply_optimized_settings(); });
 
@@ -1784,12 +1863,28 @@ void StrengthLoadPanel::build_ui()
     }
     for (wxTextCtrl *field : m_objective_weights)
         stale_text_fields.push_back(field);
+    const auto edited_setup = [this](wxCommandEvent &) {
+        const uint64_t revision = m_session->revision;
+        collect_setup(false, false);
+        if (revision == m_session->revision)
+            mark_stale();
+    };
     for (wxTextCtrl *field : stale_text_fields)
-        field->Bind(wxEVT_TEXT, [this](wxCommandEvent &) { mark_stale(); });
+        field->Bind(wxEVT_TEXT, edited_setup);
     for (wxChoice *choice : {m_load_type, m_strength_basis, m_background_pattern, m_dense_pattern})
-        choice->Bind(wxEVT_CHOICE, [this](wxCommandEvent &) { mark_stale(); });
-    for (wxCheckBox *checkbox : {m_load_active, m_load_whole_model, m_gravity_enabled})
-        checkbox->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent &) { mark_stale(); });
+        choice->Bind(wxEVT_CHOICE, edited_setup);
+    for (wxCheckBox *checkbox : {m_load_active, m_load_whole_model})
+        checkbox->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent &) {
+            save_current_load_editor();
+            persist_setup();
+            mark_stale();
+        });
+    m_gravity_enabled->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent &) {
+        m_session->setup.gravity.enabled = m_gravity_enabled->GetValue();
+        persist_setup();
+        mark_stale();
+        refresh_operation_panel();
+    });
 
     m_cancel_button->Disable();
     m_dense_button->Disable();
@@ -1813,35 +1908,91 @@ void StrengthLoadPanel::load_selected_object()
         m_object_label->SetLabel(_L("Select one model object in Prepare."));
         m_run_button->Disable();
         m_precheck_button->Disable();
+        m_remove_dense_button->Disable();
+        m_dense_button->Disable();
+        m_orientation_button->Disable();
+        m_settings_button->Disable();
+        set_precheck_state(0);
         if (m_session->object_index != -1) {
             m_session->object_index = -1;
+            m_session->object_id = ObjectID();
             m_session->mesh = {};
+            m_session->result = {};
+            m_session->solved_mesh = {};
+            m_session->solved_setup = {};
+            m_session->dense_profile.reset();
+            m_session->persisted_setup.clear();
             m_session->stale = true;
             ++m_session->revision;
         }
+        m_setup_history.clear();
+        m_setup_history_index = 0;
+        m_selected_kind = 0;
+        m_selected_index = -1;
+        m_current_load = -1;
+        m_setup_canvas->select_item(0, -1);
+        refresh_study_tree();
+        refresh_operation_panel();
+        update_setup_history_buttons();
         return;
     }
 
     ModelObject *object = m_plater->model().objects[size_t(index)];
-    const bool new_object = index != m_session->object_index;
+    const bool new_object = object->id() != m_session->object_id;
     const indexed_triangle_set current_mesh = object->raw_mesh().its;
-    const bool changed_geometry = index == m_session->object_index && !meshes_equal(current_mesh, m_session->mesh);
-    if (index != m_session->object_index) {
-        m_session->object_index = index;
-        m_session->setup = SA::Setup{};
-        if (const auto *option = object->config.get().option<ConfigOptionString>("strength_analysis_setup")) {
-            std::string error;
-            if (!option->value.empty() && !SA::deserialize_setup_from_config(option->value, m_session->setup, &error))
-                m_status_label->SetLabel(wxString::Format(_L("Saved strength setup could not be read: %s"), wxString::FromUTF8(error)));
-        }
+    const bool changed_geometry = !new_object && !meshes_equal(current_mesh, m_session->mesh);
+    m_session->object_index = index;
+    m_session->mesh = current_mesh;
+    SA::Setup stored_setup;
+    bool stored_setup_readable = true;
+    if (const auto *option = object->config.get().option<ConfigOptionString>("strength_analysis_setup");
+        option != nullptr && !option->value.empty()) {
+        std::string error;
+        stored_setup_readable = SA::deserialize_setup_from_config(option->value, stored_setup, &error);
+        if (!stored_setup_readable)
+            m_status_label->SetLabel(wxString::Format(_L("Saved strength setup could not be read: %s"),
+                                                      wxString::FromUTF8(error)));
+    }
+    const std::string serialized_stored_setup = SA::serialize_setup(stored_setup);
+    const bool changed_persisted_setup = !new_object && stored_setup_readable &&
+        serialized_stored_setup != m_session->persisted_setup;
+    if (new_object) {
+        set_precheck_state(0);
+        m_session->object_id = object->id();
+        m_session->setup = stored_setup_readable ? stored_setup : SA::Setup{};
+        m_session->persisted_setup = stored_setup_readable ? serialized_stored_setup : std::string();
         m_session->result = SA::Result{};
         m_session->solved_mesh = {};
         m_session->solved_setup = SA::Setup{};
+        m_session->dense_profile.reset();
         m_session->stale = true;
         ++m_session->revision;
         m_current_load = -1;
+        m_selected_kind = 0;
+        m_selected_index = -1;
+        m_setup_canvas->select_item(0, -1);
         populate_from_setup();
-    } else if (changed_geometry) {
+        m_setup_history.assign(1, m_session->setup);
+        m_setup_history_index = 0;
+        update_setup_history_buttons();
+    } else if (changed_persisted_setup) {
+        set_precheck_state(0);
+        m_session->setup = stored_setup;
+        m_session->persisted_setup = serialized_stored_setup;
+        m_session->stale = true;
+        ++m_session->revision;
+        m_current_load = -1;
+        m_selected_kind = 0;
+        m_selected_index = -1;
+        m_setup_canvas->select_item(0, -1);
+        populate_from_setup();
+        m_setup_history.assign(1, m_session->setup);
+        m_setup_history_index = 0;
+        update_setup_history_buttons();
+        m_status_label->SetLabel(_L("Strength setup changed through the main Undo/Redo history; results require a new solve."));
+    }
+    if (changed_geometry) {
+        set_precheck_state(0);
         m_session->stale = true;
         ++m_session->revision;
         m_dense_button->Disable();
@@ -1849,11 +2000,16 @@ void StrengthLoadPanel::load_selected_object()
         m_settings_button->Disable();
         m_status_label->SetLabel(_L("Model geometry changed; run the analysis again."));
     }
-    m_session->mesh = current_mesh;
+    if (m_session->stale) {
+        m_dense_button->Disable();
+        m_orientation_button->Disable();
+        m_settings_button->Disable();
+    }
     m_object_label->SetLabel(wxString::Format(_L("Object: %s — %zu vertices, %zu triangles"),
         wxString::FromUTF8(object->name), current_mesh.vertices.size(), current_mesh.indices.size()));
-    m_run_button->Enable(!current_mesh.empty());
-    m_precheck_button->Enable(!current_mesh.empty());
+    m_run_button->Enable(!current_mesh.empty() && !m_analysis_running);
+    m_precheck_button->Enable(!current_mesh.empty() && !m_analysis_running);
+    m_remove_dense_button->Enable(std::any_of(object->volumes.begin(), object->volumes.end(), is_strength_dense_modifier));
     if (m_setup_canvas != nullptr) {
         if (new_object || changed_geometry)
             m_setup_canvas->rebuild_surface_groups();
@@ -1863,7 +2019,8 @@ void StrengthLoadPanel::load_selected_object()
             m_setup_canvas->Refresh();
     }
     refresh_study_tree();
-    refresh_operation_panel();
+    if (new_object || changed_persisted_setup || changed_geometry)
+        refresh_operation_panel();
 }
 
 void StrengthLoadPanel::populate_material_fields()
@@ -1908,7 +2065,8 @@ void StrengthLoadPanel::populate_from_setup()
     for (int index = 0; index < 4; ++index)
         m_objective_weights[index]->ChangeValue(number(weights[index]));
     refresh_load_list();
-    load_current_load_editor(setup.loads.empty() ? -1 : 0);
+    load_current_load_editor(setup.loads.empty() ? -1 :
+        (m_selected_kind == 1 && m_selected_index >= 0 && size_t(m_selected_index) < setup.loads.size() ? m_selected_index : 0));
     refresh_preserve_list();
     refresh_study_tree();
     if ((m_selected_kind == 1 && (m_selected_index < 0 || size_t(m_selected_index) >= setup.loads.size())) ||
@@ -1919,9 +2077,11 @@ void StrengthLoadPanel::populate_from_setup()
     refresh_operation_panel();
 }
 
-bool StrengthLoadPanel::collect_setup(bool show_errors)
+bool StrengthLoadPanel::collect_setup(bool show_errors, bool validate_setup)
 {
-    save_current_load_editor();
+    const SA::Setup previous = m_session->setup;
+    const std::string previous_setup = SA::serialize_setup(m_session->setup);
+    bool numeric = save_current_load_editor();
     SA::Setup &setup = m_session->setup;
     SA::Material &m = setup.material;
     const int selected_material = m_material_choice->GetSelection();
@@ -1929,27 +2089,22 @@ bool StrengthLoadPanel::collect_setup(bool show_errors)
         const SA::MaterialCalibration calibration = m.calibration;
         m = SA::builtin_materials()[size_t(selected_material)];
         m.calibration = calibration;
-    } else {
-        m.key = "custom";
-        m.name = "Custom material";
-        m.provenance = "User-entered material properties; verify against a filament datasheet and printed coupons.";
     }
-    std::array<double, 12> values{};
-    bool numeric = true;
-    for (size_t index = 0; index < values.size(); ++index)
-        numeric = read_number(m_material_fields[index], values[index]) && numeric;
-    m.density_kg_m3 = values[0];
-    m.elastic_modulus_xy_pa = values[1] * 1e9;
-    m.elastic_modulus_z_pa = values[2] * 1e9;
-    m.poisson_xy = values[3];
-    m.shear_modulus_xy_pa = values[4] * 1e9;
-    m.shear_modulus_xz_pa = values[5] * 1e9;
-    m.yield_strength_xy_pa = values[6] * 1e6;
-    m.yield_strength_z_pa = values[7] * 1e6;
-    m.ultimate_strength_xy_pa = values[8] * 1e6;
-    m.ultimate_strength_z_pa = values[9] * 1e6;
-    m.shear_strength_xy_pa = values[10] * 1e6;
-    m.shear_strength_xz_pa = values[11] * 1e6;
+    const std::array<double *, 12> properties{&m.density_kg_m3, &m.elastic_modulus_xy_pa, &m.elastic_modulus_z_pa,
+        &m.poisson_xy, &m.shear_modulus_xy_pa, &m.shear_modulus_xz_pa, &m.yield_strength_xy_pa, &m.yield_strength_z_pa,
+        &m.ultimate_strength_xy_pa, &m.ultimate_strength_z_pa, &m.shear_strength_xy_pa, &m.shear_strength_xz_pa};
+    const std::array<double, 12> units{1.0, 1e9, 1e9, 1.0, 1e9, 1e9, 1e6, 1e6, 1e6, 1e6, 1e6, 1e6};
+    for (size_t index = 0; index < properties.size(); ++index) {
+        // A pre-check must not round a measured value merely because its display has fewer
+        // significant digits. Preserve untouched properties and imported provenance exactly.
+        if (m_material_fields[index]->GetValue() == number(*properties[index] / units[index]))
+            continue;
+        double value = 0.0;
+        if (read_number(m_material_fields[index], value))
+            *properties[index] = value * units[index];
+        else
+            numeric = false;
+    }
     if (selected_material >= 0 && size_t(selected_material) < SA::builtin_materials().size()) {
         const SA::Material &builtin = SA::builtin_materials()[size_t(selected_material)];
         if (!material_properties_match(m, builtin)) {
@@ -1959,7 +2114,8 @@ bool StrengthLoadPanel::collect_setup(bool show_errors)
             m_material_choice->SetSelection(int(SA::builtin_materials().size()));
         }
     }
-    std::array<double, 5> scales{};
+    std::array<double, 5> scales{m.calibration.modulus_xy_scale, m.calibration.modulus_z_scale,
+        m.calibration.strength_xy_scale, m.calibration.strength_z_scale, m.calibration.shear_scale};
     for (size_t index = 0; index < scales.size(); ++index)
         numeric = read_number(m_calibration_fields[index], scales[index]) && numeric;
     m.calibration.modulus_xy_scale = scales[0];
@@ -1968,9 +2124,9 @@ bool StrengthLoadPanel::collect_setup(bool show_errors)
     m.calibration.strength_z_scale = scales[3];
     m.calibration.shear_scale = scales[4];
     m.calibration.source = m_calibration_source->GetValue().utf8_string();
-    setup.print_layer_axis = read_vector(m_layer_axis, setup.print_layer_axis);
+    numeric = read_vector_strict(m_layer_axis, setup.print_layer_axis) && numeric;
     setup.gravity.enabled = m_gravity_enabled->GetValue();
-    setup.gravity.acceleration_m_s2 = read_vector(m_gravity, setup.gravity.acceleration_m_s2);
+    numeric = read_vector_strict(m_gravity, setup.gravity.acceleration_m_s2) && numeric;
     setup.infill.background_pattern = SA::InfillPattern(std::max(0, m_background_pattern->GetSelection()));
     setup.infill.dense_pattern = SA::InfillPattern(std::max(0, m_dense_pattern->GetSelection()));
     double value = 0.0;
@@ -1984,8 +2140,9 @@ bool StrengthLoadPanel::collect_setup(bool show_errors)
     numeric = read_number(m_objective_weights[2], setup.criteria.support_weight) && numeric;
     numeric = read_number(m_objective_weights[3], setup.criteria.print_time_weight) && numeric;
 
-    const std::vector<std::string> errors = SA::validate(m_session->mesh, setup);
+    const std::vector<std::string> errors = validate_setup ? SA::validate(m_session->mesh, setup) : std::vector<std::string>();
     if (!numeric || !errors.empty()) {
+        m_session->setup = previous;
         if (show_errors) {
             wxString message = numeric ? wxString() : _L("One or more numeric fields are invalid.\n");
             for (const std::string &error : errors)
@@ -1994,7 +2151,8 @@ bool StrengthLoadPanel::collect_setup(bool show_errors)
         }
         return false;
     }
-    mark_stale();
+    if (SA::serialize_setup(setup) != previous_setup)
+        mark_stale();
     return true;
 }
 
@@ -2004,19 +2162,29 @@ void StrengthLoadPanel::persist_setup(bool take_snapshot)
     if (index < 0 || size_t(index) >= m_plater->model().objects.size())
         return;
     ModelObject *object = m_plater->model().objects[size_t(index)];
+    if (object->id() != m_session->object_id)
+        return;
     const std::string serialized = SA::serialize_setup_for_config(m_session->setup);
     if (const auto *existing = object->config.get().option<ConfigOptionString>("strength_analysis_setup")) {
-        if (existing->value == serialized)
+        if (existing->value == serialized) {
+            m_session->persisted_setup = SA::serialize_setup(m_session->setup);
             return;
+        }
     }
     if (take_snapshot)
         m_plater->take_snapshot("Save strength analysis setup");
     object->config.set_key_value("strength_analysis_setup", new ConfigOptionString(serialized));
+    m_session->persisted_setup = SA::serialize_setup(m_session->setup);
     m_plater->set_plater_dirty(true);
 }
 
 void StrengthLoadPanel::mark_stale()
 {
+    record_setup_history();
+    // Keep accepted study edits in the project, including dialog edits made before the first
+    // solve. Setup Undo/Redo owns the fine-grained history; avoid a main snapshot per keystroke.
+    persist_setup(false);
+    set_precheck_state(0);
     m_session->stale = true;
     ++m_session->revision;
     m_dense_button->Disable();
@@ -2031,6 +2199,97 @@ void StrengthLoadPanel::mark_stale()
     refresh_study_tree();
 }
 
+void StrengthLoadPanel::record_setup_history()
+{
+    if (m_restoring_history)
+        return;
+    if (m_setup_history.empty()) {
+        m_setup_history.push_back(m_session->setup);
+        m_setup_history_index = 0;
+        update_setup_history_buttons();
+        return;
+    }
+    if (SA::serialize_setup(m_setup_history[m_setup_history_index]) == SA::serialize_setup(m_session->setup)) {
+        update_setup_history_buttons();
+        return;
+    }
+    if (m_setup_history_index + 1 < m_setup_history.size())
+        m_setup_history.erase(m_setup_history.begin() + std::ptrdiff_t(m_setup_history_index + 1), m_setup_history.end());
+    m_setup_history.push_back(m_session->setup);
+    if (m_setup_history.size() > 100)
+        m_setup_history.erase(m_setup_history.begin());
+    m_setup_history_index = m_setup_history.size() - 1;
+    update_setup_history_buttons();
+}
+
+void StrengthLoadPanel::restore_setup_history(size_t index)
+{
+    const uint64_t revision = m_session->revision;
+    load_selected_object();
+    if (revision != m_session->revision)
+        return;
+    if (index >= m_setup_history.size() || index == m_setup_history_index)
+        return;
+    m_restoring_history = true;
+    m_setup_history_index = index;
+    m_session->setup = m_setup_history[index];
+    m_selected_kind = 0;
+    m_selected_index = -1;
+    m_current_load = -1;
+    m_setup_canvas->select_item(0, -1);
+    populate_from_setup();
+    persist_setup(false);
+    mark_stale();
+    m_restoring_history = false;
+    update_setup_history_buttons();
+    m_status_label->SetLabel(_L("Restored the selected setup history state. Solve again to refresh results."));
+}
+
+void StrengthLoadPanel::update_setup_history_buttons()
+{
+    if (m_setup_undo != nullptr)
+        m_setup_undo->Enable(!m_setup_history.empty() && m_setup_history_index > 0);
+    if (m_setup_redo != nullptr)
+        m_setup_redo->Enable(!m_setup_history.empty() && m_setup_history_index + 1 < m_setup_history.size());
+}
+
+void StrengthLoadPanel::delete_selected_operation()
+{
+    const uint64_t revision = m_session->revision;
+    load_selected_object();
+    if (revision != m_session->revision)
+        return;
+    // Keep pending valid edits in history before deleting a different operation.
+    if (!collect_setup(true, false))
+        return;
+    bool changed = false;
+    if (m_selected_kind == 1 && m_selected_index >= 0 &&
+        size_t(m_selected_index) < m_session->setup.loads.size()) {
+        m_session->setup.loads.erase(m_session->setup.loads.begin() + m_selected_index);
+        m_selected_index = std::min(m_selected_index, int(m_session->setup.loads.size()) - 1);
+        changed = true;
+    } else if (m_selected_kind == 2 && m_selected_index >= 0 &&
+               size_t(m_selected_index) < m_session->setup.preserve_regions.size()) {
+        m_session->setup.preserve_regions.erase(m_session->setup.preserve_regions.begin() + m_selected_index);
+        m_selected_index = std::min(m_selected_index, int(m_session->setup.preserve_regions.size()) - 1);
+        changed = true;
+    } else if (m_selected_kind == 3 && m_session->setup.gravity.enabled) {
+        m_session->setup.gravity.enabled = false;
+        changed = true;
+    }
+    if (!changed)
+        return;
+    if (m_selected_index < 0)
+        m_selected_kind = 0;
+    m_current_load = -1;
+    populate_from_setup();
+    if (m_setup_canvas != nullptr)
+        m_setup_canvas->select_item(m_selected_kind, m_selected_index);
+    persist_setup();
+    mark_stale();
+    m_status_label->SetLabel(_L("Deleted the selected setup operation. Use Undo setup to restore it."));
+}
+
 void StrengthLoadPanel::refresh_load_list()
 {
     m_load_list->Clear();
@@ -2039,22 +2298,25 @@ void StrengthLoadPanel::refresh_load_list()
             wxString::FromUTF8(SA::to_string(load.type)), load.active ? "" : " (disabled)"));
 }
 
-void StrengthLoadPanel::save_current_load_editor()
+bool StrengthLoadPanel::save_current_load_editor()
 {
     if (m_current_load < 0 || size_t(m_current_load) >= m_session->setup.loads.size())
-        return;
-    SA::Load &load = m_session->setup.loads[size_t(m_current_load)];
+        return true;
+    SA::Load load = m_session->setup.loads[size_t(m_current_load)];
     load.name = m_load_name->GetValue().utf8_string();
     load.type = SA::LoadType(std::max(0, m_load_type->GetSelection()));
     load.active = m_load_active->GetValue();
     load.region.whole_model = m_load_whole_model->GetValue() || load.type == SA::LoadType::GlobalForce;
-    load.region.center_mm = read_vector(m_load_center, load.region.center_mm);
-    read_number(m_load_radius, load.region.radius_mm);
-    load.direction = read_vector(m_load_direction, load.direction);
-    read_number(m_load_magnitude, load.magnitude_n);
-    read_number(m_load_impact, load.impact_factor);
-    read_number(m_load_safety_factor, load.target_safety_factor);
+    bool numeric = read_vector_strict(m_load_center, load.region.center_mm);
+    numeric = read_number(m_load_radius, load.region.radius_mm) && numeric;
+    numeric = read_vector_strict(m_load_direction, load.direction) && numeric;
+    numeric = read_number(m_load_magnitude, load.magnitude_n) && numeric;
+    numeric = read_number(m_load_impact, load.impact_factor) && numeric;
+    numeric = read_number(m_load_safety_factor, load.target_safety_factor) && numeric;
     load.strength_basis = SA::StrengthBasis(std::max(0, m_strength_basis->GetSelection()));
+    if (numeric)
+        m_session->setup.loads[size_t(m_current_load)] = std::move(load);
+    return numeric;
 }
 
 void StrengthLoadPanel::load_current_load_editor(int index)
@@ -2100,6 +2362,7 @@ void StrengthLoadPanel::refresh_study_tree()
 {
     if (m_study_tree == nullptr)
         return;
+    m_refreshing_tree = true;
     m_study_tree->Freeze();
     m_study_tree->DeleteAllItems();
     const wxTreeItemId root = m_study_tree->AddRoot("study-root");
@@ -2152,7 +2415,10 @@ void StrengthLoadPanel::refresh_study_tree()
     m_study_tree->AppendItem(study,
         wxString::Format(_L("Results — %s%s"), result_state, m_session->stale ? _L(" (stale)") : wxString()));
     m_study_tree->ExpandAll();
+    if (m_selected_kind >= 1 && m_selected_kind <= 3)
+        select_study_tree_item(m_selected_kind, m_selected_index);
     m_study_tree->Thaw();
+    m_refreshing_tree = false;
 }
 
 void StrengthLoadPanel::select_study_tree_item(int kind, int index)
@@ -2164,8 +2430,12 @@ void StrengthLoadPanel::select_study_tree_item(int kind, int index)
             return false;
         if (auto *data = dynamic_cast<StudyTreeItemData *>(m_study_tree->GetItemData(item));
             data != nullptr && data->kind == kind && data->index == index) {
-            if (m_study_tree->GetSelection() != item)
+            if (m_study_tree->GetSelection() != item) {
+                const bool refreshing = m_refreshing_tree;
+                m_refreshing_tree = true;
                 m_study_tree->SelectItem(item);
+                m_refreshing_tree = refreshing;
+            }
             m_study_tree->EnsureVisible(item);
             return true;
         }
@@ -2251,6 +2521,8 @@ void StrengthLoadPanel::refresh_operation_panel()
         region = &m_session->setup.preserve_regions[size_t(m_selected_index)];
         m_operation_title->SetLabel(wxString::Format(_L("Preserve region %d"), m_selected_index + 1));
         m_operation_name->ChangeValue(wxString::Format(_L("Preserve %d"), m_selected_index + 1));
+    } else if (m_selected_kind == 3) {
+        m_operation_title->SetLabel(_L("Gravity load"));
     } else {
         m_operation_title->SetLabel(_L("Operation details — nothing selected"));
     }
@@ -2261,6 +2533,8 @@ void StrengthLoadPanel::refresh_operation_panel()
     for (wxWindow *control : controls)
         if (control != m_operation_panel)
             control->Enable(enabled);
+    m_operation_delete->Enable(enabled || (m_selected_kind == 3 && m_session->setup.gravity.enabled));
+    m_operation_popout->Enable(enabled || m_selected_kind == 3);
     for (int axis = 0; axis < 3; ++axis) {
         m_operation_center[axis]->Enable(enabled);
         m_operation_size[axis]->Enable(enabled);
@@ -2339,6 +2613,8 @@ void StrengthLoadPanel::apply_operation_panel()
             load->magnitude_n = magnitude;
         }
     }
+    if (load != nullptr)
+        load_current_load_editor(m_selected_index);
     persist_setup();
     mark_stale();
     refresh_load_list();
@@ -2791,7 +3067,7 @@ void StrengthLoadPanel::edit_infill_dialog()
     const int gap = FromDIP(8);
     auto *root = new wxBoxSizer(wxVERTICAL);
     root->Add(new wxStaticText(&dialog, wxID_ANY,
-        _L("Define the baseline print structure and the stress threshold used to recommend a local dense modifier.")),
+        _L("Define the baseline print structure. In Simulation, use this stress threshold to size the stress-directed region, then refine its volume.")),
         0, wxEXPAND | wxALL, gap);
     auto *grid = new wxFlexGridSizer(2, gap, gap);
     grid->AddGrowableCol(1, 1);
@@ -2822,11 +3098,22 @@ void StrengthLoadPanel::edit_infill_dialog()
                          _L("Invalid print structure"), wxOK | wxICON_WARNING, &dialog);
             continue;
         }
-        m_session->setup.infill.background_pattern = SA::InfillPattern(std::max(0, background_pattern->GetSelection()));
-        m_session->setup.infill.dense_pattern = SA::InfillPattern(std::max(0, dense_pattern->GetSelection()));
-        m_session->setup.infill.background_density = background / 100.0;
-        m_session->setup.infill.dense_density = dense / 100.0;
-        m_session->setup.infill.dense_stress_threshold = stress / 100.0;
+        SA::Setup candidate = m_session->setup;
+        candidate.infill.background_pattern = SA::InfillPattern(std::max(0, background_pattern->GetSelection()));
+        candidate.infill.dense_pattern = SA::InfillPattern(std::max(0, dense_pattern->GetSelection()));
+        candidate.infill.background_density = background / 100.0;
+        candidate.infill.dense_density = dense / 100.0;
+        candidate.infill.dense_stress_threshold = stress / 100.0;
+        const std::vector<std::string> validation = SA::validate(m_session->mesh, candidate);
+        const auto weaker = std::find_if(validation.begin(), validation.end(), [](const std::string &message) {
+            return message.find("must not be weaker or less stiff") != std::string::npos;
+        });
+        if (weaker != validation.end()) {
+            wxMessageBox(wxString::FromUTF8(*weaker), _L("Invalid print structure"),
+                         wxOK | wxICON_WARNING, &dialog);
+            continue;
+        }
+        m_session->setup.infill = candidate.infill;
         populate_from_setup();
         mark_stale();
         return;
@@ -2889,6 +3176,10 @@ void StrengthLoadPanel::edit_criteria_dialog()
 
 void StrengthLoadPanel::select_canvas_item(int kind, int index, bool edit)
 {
+    if (!save_current_load_editor()) {
+        m_status_label->SetLabel(_L("Correct the invalid numeric load fields before selecting another operation."));
+        return;
+    }
     m_selected_kind = kind;
     m_selected_index = index;
     select_study_tree_item(kind, index);
@@ -2928,19 +3219,24 @@ void StrengthLoadPanel::select_canvas_item(int kind, int index, bool edit)
 bool StrengthLoadPanel::run_precheck(bool show_success)
 {
     load_selected_object();
-    if (m_session->mesh.empty())
+    if (m_session->mesh.empty()) {
+        set_precheck_state(-1);
         return false;
+    }
     if (!collect_setup(true)) {
+        set_precheck_state(-1);
         m_status_label->SetLabel(_L("Pre-check found setup issues. Correct the highlighted study inputs before solving."));
         refresh_study_tree();
         return false;
     }
     const std::vector<std::string> errors = SA::validate(m_session->mesh, m_session->setup);
     if (!errors.empty()) {
+        set_precheck_state(-1);
         m_status_label->SetLabel(wxString::Format(_L("Pre-check found %zu issue(s)."), errors.size()));
         refresh_study_tree();
         return false;
     }
+    set_precheck_state(1);
     m_status_label->SetLabel(_L("Pre-check READY — material, mesh, supports, loads, and objectives are valid."));
     refresh_study_tree();
     if (show_success)
@@ -2949,8 +3245,43 @@ bool StrengthLoadPanel::run_precheck(bool show_success)
     return true;
 }
 
+void StrengthLoadPanel::set_precheck_state(int state)
+{
+    if (m_precheck_button == nullptr)
+        return;
+    m_precheck_button->SetStyle(ButtonStyle::Regular, ButtonType::Compact);
+    if (state > 0) {
+        m_precheck_button->SetLabel(_L("Pre-check: READY"));
+        m_precheck_button->SetBackgroundColor(StateColor(
+            std::pair<wxColour, int>(wxColour(238, 238, 238), StateColor::Disabled),
+            std::pair<wxColour, int>(wxColour(224, 244, 229), StateColor::Normal)));
+        m_precheck_button->SetTextColor(StateColor(
+            std::pair<wxColour, int>(wxColour(144, 144, 144), StateColor::Disabled),
+            std::pair<wxColour, int>(wxColour(33, 104, 55), StateColor::Normal)));
+        m_precheck_button->SetBorderColor(StateColor(wxColour(33, 104, 55)));
+        m_precheck_button->SetToolTip(_L("Pre-check passed for the current setup."));
+    } else if (state < 0) {
+        m_precheck_button->SetLabel(_L("Pre-check: issues"));
+        m_precheck_button->SetBackgroundColor(StateColor(
+            std::pair<wxColour, int>(wxColour(238, 238, 238), StateColor::Disabled),
+            std::pair<wxColour, int>(wxColour(255, 236, 207), StateColor::Normal)));
+        m_precheck_button->SetTextColor(StateColor(
+            std::pair<wxColour, int>(wxColour(144, 144, 144), StateColor::Disabled),
+            std::pair<wxColour, int>(wxColour(139, 75, 15), StateColor::Normal)));
+        m_precheck_button->SetBorderColor(StateColor(wxColour(139, 75, 15)));
+        m_precheck_button->SetToolTip(_L("Pre-check found one or more setup issues."));
+    } else {
+        m_precheck_button->SetLabel(_L("Pre-check"));
+        m_precheck_button->SetToolTip(_L("Validate the mesh, material, constraints, loads, and objectives."));
+    }
+    m_precheck_button->Refresh();
+    Layout();
+}
+
 void StrengthLoadPanel::run_analysis()
 {
+    if (m_analysis_running)
+        return;
     load_selected_object();
     if (!run_precheck(false))
         return;
@@ -2961,15 +3292,27 @@ void StrengthLoadPanel::run_analysis()
     const indexed_triangle_set mesh = m_session->mesh;
     const uint64_t revision = m_session->revision;
     m_cancel = false;
+    m_analysis_running = true;
     m_run_button->Disable();
     m_precheck_button->Disable();
     m_cancel_button->Enable();
     m_status_label->SetLabel(_L("Running offline linear-static engineering estimate…"));
     m_worker = std::thread([this, setup, mesh, revision] {
         SA::Result result = SA::analyze(mesh, setup, [this] { return m_cancel.load(); });
+        std::shared_ptr<const SA::DenseRegionPreviewProfile> profile;
+        if (result.succeeded()) {
+            profile = std::make_shared<SA::DenseRegionPreviewProfile>(
+                SA::build_dense_region_preview_profile(mesh, result, [this] { return m_cancel.load(); }));
+            if (m_cancel.load()) {
+                result.status = SA::AnalysisStatus::Cancelled;
+                result.message = "Strength preview preparation was cancelled.";
+                profile.reset();
+            }
+        }
         {
             std::lock_guard<std::mutex> lock(m_pending_mutex);
             m_pending_result = std::move(result);
+            m_pending_profile = std::move(profile);
             m_pending_revision = revision;
         }
         wxQueueEvent(this, new wxThreadEvent(EVT_STRENGTH_ANALYSIS_FINISHED));
@@ -2986,21 +3329,29 @@ void StrengthLoadPanel::on_analysis_finished()
 {
     if (m_worker.joinable())
         m_worker.join();
+    m_analysis_running = false;
     SA::Result result;
+    std::shared_ptr<const SA::DenseRegionPreviewProfile> profile;
     uint64_t revision = 0;
     {
         std::lock_guard<std::mutex> lock(m_pending_mutex);
         result = std::move(m_pending_result);
+        profile = std::move(m_pending_profile);
         revision = m_pending_revision;
     }
     m_run_button->Enable();
     m_precheck_button->Enable();
     m_cancel_button->Disable();
+    load_selected_object();
     if (revision != m_session->revision) {
         m_status_label->SetLabel(_L("Analysis finished, but inputs changed while it was running; results were discarded."));
+        if (m_result_callback)
+            m_result_callback();
         return;
     }
     m_session->result = std::move(result);
+    m_session->dense_profile = std::move(profile);
+    ++m_session->solved_revision;
     m_session->stale = false;
     const SA::Result &stored = m_session->result;
     if (stored.succeeded()) {
@@ -3013,7 +3364,7 @@ void StrengthLoadPanel::on_analysis_finished()
     m_status_label->SetLabel(wxString::Format("%s — %s", wxString::FromUTF8(SA::to_string(stored.status)),
                                               wxString::FromUTF8(stored.message)));
     const bool ready = stored.succeeded();
-    m_dense_button->Enable(ready && stored.dense_region.available);
+    m_dense_button->Enable(ready);
     m_orientation_button->Enable(ready && !stored.orientation_recommendations.empty());
     m_settings_button->Enable(ready && !stored.print_settings_candidates.empty() &&
                               stored.print_settings_candidates.front().feasible);
@@ -3022,45 +3373,133 @@ void StrengthLoadPanel::on_analysis_finished()
         m_result_callback();
 }
 
-void StrengthLoadPanel::create_dense_modifier()
+void StrengthLoadPanel::preview_dense_region()
 {
-    if (m_session->stale || !m_session->result.succeeded() || !m_session->result.dense_region.available)
+    load_selected_object();
+    if (!m_session->stale && m_session->result.succeeded() && m_preview_callback)
+        m_preview_callback();
+}
+
+bool StrengthLoadPanel::create_dense_modifier_from_preview(const SA::DenseRegionPreview &preview)
+{
+    const ObjectID object_id = m_session->object_id;
+    const uint64_t revision = m_session->revision;
+    load_selected_object();
+    if (object_id != m_session->object_id || revision != m_session->revision ||
+        m_session->stale || !m_session->result.succeeded() || !preview.applicable() ||
+        !meshes_equal(m_session->mesh, m_session->solved_mesh) || preview.modifier_mesh.empty())
+        return false;
+    for (const Vec3f &vertex : preview.modifier_mesh.vertices)
+        if (!vertex.allFinite())
+            return false;
+    for (const Vec3i32 &triangle : preview.modifier_mesh.indices)
+        if (!valid_triangle(triangle, preview.modifier_mesh.vertices.size()))
+            return false;
+    const int index = m_session->object_index;
+    if (index < 0 || size_t(index) >= m_plater->model().objects.size())
+        return false;
+    const SA::InfillSettings &infill = m_session->solved_setup.infill;
+    m_plater->take_snapshot("Apply previewed strength dense-region modifier");
+    ModelObject *object = m_plater->model().objects[size_t(index)];
+    ModelVolume *volume = object->add_volume(TriangleMesh(preview.modifier_mesh), ModelVolumeType::PARAMETER_MODIFIER, false);
+    volume->name = STRENGTH_MODIFIER_NAME;
+    // The preview mesh uses the same object coordinates as ModelObject::raw_mesh().
+    // Keep them intact; auto-centering would require an additional offset transform.
+    volume->set_transformation(Geometry::Transformation());
+    volume->config.set_key_value("sparse_infill_density", new ConfigOptionPercent(infill.dense_density * 100.0));
+    volume->config.set_key_value("sparse_infill_pattern",
+        new ConfigOptionEnum<Slic3r::InfillPattern>(print_pattern(infill.dense_pattern)));
+    volume->config.set_key_value("strength_analysis_modifier", new ConfigOptionBool(true));
+    object->config.set_key_value("sparse_infill_density", new ConfigOptionPercent(infill.background_density * 100.0));
+    object->config.set_key_value("sparse_infill_pattern",
+        new ConfigOptionEnum<Slic3r::InfillPattern>(print_pattern(infill.background_pattern)));
+    // Add the replacement first: deleting down to one volume would collapse the part's
+    // transform into its instances and change the object coordinates used by this preview.
+    for (size_t volume_index = object->volumes.size(); volume_index-- > 0;) {
+        const ModelVolume *candidate = object->volumes[volume_index];
+        if (candidate != volume && is_strength_dense_modifier(candidate))
+            object->delete_volume(volume_index);
+    }
+    m_plater->changed_object(index);
+    m_plater->set_plater_dirty(true);
+    m_remove_dense_button->Enable();
+    m_status_label->SetLabel(wxString::Format(
+        _L("Applied a native dense-infill modifier at approximately %.3g%% of model volume: %.3g%% %s inside, %.3g%% %s background. "
+           "Other user modifiers can override these settings. Slice and validate the printed design separately."),
+        preview.estimated_volume_fraction * 100.0, infill.dense_density * 100.0,
+        wxString::FromUTF8(SA::to_string(infill.dense_pattern)), infill.background_density * 100.0,
+        wxString::FromUTF8(SA::to_string(infill.background_pattern))));
+    return true;
+}
+
+void StrengthLoadPanel::remove_dense_modifier()
+{
+    const ObjectID object_id = m_session->object_id;
+    load_selected_object();
+    if (object_id != m_session->object_id)
         return;
     const int index = m_session->object_index;
     if (index < 0 || size_t(index) >= m_plater->model().objects.size())
         return;
-    const SA::DenseRegionRecommendation &recommendation = m_session->result.dense_region;
-    m_plater->take_snapshot("Create strength dense-region modifier");
     ModelObject *object = m_plater->model().objects[size_t(index)];
-    TriangleMesh sphere(its_make_sphere(recommendation.region.radius_mm, PI / 18.0));
-    ModelVolume *volume = object->add_volume(std::move(sphere), ModelVolumeType::PARAMETER_MODIFIER);
-    volume->name = "Strength dense region";
-    volume->set_offset(recommendation.region.center_mm);
-    volume->config.set_key_value("sparse_infill_density", new ConfigOptionPercent(recommendation.recommended_density * 100.0));
-    volume->config.set_key_value("sparse_infill_pattern",
-        new ConfigOptionEnum<Slic3r::InfillPattern>(print_pattern(recommendation.recommended_pattern)));
+    std::vector<size_t> modifier_indices;
+    for (size_t volume = 0; volume < object->volumes.size(); ++volume) {
+        const ModelVolume *candidate = object->volumes[volume];
+        if (is_strength_dense_modifier(candidate))
+            modifier_indices.push_back(volume);
+    }
+    if (modifier_indices.empty())
+        return;
+    m_plater->take_snapshot("Remove strength dense-region modifier");
+    std::vector<std::pair<ModelVolume *, Geometry::Transformation>> remaining_transforms;
+    for (ModelVolume *volume : object->volumes)
+        if (!is_strength_dense_modifier(volume))
+            remaining_transforms.emplace_back(volume, volume->get_transformation());
+    std::vector<Geometry::Transformation> instance_transforms;
+    for (const ModelInstance *instance : object->instances)
+        instance_transforms.push_back(instance->get_transformation());
+    for (auto volume = modifier_indices.rbegin(); volume != modifier_indices.rend(); ++volume)
+        object->delete_volume(*volume);
+    // Removing down to a single part normalizes its transform into the instances. Restore the
+    // equivalent original frame so the saved loads and constraints do not jump on removal.
+    for (const auto &remaining : remaining_transforms)
+        remaining.first->set_transformation(remaining.second);
+    for (size_t instance = 0; instance < object->instances.size(); ++instance)
+        object->instances[instance]->set_transformation(instance_transforms[instance]);
+    object->invalidate_bounding_box();
     m_plater->changed_object(index);
     m_plater->set_plater_dirty(true);
-    m_dense_button->Disable();
-    m_status_label->SetLabel(_L("Created a native parameter modifier for the highest-stress region."));
+    load_selected_object();
+    mark_stale();
+    m_remove_dense_button->Disable();
+    m_status_label->SetLabel(_L("Removed the managed dense-infill modifier; loads and constraints keep their placement. "
+                               "Use the main Undo command to restore the modifier."));
 }
 
 void StrengthLoadPanel::apply_recommended_orientation()
 {
-    if (m_session->stale || m_session->result.orientation_recommendations.empty())
+    const ObjectID object_id = m_session->object_id;
+    const uint64_t revision = m_session->revision;
+    load_selected_object();
+    if (object_id != m_session->object_id || revision != m_session->revision ||
+        m_session->stale || m_session->result.orientation_recommendations.empty())
         return;
     const int index = m_session->object_index;
     if (index < 0 || size_t(index) >= m_plater->model().objects.size())
         return;
     const Vec3d layer_axis = m_session->result.orientation_recommendations.front().layer_axis;
-    Vec3d rotation_axis;
-    double angle = 0.0;
-    Matrix3d rotation;
-    Geometry::rotation_from_two_vectors(layer_axis, Vec3d::UnitZ(), rotation_axis, angle, &rotation);
     m_plater->take_snapshot("Apply strength-optimized orientation");
     ModelObject *object = m_plater->model().objects[size_t(index)];
-    for (ModelInstance *instance : object->instances)
+    for (ModelInstance *instance : object->instances) {
+        // A layer axis is a plane normal. Transform it with the inverse transpose before
+        // alignment, including any existing instance rotation, nonuniform scale, or mirror.
+        const Vec3d world_layer_axis = instance->get_matrix().linear().inverse().transpose() * layer_axis;
+        Vec3d rotation_axis;
+        double angle = 0.0;
+        Matrix3d rotation;
+        Geometry::rotation_from_two_vectors(world_layer_axis, Vec3d::UnitZ(), rotation_axis, angle, &rotation);
         instance->rotate(rotation);
+    }
     object->invalidate_bounding_box();
     m_session->setup.print_layer_axis = layer_axis;
     populate_from_setup();
@@ -3072,7 +3511,11 @@ void StrengthLoadPanel::apply_recommended_orientation()
 
 void StrengthLoadPanel::apply_optimized_settings()
 {
-    if (m_session->stale || m_session->result.print_settings_candidates.empty() ||
+    const ObjectID object_id = m_session->object_id;
+    const uint64_t revision = m_session->revision;
+    load_selected_object();
+    if (object_id != m_session->object_id || revision != m_session->revision ||
+        m_session->stale || m_session->result.print_settings_candidates.empty() ||
         !m_session->result.print_settings_candidates.front().feasible)
         return;
     const int index = m_session->object_index;
@@ -3113,6 +3556,12 @@ public:
     void set_show_setup(bool value) { m_show_setup = value; Refresh(); }
     void set_show_wireframe(bool value) { m_show_wireframe = value; Refresh(); }
     void set_banded(bool value) { m_banded = value; Refresh(); }
+    void set_dense_preview(const SA::DenseRegionPreview &preview, bool visible)
+    {
+        m_dense_preview = preview;
+        m_show_dense_preview = visible;
+        Refresh();
+    }
 
 protected:
     std::vector<Vec3d> scene_points() const override
@@ -3121,8 +3570,10 @@ protected:
         const indexed_triangle_set &mesh = display_mesh();
         if (m_session->result.succeeded() && m_session->result.vertices.size() == mesh.vertices.size()) {
             points.reserve(m_session->result.vertices.size());
-            for (const SA::VertexResult &vertex : m_session->result.vertices) {
-                const Vec3d offset = vertex.displacement_m * (1000.0 * m_deformation_scale);
+            for (size_t index = 0; index < m_session->result.vertices.size(); ++index) {
+                const SA::VertexResult &vertex = m_session->result.vertices[index];
+                const Vec3d offset = vertex.displacement_m *
+                    (1000.0 * m_deformation_scale * preview_load_multiplier() / preview_stiffness(index));
                 points.push_back(vertex.position_mm + (offset.allFinite() ? offset : Vec3d::Zero()));
             }
         } else {
@@ -3160,10 +3611,11 @@ protected:
         size_t minimum_vertex = 0, maximum_vertex = 0;
         for (size_t index = 0; index < result.vertices.size(); ++index) {
             const SA::VertexResult &vertex = result.vertices[index];
-            const Vec3d offset = vertex.displacement_m * (1000.0 * m_deformation_scale);
+            const Vec3d offset = vertex.displacement_m *
+                (1000.0 * m_deformation_scale * preview_load_multiplier() / preview_stiffness(index));
             deformed.push_back(vertex.position_mm + (offset.allFinite() ? offset : Vec3d::Zero()));
             m_projected.push_back(project(deformed.back(), camera));
-            const double value = scalar(vertex);
+            const double value = scalar(index);
             if (std::isfinite(value)) {
                 if (value < minimum) { minimum = value; minimum_vertex = index; }
                 if (value > maximum) { maximum = value; maximum_vertex = index; }
@@ -3194,7 +3646,7 @@ protected:
             bool finite = true;
             for (int corner = 0; corner < 3; ++corner) {
                 const size_t vertex = size_t(triangle[corner]);
-                values[corner] = scalar(result.vertices[vertex]);
+                values[corner] = scalar(vertex);
                 finite = std::isfinite(values[corner]) && finite;
             }
             result_bitmap.triangle(m_projected[size_t(triangle[0])], m_projected[size_t(triangle[1])],
@@ -3217,6 +3669,33 @@ protected:
             draw_reference_mesh(dc, camera, true);
         if (m_show_setup)
             draw_setup_glyphs(dc, camera);
+        if (m_show_dense_preview && m_dense_preview.available && !m_dense_preview.modifier_mesh.empty()) {
+            const wxColour colour = m_dense_preview.overlaps_preserve ? wxColour(207, 67, 67) : wxColour(118, 49, 190);
+            // X-ray the actual undeformed modifier mesh so interior reinforcement remains
+            // visible through the contour surface. Depth-test the mask against itself.
+            DepthBitmap mask(GetClientSize());
+            std::vector<ScreenVertex> projected_mask;
+            projected_mask.reserve(m_dense_preview.modifier_mesh.vertices.size());
+            for (const Vec3f &vertex : m_dense_preview.modifier_mesh.vertices)
+                projected_mask.push_back(project(vertex.cast<double>(), camera));
+            for (const Vec3i32 &triangle : m_dense_preview.modifier_mesh.indices) {
+                if (!valid_triangle(triangle, projected_mask.size()))
+                    continue;
+                const auto &vertices = m_dense_preview.modifier_mesh.vertices;
+                const Vec3d normal = (vertices[triangle[1]] - vertices[triangle[0]]).cast<double>().cross(
+                    (vertices[triangle[2]] - vertices[triangle[0]]).cast<double>());
+                const double shade = normal.squaredNorm() > 1e-18 ?
+                    0.6 + 0.4 * std::abs(normal.normalized().dot(camera.forward)) : 1.0;
+                const wxColour shaded(int(colour.Red() * shade), int(colour.Green() * shade), int(colour.Blue() * shade), 135);
+                mask.triangle(projected_mask[triangle[0]], projected_mask[triangle[1]], projected_mask[triangle[2]],
+                    [shaded](double, double, double) { return shaded; });
+            }
+            mask.draw(dc);
+            const ScreenVertex center = project(m_dense_preview.region.center_mm, camera);
+            dc.SetTextForeground(colour);
+            dc.DrawText(wxString::Format(_L("Stress-directed reinforcement %.1f%% (undeformed)"),
+                m_dense_preview.estimated_volume_fraction * 100.0), center.point + wxPoint(10, 8));
+        }
 
         draw_extreme_marker(dc, minimum_vertex, _L("MIN"),
                             m_mode == 0 ? wxColour(215, 52, 48) : wxColour(42, 92, 210));
@@ -3273,6 +3752,8 @@ private:
     bool m_show_setup{true};
     bool m_show_wireframe{true};
     bool m_banded{false};
+    bool m_show_dense_preview{true};
+    SA::DenseRegionPreview m_dense_preview;
     std::vector<ScreenVertex> m_projected;
 
     const indexed_triangle_set &display_mesh() const
@@ -3287,11 +3768,40 @@ private:
             m_session->solved_setup : m_session->setup;
     }
 
-    double scalar(const SA::VertexResult &vertex) const
+    bool previewed(size_t vertex) const
     {
+        return m_show_dense_preview && m_dense_preview.available && m_dense_preview.response_estimate_available &&
+            !m_dense_preview.overlaps_preserve &&
+            std::binary_search(m_dense_preview.affected_vertices.begin(), m_dense_preview.affected_vertices.end(), vertex);
+    }
+
+    double preview_strength(size_t vertex) const
+    {
+        return previewed(vertex) ? std::max(1e-12, m_dense_preview.local_strength_multiplier) : 1.0;
+    }
+
+    double preview_stiffness(size_t vertex) const
+    {
+        return previewed(vertex) ? std::max(1e-12, m_dense_preview.local_stiffness_multiplier) : 1.0;
+    }
+
+    double preview_load_multiplier() const
+    {
+        return m_show_dense_preview && m_dense_preview.available && m_dense_preview.response_estimate_available &&
+            m_session->solved_setup.gravity.enabled &&
+            m_session->result.estimated_mass_kg > 1e-12 ?
+            std::max(1.0, m_dense_preview.estimated_total_mass_kg / m_session->result.estimated_mass_kg) : 1.0;
+    }
+
+    double scalar(size_t index) const
+    {
+        const SA::VertexResult &vertex = m_session->result.vertices[index];
+        const double strength = preview_strength(index);
+        const double stiffness = preview_stiffness(index);
+        const double load = preview_load_multiplier();
         switch (m_mode) {
-        case 0: return std::isfinite(vertex.safety_factor) ? vertex.safety_factor : 10.0;
-        case 1: return vertex.displacement_m.norm() * 1000.0;
+        case 0: return std::isfinite(vertex.safety_factor) ? vertex.safety_factor * strength / load : 10.0;
+        case 1: return vertex.displacement_m.norm() * 1000.0 * load / stiffness;
         case 2: return vertex.von_mises_pa / 1e6;
         case 3: return vertex.maximum_shear_pa / 1e6;
         case 4: return vertex.normal_stress_pa.x() / 1e6;
@@ -3477,10 +3987,12 @@ private:
 };
 
 StrengthSimulationPanel::StrengthSimulationPanel(wxWindow *parent, std::shared_ptr<StrengthAnalysisSession> session,
-                                                 std::function<void()> synchronize_session)
+                                                 std::function<void()> synchronize_session,
+                                                 std::function<bool(const SA::DenseRegionPreview &)> apply_dense_preview)
     : wxScrolledWindow(parent, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxVSCROLL | wxHSCROLL | wxTAB_TRAVERSAL)
     , m_session(std::move(session))
     , m_synchronize_session(std::move(synchronize_session))
+    , m_apply_dense_preview(std::move(apply_dense_preview))
 {
     SetBackgroundColour(*wxWHITE);
     SetScrollRate(FromDIP(12), FromDIP(12));
@@ -3522,6 +4034,43 @@ StrengthSimulationPanel::StrengthSimulationPanel(wxWindow *parent, std::shared_p
         _L("Rainbow contours map the legend range; safety factor is reversed and signed stresses are centered on zero.")),
         0, wxALIGN_CENTER_VERTICAL);
     root->Add(display, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
+
+    auto *dense_preview = new wxStaticBoxSizer(wxVERTICAL, this, _L("Strengthened-region preview"));
+    auto *dense_row = new wxBoxSizer(wxHORIZONTAL);
+    m_show_dense_preview = new wxCheckBox(this, wxID_ANY, _L("Show predicted dense region"));
+    m_show_dense_preview->SetValue(true);
+    m_dense_volume_slider = new wxSlider(this, wxID_ANY, 15, 0, 100, wxDefaultPosition,
+                                         FromDIP(wxSize(300, -1)), wxSL_HORIZONTAL);
+    m_dense_volume_value = new wxStaticText(this, wxID_ANY, _L("15% of model volume"));
+    m_apply_dense_button = new wxButton(this, wxID_ANY, _L("Create slicer modifier"));
+    dense_row->Add(m_show_dense_preview, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
+    dense_row->Add(m_dense_volume_slider, 1, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
+    dense_row->Add(m_dense_volume_value, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
+    dense_row->Add(m_apply_dense_button, 0, wxALIGN_CENTER_VERTICAL);
+    dense_preview->Add(dense_row, 0, wxEXPAND | wxALL, gap);
+    auto *target_row = new wxBoxSizer(wxHORIZONTAL);
+    m_target_safety_factor = number_input(this, 2.0, 90);
+    m_size_to_safety_factor = new wxButton(this, wxID_ANY, _L("Size to target SF"));
+    m_use_stress_threshold = new wxButton(this, wxID_ANY, _L("Use setup stress threshold"));
+    target_row->Add(new wxStaticText(this, wxID_ANY, _L("Target estimated safety factor")),
+                    0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
+    target_row->Add(m_target_safety_factor, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
+    target_row->Add(m_size_to_safety_factor, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
+    target_row->Add(m_use_stress_threshold, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
+    target_row->Add(new wxStaticText(this, wxID_ANY, _L("Estimate fitting in 1% volume steps; validate the design separately.")),
+                    0, wxALIGN_CENTER_VERTICAL);
+    dense_preview->Add(target_row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
+    m_dense_preview_metrics = new wxStaticText(this, wxID_ANY,
+        _L("Solve a study to preview strengthened volume, mass, deformation, and safety factor."));
+    m_dense_preview_metrics->Wrap(FromDIP(920));
+    dense_preview->Add(m_dense_preview_metrics, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
+    auto *preview_notice = new wxStaticText(this, wxID_ANY,
+        _L("Predicted from the solved field for interactive sizing; local load paths are not re-solved. "
+           "The created parameter modifier changes the actual sliced infill and should be validated."));
+    preview_notice->Wrap(FromDIP(920));
+    dense_preview->Add(preview_notice, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
+    root->Add(dense_preview, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
+
     m_canvas = new ResultCanvas(this, m_session, [this](size_t vertex) { update_probe(vertex); });
     root->Add(m_canvas, 1, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
     m_probe = new wxStaticText(this, wxID_ANY, _L("Point probe: click near a mesh vertex."));
@@ -3541,6 +4090,27 @@ StrengthSimulationPanel::StrengthSimulationPanel(wxWindow *parent, std::shared_p
         double value = 1.0;
         if (read_number(m_deformation_scale, value)) m_canvas->set_deformation_scale(value);
     });
+    m_dense_volume_slider->Bind(wxEVT_SLIDER, [this](wxCommandEvent &) { update_dense_preview(); });
+    m_size_to_safety_factor->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { size_dense_preview_to_target(); });
+    m_use_stress_threshold->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { size_dense_preview_to_threshold(); });
+    m_show_dense_preview->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent &) { update_dense_preview(); });
+    m_apply_dense_button->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) {
+        if (m_apply_dense_preview && m_dense_preview.applicable() && !m_session->stale) {
+            const SA::DenseRegionPreview preview = m_dense_preview;
+            const bool applied = m_dense_profile && m_dense_profile == m_session->dense_profile && m_apply_dense_preview(preview);
+            if (applied) {
+                m_apply_dense_button->Disable();
+                m_dense_preview_metrics->SetLabel(m_dense_preview_metrics->GetLabel() +
+                    _L("  Slicer modifier created or updated; Slice now uses its dense infill settings."));
+            } else {
+                refresh();
+                m_dense_preview_metrics->SetLabel(m_dense_preview_metrics->GetLabel() +
+                    _L("  Modifier was not applied. Check the selected object and solve again."));
+            }
+            m_dense_preview_metrics->Wrap(FromDIP(920));
+            Layout();
+        }
+    });
 }
 
 void StrengthSimulationPanel::activate()
@@ -3557,7 +4127,7 @@ void StrengthSimulationPanel::refresh()
         m_status->SetLabel(result.status == SA::AnalysisStatus::NotRun ? _L("No analysis has been run.") :
             wxString::Format("%s — %s", wxString::FromUTF8(SA::to_string(result.status)), wxString::FromUTF8(result.message)));
         m_summary->ChangeValue({});
-        m_canvas->Refresh();
+        update_dense_preview();
         return;
     }
     m_status->SetLabel(m_session->stale ? _L("Results are stale because setup or geometry changed.") :
@@ -3574,12 +4144,10 @@ void StrengthSimulationPanel::refresh()
         text += wxString::Format(_L("Maximum-displacement target: %.6g mm — %s\n"),
             display_setup.criteria.maximum_displacement_mm, result.displacement_target_met ? _L("met") : _L("not met"));
     text += wxString::Format(_L("Requested resultant force: %s N\n\n"), vector_text(result.requested_resultant_force_n));
-    if (result.dense_region.available)
-        text += wxString::Format(_L("Dense-region recommendation: center %s mm, radius %.5g mm, %.4g%% %s "
-                                     "(vertices at or above %.4g%% of peak stress)\n"),
-            vector_text(result.dense_region.region.center_mm), result.dense_region.region.radius_mm,
-            result.dense_region.recommended_density * 100.0, wxString::FromUTF8(SA::to_string(result.dense_region.recommended_pattern)),
-            result.dense_region.stress_fraction * 100.0);
+    text += wxString::Format(_L("Reinforcement setup: %.4g%% %s; seed stress threshold %.4g%% of peak. "
+                                 "Use the strengthened-region controls above to preview and apply the actual shape.\n"),
+        display_setup.infill.dense_density * 100.0, wxString::FromUTF8(SA::to_string(display_setup.infill.dense_pattern)),
+        display_setup.infill.dense_stress_threshold * 100.0);
     if (!result.orientation_recommendations.empty()) {
         const auto &item = result.orientation_recommendations.front();
         text += wxString::Format(_L("Best estimated layer axis: %s, predicted safety factor %.5g, support score %.5g\n"),
@@ -3608,19 +4176,182 @@ void StrengthSimulationPanel::refresh()
     for (const std::string &warning : result.warnings)
         text += "  • " + wxString::FromUTF8(warning) + "\n";
     m_summary->ChangeValue(text);
-    m_canvas->Refresh();
+    update_dense_preview();
+}
+
+void StrengthSimulationPanel::update_dense_preview()
+{
+    const bool solved = m_session->result.succeeded() && !m_session->solved_mesh.empty() &&
+        m_session->result.vertices.size() == m_session->solved_mesh.vertices.size();
+    if (!solved || m_probe_revision != m_session->solved_revision) {
+        m_probe_vertex = size_t(-1);
+        m_probe->SetLabel(_L("Point probe: click near a mesh vertex."));
+    }
+    m_dense_volume_slider->Enable(solved && !m_session->stale);
+    m_target_safety_factor->Enable(solved && !m_session->stale);
+    m_size_to_safety_factor->Disable();
+    m_use_stress_threshold->Disable();
+    m_show_dense_preview->Enable(solved);
+    m_dense_volume_value->SetLabel(wxString::Format(_L("%d%% of model volume"), m_dense_volume_slider->GetValue()));
+    if (!solved) {
+        m_dense_profile = {};
+        m_dense_preview = {};
+        m_dense_preview_metrics->SetLabel(
+            _L("Solve a study to preview strengthened volume, mass, deformation, and safety factor."));
+        m_apply_dense_button->Disable();
+        m_canvas->set_dense_preview(m_dense_preview, false);
+        Layout();
+        return;
+    }
+
+    const SA::Result &result = m_session->result;
+    m_dense_profile = m_session->dense_profile;
+    if (!m_dense_profile || !m_dense_profile->available) {
+        m_dense_preview = {};
+        m_dense_volume_slider->Disable();
+        m_target_safety_factor->Disable();
+        m_show_dense_preview->Disable();
+        m_dense_preview_metrics->SetLabel(m_dense_profile ? wxString::FromUTF8(m_dense_profile->warning) :
+            _L("Solve the study to prepare its stress-directed reinforcement preview."));
+        m_apply_dense_button->Disable();
+        m_canvas->set_dense_preview(m_dense_preview, false);
+        Layout();
+        return;
+    }
+    m_dense_preview = SA::preview_dense_region(m_session->solved_mesh, m_session->solved_setup,
+                                                result, m_dense_volume_slider->GetValue() / 100.0,
+                                                m_dense_profile.get());
+    m_size_to_safety_factor->Enable(!m_session->stale && m_dense_preview.available &&
+        m_dense_preview.response_estimate_available && !m_session->solved_setup.gravity.enabled);
+    m_use_stress_threshold->Enable(!m_session->stale && m_dense_preview.available);
+    m_size_to_safety_factor->SetToolTip(m_session->solved_setup.gravity.enabled ?
+        _L("Sizing to an estimated safety factor is unavailable when gravity is enabled.") :
+        _L("Choose the smallest estimated region meeting the target, in 1% model-volume steps."));
+    wxString metrics;
+    if (!m_dense_preview.available) {
+        metrics = m_dense_preview.warning.empty() ? _L("A dense-region preview is not available for this result.") :
+            wxString::FromUTF8(m_dense_preview.warning);
+    } else {
+        metrics = wxString::Format(
+            _L("Estimated strengthened volume %.2f%% (%.4g cm³) • stress threshold %.1f%% of peak • "
+               "sampled stress coverage %.1f%% • estimated total mass %.4g kg (%+.4g kg)"),
+            m_dense_preview.estimated_volume_fraction * 100.0, m_dense_preview.estimated_volume_m3 * 1e6,
+            m_dense_preview.equivalent_stress_threshold * 100.0,
+            m_dense_preview.stress_coverage * 100.0,
+            m_dense_preview.estimated_total_mass_kg, m_dense_preview.estimated_added_mass_kg);
+        if (m_dense_preview.response_estimate_available) {
+            metrics += wxString::Format(_L(" • estimated minimum safety factor %.4g • maximum deformation %.4g mm"),
+                m_dense_preview.predicted_minimum_safety_factor, m_dense_preview.predicted_maximum_displacement_mm);
+        } else {
+            metrics += _L(" • Safety-factor and deformation estimates unavailable; contours and probes retain the baseline response.");
+        }
+        if (!m_dense_preview.warning.empty())
+            metrics += "  " + wxString::FromUTF8(m_dense_preview.warning);
+    }
+    if (m_session->stale)
+        metrics += _L("  Results are stale; solve again before creating a modifier.");
+    m_dense_preview_metrics->SetLabel(metrics);
+    m_dense_preview_metrics->Wrap(FromDIP(920));
+    m_apply_dense_button->Enable(!m_session->stale && m_dense_preview.applicable() && bool(m_apply_dense_preview));
+    m_canvas->set_dense_preview(m_dense_preview, m_show_dense_preview->GetValue());
+    if (m_probe_vertex < result.vertices.size())
+        update_probe(m_probe_vertex);
+    Layout();
+}
+
+void StrengthSimulationPanel::size_dense_preview_to_target()
+{
+    if (m_synchronize_session)
+        m_synchronize_session();
+    update_dense_preview();
+    if (!m_size_to_safety_factor->IsEnabled())
+        return;
+    double target = 0.0;
+    if (!read_number(m_target_safety_factor, target) || target <= 0.0) {
+        wxMessageBox(_L("Enter a finite safety-factor target greater than zero."),
+                     _L("Invalid safety-factor target"), wxOK | wxICON_WARNING, this);
+        return;
+    }
+
+    const auto meets_target = [&](int percent) {
+        const SA::DenseRegionPreview candidate = SA::preview_dense_region(
+            m_session->solved_mesh, m_session->solved_setup, m_session->result, percent / 100.0, m_dense_profile.get(), false);
+        return candidate.available && candidate.response_estimate_available && candidate.predicted_minimum_safety_factor >= target;
+    };
+    int selected_percent = 100;
+    const bool reached = meets_target(100);
+    if (reached) {
+        // Validated dense settings cannot weaken the background, and the selected cell sets are
+        // nested. The estimated SF is monotone, so binary search avoids 101 expensive previews.
+        int lower = 0, upper = 100;
+        while (lower < upper) {
+            const int middle = lower + (upper - lower) / 2;
+            if (meets_target(middle))
+                upper = middle;
+            else
+                lower = middle + 1;
+        }
+        selected_percent = lower;
+    }
+    m_dense_volume_slider->SetValue(selected_percent);
+    update_dense_preview();
+    m_dense_preview_metrics->SetLabel(m_dense_preview_metrics->GetLabel() + (reached ?
+        wxString::Format(_L("  Target estimated SF %.4g met at the smallest tested volume setting, %d%%. This is an estimate fit."),
+                         target, selected_percent) :
+        wxString::Format(_L("  Target estimated SF %.4g is unattainable in the tested 0–100%% range. "
+                            "Showing the 100%% candidate, subject to preserve-region limits."), target)));
+    m_dense_preview_metrics->Wrap(FromDIP(920));
+    Layout();
+}
+
+void StrengthSimulationPanel::size_dense_preview_to_threshold()
+{
+    if (m_synchronize_session)
+        m_synchronize_session();
+    update_dense_preview();
+    if (!m_use_stress_threshold->IsEnabled())
+        return;
+    const double threshold = m_session->solved_setup.infill.dense_stress_threshold;
+    const SA::DenseRegionPreview candidate = SA::preview_dense_region(
+        m_session->solved_mesh, m_session->solved_setup, m_session->result, 1.0, m_dense_profile.get(), false, threshold);
+    if (!candidate.available)
+        return;
+    const int percent = int(std::lround(candidate.estimated_volume_fraction * 100.0));
+    m_dense_volume_slider->SetValue(percent);
+    update_dense_preview();
+    m_dense_preview_metrics->SetLabel(m_dense_preview_metrics->GetLabel() + wxString::Format(
+        _L("  Setup stress threshold %.4g%% maps to %.2f%% eligible model volume, rounded to the nearest 1%% slider step."),
+        threshold * 100.0, candidate.estimated_volume_fraction * 100.0));
+    m_dense_preview_metrics->Wrap(FromDIP(920));
+    Layout();
 }
 
 void StrengthSimulationPanel::update_probe(size_t vertex_index)
 {
     if (vertex_index >= m_session->result.vertices.size()) return;
+    m_probe_vertex = vertex_index;
+    m_probe_revision = m_session->solved_revision;
     const SA::VertexResult &value = m_session->result.vertices[vertex_index];
-    m_probe->SetLabel(wxString::Format(
+    wxString label = wxString::Format(
         _L("Point probe #%zu — position %s mm; displacement %s mm (|u| %.6g); normal stress %s MPa; "
            "shear XY/XZ/YZ %s MPa; Von Mises %.6g MPa; maximum shear %.6g MPa; safety factor %.6g"),
         vertex_index, vector_text(value.position_mm), vector_text(value.displacement_m * 1000.0), value.displacement_m.norm() * 1000.0,
         vector_text(value.normal_stress_pa / 1e6), vector_text(value.shear_stress_pa / 1e6), value.von_mises_pa / 1e6,
-        value.maximum_shear_pa / 1e6, value.safety_factor));
+        value.maximum_shear_pa / 1e6, value.safety_factor);
+    if (m_show_dense_preview->GetValue() && m_dense_preview.applicable() && m_dense_preview.response_estimate_available) {
+        const bool strengthened = std::binary_search(m_dense_preview.affected_vertices.begin(),
+                                                     m_dense_preview.affected_vertices.end(), vertex_index);
+        const double strength = strengthened ? std::max(1e-12, m_dense_preview.local_strength_multiplier) : 1.0;
+        const double stiffness = strengthened ? std::max(1e-12, m_dense_preview.local_stiffness_multiplier) : 1.0;
+        const double load = m_session->solved_setup.gravity.enabled && m_session->result.estimated_mass_kg > 1e-12 ?
+            std::max(1.0, m_dense_preview.estimated_total_mass_kg / m_session->result.estimated_mass_kg) : 1.0;
+        label += wxString::Format(_L(" — dense preview: safety factor %.6g, displacement %.6g mm"),
+            value.safety_factor * strength / load,
+            value.displacement_m.norm() * 1000.0 * load / stiffness);
+    } else if (m_show_dense_preview->GetValue() && m_dense_preview.available && !m_dense_preview.response_estimate_available) {
+        label += _L(" — Dense-preview response unavailable; baseline response shown.");
+    }
+    m_probe->SetLabel(label);
     Layout();
 }
 

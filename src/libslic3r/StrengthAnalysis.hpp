@@ -4,6 +4,8 @@
 #include "Point.hpp"
 #include "TriangleMesh.hpp"
 
+#include <cstdint>
+#include <array>
 #include <functional>
 #include <limits>
 #include <string>
@@ -175,6 +177,68 @@ struct DenseRegionRecommendation {
     InfillPattern recommended_pattern{InfillPattern::Gyroid};
 };
 
+struct DenseRegionCell {
+    size_t grid_index{0};
+    double volume_mm3{0.0}; // Actual model intersection, not the enclosing voxel volume.
+    double stress_pa{0.0};
+};
+
+// Prepared off the UI thread. Cells are ranked by interpolated solved stress (descending), then
+// grid index for deterministic ties. Exact polyhedral integration retains cavities and thin solids.
+// Grid planes and the emitted mesh use object coordinates; the slicer clips voxels to the model.
+struct DenseRegionPreviewProfile {
+    bool available{false};
+    size_t vertex_count{0};
+    size_t triangle_count{0};
+    // Bitwise fingerprint of all mesh coordinates/indices and the solved positions/stress field.
+    // Displacements and safety factors are read afresh by preview_dense_region().
+    std::uint64_t mesh_result_fingerprint{0};
+    size_t hotspot_vertex{0};
+    Vec3d hotspot_center_mm{Vec3d::Zero()};
+    double hotspot_stress_pa{0.0};
+    double solid_volume_m3{0.0};
+    double sampled_volume_mm3{0.0};
+    std::array<std::vector<double>, 3> grid_planes_mm;
+    std::vector<DenseRegionCell> cells;
+    std::vector<double> cumulative_volume_mm3;
+    std::string warning;
+};
+
+// Fast, deterministic what-if estimate for resizing the recommended dense infill modifier. The
+// preview deliberately does not claim to be a re-solved stress study: it applies the local
+// density/pattern response to the solved vertex field so the UI can update while a slider moves.
+struct DenseRegionPreview {
+    bool available{false};
+    bool overlaps_preserve{false};
+    // Sizing remains applicable when false, but both response predictions are NaN: changed
+    // self-weight requires a new solve. Callers should display the baseline response instead.
+    bool response_estimate_available{true};
+    // Authoritative native PARAMETER_MODIFIER geometry in OBJECT COORDINATES. Empty when
+    // generate_modifier_mesh=false; region is only a diagnostic enclosing box.
+    indexed_triangle_set modifier_mesh;
+    SphericalRegion region;
+    size_t selected_cell_count{0};
+    double target_volume_fraction{0.0};
+    double estimated_volume_fraction{0.0};
+    double estimated_volume_m3{0.0};
+    double stress_coverage{0.0};
+    double equivalent_stress_threshold{0.0};
+    double local_strength_multiplier{1.0};
+    double local_stiffness_multiplier{1.0};
+    double predicted_minimum_safety_factor{std::numeric_limits<double>::infinity()};
+    double predicted_maximum_displacement_mm{0.0};
+    double estimated_added_mass_kg{0.0};
+    double estimated_total_mass_kg{0.0};
+    std::vector<size_t> affected_vertices;
+    std::string warning;
+
+    bool applicable() const
+    {
+        return available && !overlaps_preserve && target_volume_fraction > 0.0 &&
+            estimated_volume_fraction > 0.0 && selected_cell_count > 0;
+    }
+};
+
 struct InfillComparison {
     InfillPattern pattern{InfillPattern::Gyroid};
     double density{0.0};
@@ -252,6 +316,21 @@ std::vector<SurfacePatch> group_coplanar_surfaces(const indexed_triangle_set &me
                                                   const SurfaceGroupingSettings &settings = {});
 std::vector<std::vector<size_t>> mesh_connected_components(const indexed_triangle_set &mesh);
 Result analyze(const indexed_triangle_set &mesh, const Setup &setup, const CancelPredicate &cancel = {});
+
+// Builds a reusable cancellable stress-directed interior-cell profile. Work-limit or cancellation
+// failures are unavailable with an explicit warning, never a silently truncated profile.
+DenseRegionPreviewProfile build_dense_region_preview_profile(const indexed_triangle_set &mesh,
+                                                              const Result &result, const CancelPredicate &cancel = {});
+// Selects the volume-weighted ranked prefix, skipping every cell intersecting a preserve region.
+// The target is a share of total model volume; attainable share may be smaller due to preserves.
+// Metrics-only callers may suppress mesh generation. A stale supplied cache fails explicitly so
+// callers can rebuild off the UI thread. No profile supplied builds synchronously for headless use.
+// An optional relative stress cutoff limits the eligible cells, after preserve exclusion.
+// Response metrics are engineering what-if estimates, not a re-solved or full FEA validation.
+DenseRegionPreview preview_dense_region(const indexed_triangle_set &mesh, const Setup &setup,
+                                        const Result &result, double target_volume_fraction,
+                                        const DenseRegionPreviewProfile *profile = nullptr,
+                                        bool generate_modifier_mesh = true, double minimum_stress_fraction = 0.0);
 
 std::vector<InfillComparison> compare_infill_patterns(double solid_volume_m3, const Setup &setup, double reference_safety_factor);
 std::vector<MassStrengthPoint> estimate_mass_strength_curve(double solid_volume_m3, const Setup &setup, double reference_safety_factor);

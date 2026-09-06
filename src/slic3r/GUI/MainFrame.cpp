@@ -1338,10 +1338,15 @@ void MainFrame::init_tabpanel() {
     m_strength_simulation_panel = new StrengthSimulationPanel(m_tabpanel, m_strength_session, [this] {
         if (m_strength_load_panel != nullptr)
             m_strength_load_panel->activate();
+    }, [this](const StrengthAnalysis::DenseRegionPreview &preview) {
+        return m_strength_load_panel != nullptr && m_strength_load_panel->create_dense_modifier_from_preview(preview);
     });
     m_strength_load_panel->set_result_callback([this] {
         if (m_strength_simulation_panel != nullptr)
-            m_strength_simulation_panel->activate();
+            m_strength_simulation_panel->refresh();
+    });
+    m_strength_load_panel->set_preview_callback([this] {
+        select_tab(TAB_ID_STRENGTH_SIMULATION);
     });
 
     create_preset_tabs();

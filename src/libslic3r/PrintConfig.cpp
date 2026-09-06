@@ -8200,6 +8200,13 @@ void PrintConfigDef::init_fff_params()
     def->mode = comDevelop;
     def->cli = ConfigOptionDef::nocli;
     def->set_default_value(new ConfigOptionString());
+
+    def = this->add("strength_analysis_modifier", coBool);
+    def->label = L("Strength analysis modifier");
+    def->tooltip = L("Internal marker for the dense-infill parameter modifier managed by Strength Analysis.");
+    def->mode = comDevelop;
+    def->cli = ConfigOptionDef::nocli;
+    def->set_default_value(new ConfigOptionBool(false));
 }
 
 void PrintConfigDef::init_extruder_option_keys()

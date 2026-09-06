@@ -363,11 +363,11 @@ ModelVolumeType type_from_string(const std::string &s)
     // Legacy support
     if (s == "1") return ModelVolumeType::PARAMETER_MODIFIER;
     // New type (supporting the support enforcers & blockers)
-    if (s == "ModelPart") return ModelVolumeType::MODEL_PART;
-    if (s == "NegativeVolume") return ModelVolumeType::NEGATIVE_VOLUME;
-    if (s == "ParameterModifier") return ModelVolumeType::PARAMETER_MODIFIER;
-    if (s == "SupportEnforcer") return ModelVolumeType::SUPPORT_ENFORCER;
-    if (s == "SupportBlocker") return ModelVolumeType::SUPPORT_BLOCKER;
+    if (s == "ModelPart" || s == "normal_part") return ModelVolumeType::MODEL_PART;
+    if (s == "NegativeVolume" || s == "negative_part") return ModelVolumeType::NEGATIVE_VOLUME;
+    if (s == "ParameterModifier" || s == "modifier_part") return ModelVolumeType::PARAMETER_MODIFIER;
+    if (s == "SupportEnforcer" || s == "support_enforcer") return ModelVolumeType::SUPPORT_ENFORCER;
+    if (s == "SupportBlocker" || s == "support_blocker") return ModelVolumeType::SUPPORT_BLOCKER;
     // Default value if invalud type string received.
     return ModelVolumeType::MODEL_PART;
 }
@@ -2044,7 +2044,10 @@ ModelVolumeType type_from_string(const std::string &s)
             "source_offset_z",
             "extruder",
             "modifier",
-            "strength_analysis_setup"
+            "strength_analysis_setup",
+            "strength_analysis_modifier",
+            "sparse_infill_density",
+            "sparse_infill_pattern"
         };
 
         auto itor = std::find(valid_keys.begin(), valid_keys.end(), key);

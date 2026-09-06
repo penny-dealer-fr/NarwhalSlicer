@@ -1,5 +1,7 @@
 #include "StrengthAnalysis.hpp"
 
+#include "AABBTreeIndirect.hpp"
+#include "KDTreeIndirect.hpp"
 #include "nlohmann/json.hpp"
 
 #include <Eigen/Eigenvalues>
@@ -9,6 +11,8 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstring>
+#include <exception>
 #include <iterator>
 #include <map>
 #include <numeric>
@@ -24,6 +28,37 @@ namespace {
 constexpr double MM_TO_M = 1e-3;
 constexpr double MM3_TO_M3 = 1e-9;
 constexpr double NUMERIC_EPSILON = 1e-12;
+
+std::uint64_t dense_profile_fingerprint(const indexed_triangle_set &mesh, const Result &result)
+{
+    std::uint64_t fingerprint = 14695981039346656037ULL;
+    const auto mix = [&fingerprint](auto value) {
+        static_assert(sizeof(value) <= sizeof(std::uint64_t));
+        std::uint64_t bits = 0;
+        std::memcpy(&bits, &value, sizeof(value));
+        fingerprint = (fingerprint ^ bits) * 1099511628211ULL;
+    };
+    mix(mesh.vertices.size());
+    mix(mesh.indices.size());
+    for (const Vec3f &vertex : mesh.vertices)
+        for (int axis = 0; axis < 3; ++axis)
+            mix(vertex[axis]);
+    for (const Vec3i32 &triangle : mesh.indices)
+        for (int corner = 0; corner < 3; ++corner)
+            mix(triangle[corner]);
+    mix(int(result.status));
+    mix(result.vertices.size());
+    mix(result.maximum_stress_vertex);
+    mix(result.maximum_von_mises_pa);
+    // Hash every candidate, since a different vertex can become the hotspot while the old
+    // hotspot's position and stress remain unchanged. Do not quantize away small mesh edits.
+    for (const VertexResult &vertex : result.vertices) {
+        for (int axis = 0; axis < 3; ++axis)
+            mix(vertex.position_mm[axis]);
+        mix(vertex.von_mises_pa);
+    }
+    return fingerprint;
+}
 
 struct PatternFactors {
     double stiffness;
@@ -74,6 +109,98 @@ bool valid_region_extent(const SphericalRegion &region)
         return !region.surface_triangles.empty();
     }
     return false;
+}
+
+std::vector<size_t> region_vertices_impl(const indexed_triangle_set &mesh, const SphericalRegion &region,
+                                        bool select_nearest);
+Vec3d normalized_or_zero(const Vec3d &v);
+
+double squared_distance_to_triangle(const Vec3d &point, const Vec3d &a, const Vec3d &b, const Vec3d &c)
+{
+    const Vec3d ab = b - a;
+    const Vec3d ac = c - a;
+    const Vec3d ap = point - a;
+    const double d1 = ab.dot(ap);
+    const double d2 = ac.dot(ap);
+    if (d1 <= 0.0 && d2 <= 0.0)
+        return ap.squaredNorm();
+
+    const Vec3d bp = point - b;
+    const double d3 = ab.dot(bp);
+    const double d4 = ac.dot(bp);
+    if (d3 >= 0.0 && d4 <= d3)
+        return bp.squaredNorm();
+
+    const double vc = d1 * d4 - d3 * d2;
+    if (vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0) {
+        const double v = d1 / (d1 - d3);
+        return (point - (a + v * ab)).squaredNorm();
+    }
+
+    const Vec3d cp = point - c;
+    const double d5 = ab.dot(cp);
+    const double d6 = ac.dot(cp);
+    if (d6 >= 0.0 && d5 <= d6)
+        return cp.squaredNorm();
+
+    const double vb = d5 * d2 - d1 * d6;
+    if (vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0) {
+        const double w = d2 / (d2 - d6);
+        return (point - (a + w * ac)).squaredNorm();
+    }
+
+    const double va = d3 * d6 - d5 * d4;
+    if (va <= 0.0 && d4 - d3 >= 0.0 && d5 - d6 >= 0.0) {
+        const double w = (d4 - d3) / ((d4 - d3) + (d5 - d6));
+        return (point - (b + w * (c - b))).squaredNorm();
+    }
+
+    const double denominator = va + vb + vc;
+    if (std::abs(denominator) <= NUMERIC_EPSILON)
+        return std::min({ap.squaredNorm(), bp.squaredNorm(), cp.squaredNorm()});
+    const double v = vb / denominator;
+    const double w = vc / denominator;
+    return (point - (a + ab * v + ac * w)).squaredNorm();
+}
+
+double distance_to_region(const indexed_triangle_set &mesh, const SphericalRegion &region, const Vec3d &point)
+{
+    if (region.whole_model)
+        return 0.0;
+    const Vec3d delta = point - region.center_mm;
+    switch (region.shape) {
+    case RegionShape::Sphere:
+        return std::max(0.0, delta.norm() - std::max(0.0, region.radius_mm));
+    case RegionShape::Box: {
+        const Vec3d outside = (delta.cwiseAbs() - 0.5 * region.size_mm.cwiseAbs()).cwiseMax(0.0);
+        return outside.norm();
+    }
+    case RegionShape::Cylinder: {
+        const Vec3d axis = normalized_or_zero(region.axis);
+        if (axis.isZero(NUMERIC_EPSILON))
+            return std::numeric_limits<double>::infinity();
+        const double axial = std::abs(delta.dot(axis));
+        const double radial = (delta - delta.dot(axis) * axis).norm();
+        return std::hypot(std::max(0.0, radial - std::max(0.0, region.radius_mm)),
+                          std::max(0.0, axial - 0.5 * std::abs(region.size_mm.z())));
+    }
+    case RegionShape::Surface: {
+        double squared_distance = std::numeric_limits<double>::infinity();
+        for (size_t triangle_index : region.surface_triangles) {
+            if (triangle_index >= mesh.indices.size())
+                continue;
+            const Vec3i32 &triangle = mesh.indices[triangle_index];
+            if (triangle.minCoeff() < 0 || triangle.maxCoeff() >= int(mesh.vertices.size()))
+                continue;
+            squared_distance = std::min(squared_distance, squared_distance_to_triangle(
+                point, mesh.vertices[size_t(triangle[0])].cast<double>(),
+                mesh.vertices[size_t(triangle[1])].cast<double>(),
+                mesh.vertices[size_t(triangle[2])].cast<double>()));
+        }
+        return std::sqrt(squared_distance);
+    }
+    }
+    return std::numeric_limits<double>::infinity();
 }
 
 Vec3d normalized_or_zero(const Vec3d &v)
@@ -638,6 +765,16 @@ std::vector<std::string> validate(const indexed_triangle_set &mesh, const Setup 
         errors.emplace_back("Dense infill density must be in (0, 1].");
     if (setup.infill.dense_density < setup.infill.background_density)
         errors.emplace_back("Dense infill density cannot be lower than the background density.");
+    if (setup.infill.background_density > 0.0 && setup.infill.background_density <= 1.0 &&
+        setup.infill.dense_density > 0.0 && setup.infill.dense_density <= 1.0) {
+        const double density_ratio = effective_solid_fraction(setup.infill.dense_density) /
+            effective_solid_fraction(setup.infill.background_density);
+        const PatternFactors background = pattern_factors(setup.infill.background_pattern);
+        const PatternFactors dense = pattern_factors(setup.infill.dense_pattern);
+        if (density_ratio * dense.strength + NUMERIC_EPSILON < background.strength ||
+            density_ratio * dense.stiffness + NUMERIC_EPSILON < background.stiffness)
+            errors.emplace_back("Dense infill density and pattern must not be weaker or less stiff than the background infill.");
+    }
     if (!std::isfinite(setup.infill.dense_stress_threshold) || setup.infill.dense_stress_threshold <= 0.0 ||
         setup.infill.dense_stress_threshold > 1.0)
         errors.emplace_back("Dense stress threshold must be in (0, 1].");
@@ -1207,6 +1344,562 @@ Result analyze(const indexed_triangle_set &mesh, const Setup &setup, const Cance
     result.print_settings_candidates = recommend_print_settings(solid_volume_m3, setup, finite_reference_sf,
                                                                  result.maximum_displacement_m * 1000.0);
     return result;
+}
+
+namespace {
+
+// Convex polygon clipping in doubles, with no spatial samples. The signed projected integral
+// sum_faces integral_XY clamp(z_face - z_lower, 0, dz) dA is exactly the solid volume in a
+// rectangular cell by the divergence theorem. Inward cavity faces subtract automatically.
+// Splitting each face at cell Z planes accounts for every vertex/edge/grid crossing event.
+using CellPolygon = std::vector<Vec3d>;
+
+CellPolygon clip_cell_polygon(const CellPolygon &polygon, int axis, double plane, bool keep_above)
+{
+    CellPolygon clipped;
+    if (polygon.empty())
+        return clipped;
+    clipped.reserve(polygon.size() + 1);
+    Vec3d previous = polygon.back();
+    double previous_distance = (previous[axis] - plane) * (keep_above ? 1.0 : -1.0);
+    for (const Vec3d &point : polygon) {
+        const double distance = (point[axis] - plane) * (keep_above ? 1.0 : -1.0);
+        if ((distance >= 0.0) != (previous_distance >= 0.0)) {
+            Vec3d crossing = previous + (point - previous) * (previous_distance / (previous_distance - distance));
+            crossing[axis] = plane;
+            clipped.push_back(crossing);
+        }
+        if (distance >= 0.0)
+            clipped.push_back(point);
+        previous = point;
+        previous_distance = distance;
+    }
+    return clipped;
+}
+
+// Volume and first moments of the signed column above cut. Coordinates are relative to the
+// model origin to limit cancellation when a part has a large object-coordinate translation.
+Eigen::Vector4d column_integrals(const CellPolygon &polygon, double cut)
+{
+    const CellPolygon above = clip_cell_polygon(polygon, 2, cut, true);
+    Eigen::Vector4d integral = Eigen::Vector4d::Zero();
+    for (size_t i = 1; i + 1 < above.size(); ++i) {
+        const std::array<Vec3d, 3> p{above[0], above[i], above[i + 1]};
+        const double area = 0.5 * ((p[1].x() - p[0].x()) * (p[2].y() - p[0].y()) -
+                                   (p[1].y() - p[0].y()) * (p[2].x() - p[0].x()));
+        const Vec3d h(p[0].z() - cut, p[1].z() - cut, p[2].z() - cut);
+        integral[0] += area * h.sum() / 3.0;
+        for (int axis = 0; axis < 2; ++axis) {
+            const Vec3d coordinate(p[0][axis], p[1][axis], p[2][axis]);
+            integral[axis + 1] += area * (coordinate.sum() * h.sum() + coordinate.dot(h)) / 12.0;
+        }
+        integral[3] += area * (cut * h.sum() / 3.0 +
+            (h.squaredNorm() + h[0] * h[1] + h[0] * h[2] + h[1] * h[2]) / 12.0);
+    }
+    return integral;
+}
+
+std::array<size_t, 3> dense_grid_size(const DenseRegionPreviewProfile &profile)
+{
+    return {profile.grid_planes_mm[0].size() - 1, profile.grid_planes_mm[1].size() - 1,
+            profile.grid_planes_mm[2].size() - 1};
+}
+
+std::array<size_t, 3> dense_cell_coordinates(size_t id, const std::array<size_t, 3> &size)
+{
+    return {id % size[0], (id / size[0]) % size[1], id / (size[0] * size[1])};
+}
+
+void dense_cell_bounds(const DenseRegionPreviewProfile &profile, size_t id, Vec3d &lower, Vec3d &upper)
+{
+    const auto coordinate = dense_cell_coordinates(id, dense_grid_size(profile));
+    for (int axis = 0; axis < 3; ++axis) {
+        lower[axis] = profile.grid_planes_mm[axis][coordinate[axis]];
+        upper[axis] = profile.grid_planes_mm[axis][coordinate[axis] + 1];
+    }
+}
+
+bool cell_intersects_preserve(const indexed_triangle_set &mesh, const SphericalRegion &region,
+                             const Vec3d &lower, const Vec3d &upper, double epsilon)
+{
+    if (region.whole_model)
+        return true;
+    const Vec3d center = 0.5 * (lower + upper);
+    const Vec3d half = 0.5 * (upper - lower);
+    if (region.shape == RegionShape::Sphere)
+        return (region.center_mm - center).cwiseAbs().cwiseMax(half).operator-(half).norm() <= region.radius_mm + epsilon;
+    if (region.shape == RegionShape::Box)
+        return ((region.center_mm - center).cwiseAbs().array() <=
+                (half + 0.5 * region.size_mm.cwiseAbs()).array() + epsilon).all();
+    if (region.shape == RegionShape::Cylinder) {
+        // A conservative distance bound also supports arbitrarily tilted cylinders. It can
+        // exclude a few extra boundary cells, but can never reinforce a preserved feature.
+        return distance_to_region(mesh, region, center) <= half.norm() + epsilon;
+    }
+    for (size_t face : region.surface_triangles) {
+        const Vec3i32 &triangle = mesh.indices[face];
+        CellPolygon polygon;
+        for (int corner = 0; corner < 3; ++corner)
+            polygon.push_back(mesh.vertices[size_t(triangle[corner])].cast<double>());
+        for (int axis = 0; axis < 3 && !polygon.empty(); ++axis) {
+            polygon = clip_cell_polygon(polygon, axis, lower[axis] - epsilon, true);
+            polygon = clip_cell_polygon(polygon, axis, upper[axis] + epsilon, false);
+        }
+        if (!polygon.empty())
+            return true;
+    }
+    return false;
+}
+
+indexed_triangle_set dense_boundary_mesh(const DenseRegionPreviewProfile &profile, const std::vector<unsigned char> &selected)
+{
+    indexed_triangle_set mesh;
+    const auto size = dense_grid_size(profile);
+    const std::array<size_t, 3> stride{1, size[0], size[0] * size[1]};
+    const size_t vx = size[0] + 1, vy = size[1] + 1;
+    std::vector<int32_t> vertices(vx * vy * (size[2] + 1), -1);
+    const auto vertex_index = [&](const std::array<size_t, 3> &point) {
+        int32_t &index = vertices[point[0] + vx * (point[1] + vy * point[2])];
+        if (index < 0) {
+            index = int32_t(mesh.vertices.size());
+            mesh.vertices.emplace_back(float(profile.grid_planes_mm[0][point[0]]),
+                                       float(profile.grid_planes_mm[1][point[1]]),
+                                       float(profile.grid_planes_mm[2][point[2]]));
+        }
+        return index;
+    };
+    // Emit each exposed face once, with outward winding; face-adjacent cells share vertices.
+    for (size_t id = 0; id < selected.size(); ++id) {
+        if (!selected[id])
+            continue;
+        const auto coordinate = dense_cell_coordinates(id, size);
+        for (int axis = 0; axis < 3; ++axis) {
+            const int u = (axis + 1) % 3, v = (axis + 2) % 3;
+            for (int side = 0; side < 2; ++side) {
+                if ((side == 0 && coordinate[axis] > 0 && selected[id - stride[axis]]) ||
+                    (side == 1 && coordinate[axis] + 1 < size[axis] && selected[id + stride[axis]]))
+                    continue;
+                auto point = coordinate;
+                point[axis] += size_t(side);
+                const int32_t a = vertex_index(point);
+                ++point[u];
+                const int32_t b = vertex_index(point);
+                ++point[v];
+                const int32_t c = vertex_index(point);
+                --point[u];
+                const int32_t d = vertex_index(point);
+                if (side == 1) {
+                    mesh.indices.emplace_back(a, b, c);
+                    mesh.indices.emplace_back(a, c, d);
+                } else {
+                    mesh.indices.emplace_back(a, c, b);
+                    mesh.indices.emplace_back(a, d, c);
+                }
+            }
+        }
+    }
+    return mesh;
+}
+
+} // namespace
+
+DenseRegionPreviewProfile build_dense_region_preview_profile(const indexed_triangle_set &mesh, const Result &result,
+                                                              const CancelPredicate &cancel)
+{
+    DenseRegionPreviewProfile profile;
+    const auto fail = [&](const std::string &warning) {
+        DenseRegionPreviewProfile unavailable;
+        unavailable.warning = warning;
+        return unavailable;
+    };
+    const auto cancelled = [&]() { return cancel && cancel(); };
+    if (cancelled())
+        return fail("Dense-region profile preparation was cancelled.");
+    if (!result.succeeded())
+        return fail("Run a successful strength analysis before building a dense-region profile.");
+    if (mesh.vertices.empty() || mesh.indices.empty() || result.vertices.size() != mesh.vertices.size())
+        return fail("The solved result does not match the preview mesh.");
+    constexpr size_t maximum_cells = 262144;
+    constexpr size_t maximum_work = 8 * 1024 * 1024;
+    if (mesh.vertices.size() > 200000 || mesh.indices.size() > 400000)
+        return fail("Dense-region profile exceeds the mesh work limit (200000 vertices / 400000 faces); simplify the analysis mesh.");
+    for (size_t i = 0; i < mesh.vertices.size(); ++i) {
+        if (!mesh.vertices[i].allFinite() || !result.vertices[i].position_mm.allFinite() ||
+            (mesh.vertices[i].cast<double>() - result.vertices[i].position_mm).squaredNorm() > 1e-12)
+            return fail("The solved vertex positions do not match the preview mesh.");
+        if (!std::isfinite(result.vertices[i].von_mises_pa) || result.vertices[i].von_mises_pa < 0.0)
+            return fail("The solved stress field contains a non-finite or negative value.");
+        if (result.vertices[i].von_mises_pa > profile.hotspot_stress_pa) {
+            profile.hotspot_vertex = i;
+            profile.hotspot_stress_pa = result.vertices[i].von_mises_pa;
+        }
+        if ((i & 1023) == 0 && cancelled())
+            return fail("Dense-region profile preparation was cancelled.");
+    }
+    for (const Vec3i32 &triangle : mesh.indices)
+        if (triangle.minCoeff() < 0 || triangle.maxCoeff() >= int(mesh.vertices.size()))
+            return fail("The preview mesh contains an out-of-range triangle index.");
+    if (profile.hotspot_stress_pa <= NUMERIC_EPSILON)
+        return fail("The solved result has no finite non-zero stress hotspot to strengthen.");
+
+    const double signed_volume = its_volume(mesh);
+    if (!std::isfinite(signed_volume) || std::abs(signed_volume) <= NUMERIC_EPSILON)
+        return fail("The preview mesh must enclose a positive finite volume.");
+    const double orientation = signed_volume < 0.0 ? -1.0 : 1.0;
+    const Vec3d origin = bounding_box(mesh).min.cast<double>();
+    const auto components = mesh_connected_components(mesh);
+    if (cancelled())
+        return fail("Dense-region profile preparation was cancelled.");
+    if (components.empty() || components.size() > 256)
+        return fail("Dense-region profile exceeds the connected-geometry work limit (256 shells); repair or simplify the analysis mesh.");
+
+    std::vector<size_t> face_component(mesh.indices.size(), 0);
+    std::vector<std::vector<size_t>> component_vertices(components.size());
+    size_t resolution = 40;
+    for (;;) {
+        for (auto &planes : profile.grid_planes_mm)
+            planes.clear();
+        // Each body supplies its own planes, so remote gaps cannot coarsen small or thin bodies.
+        // Round planes to the exact float coordinates that the native modifier will store.
+        for (size_t component = 0; component < components.size(); ++component) {
+            Vec3d lower = Vec3d::Constant(std::numeric_limits<double>::infinity());
+            Vec3d upper = -lower;
+            auto &vertices = component_vertices[component];
+            vertices.clear();
+            for (size_t face : components[component]) {
+                face_component[face] = component;
+                for (int corner = 0; corner < 3; ++corner) {
+                    const size_t vertex = size_t(mesh.indices[face][corner]);
+                    vertices.push_back(vertex);
+                    lower = lower.cwiseMin(mesh.vertices[vertex].cast<double>());
+                    upper = upper.cwiseMax(mesh.vertices[vertex].cast<double>());
+                }
+            }
+            std::sort(vertices.begin(), vertices.end());
+            vertices.erase(std::unique(vertices.begin(), vertices.end()), vertices.end());
+            const double longest = (upper - lower).maxCoeff();
+            if (!(longest > 0.0))
+                return fail("The preview mesh contains degenerate geometry.");
+            for (int axis = 0; axis < 3; ++axis) {
+                if (!(upper[axis] > lower[axis]))
+                    return fail("The preview mesh contains an open or zero-thickness shell.");
+                const size_t divisions = std::max(size_t(4), size_t(std::ceil(double(resolution) * (upper[axis] - lower[axis]) / longest)));
+                for (size_t i = 0; i <= divisions; ++i)
+                    profile.grid_planes_mm[axis].push_back(double(float(lower[axis] +
+                        (upper[axis] - lower[axis]) * double(i) / double(divisions))));
+            }
+        }
+        for (auto &planes : profile.grid_planes_mm) {
+            std::sort(planes.begin(), planes.end());
+            planes.erase(std::unique(planes.begin(), planes.end()), planes.end());
+            if (planes.size() < 2)
+                return fail("The preview grid has no finite extent.");
+        }
+        const auto candidate_size = dense_grid_size(profile);
+        if (candidate_size[0] * candidate_size[1] * candidate_size[2] <= maximum_cells)
+            break;
+        if (resolution == 4)
+            return fail("Dense-region profile exceeds the interior-cell memory limit (262144 cells); simplify the analysis mesh.");
+        resolution = std::max(size_t(4), resolution * 3 / 4);
+    }
+    const auto size = dense_grid_size(profile);
+    const size_t cell_count = size[0] * size[1] * size[2];
+    if (cell_count > maximum_cells)
+        return fail("Dense-region profile exceeds the interior-cell memory limit (262144 cells); simplify the analysis mesh.");
+    const auto &xs = profile.grid_planes_mm[0];
+    const auto &ys = profile.grid_planes_mm[1];
+    const auto &zs = profile.grid_planes_mm[2];
+    struct Integral {
+        Eigen::Vector4d value{Eigen::Vector4d::Zero()};
+        Eigen::Vector4d correction{Eigen::Vector4d::Zero()};
+        void add(const Eigen::Vector4d &amount) {
+            const Eigen::Vector4d corrected = amount - correction;
+            const Eigen::Vector4d next = value + corrected;
+            correction = (next - value) - corrected;
+            value = next;
+        }
+    };
+    std::vector<Integral> integrals(cell_count);
+    size_t work = 0;
+    for (size_t face = 0; face < mesh.indices.size(); ++face) {
+        if (cancelled())
+            return fail("Dense-region profile preparation was cancelled.");
+        CellPolygon triangle;
+        Vec3d lower = Vec3d::Constant(std::numeric_limits<double>::infinity());
+        Vec3d upper = -lower;
+        for (int corner = 0; corner < 3; ++corner) {
+            const Vec3d point = mesh.vertices[size_t(mesh.indices[face][corner])].cast<double>();
+            triangle.push_back(point - origin);
+            lower = lower.cwiseMin(point);
+            upper = upper.cwiseMax(point);
+        }
+        if ((triangle[1] - triangle[0]).cross(triangle[2] - triangle[0]).z() == 0.0)
+            continue;
+        const auto first_interval = [](const std::vector<double> &planes, double value) {
+            return size_t(std::max(std::ptrdiff_t(0), std::upper_bound(planes.begin(), planes.end(), value) - planes.begin() - 1));
+        };
+        for (size_t y = first_interval(ys, lower.y()); y < size[1] && ys[y] < upper.y(); ++y) {
+            CellPolygon row = clip_cell_polygon(triangle, 1, ys[y] - origin.y(), true);
+            row = clip_cell_polygon(row, 1, ys[y + 1] - origin.y(), false);
+            for (size_t x = first_interval(xs, lower.x()); x < size[0] && xs[x] < upper.x(); ++x) {
+                if (++work > maximum_work)
+                    return fail("Dense-region integration exceeds the face/cell work limit (8388608 operations); simplify the analysis mesh.");
+                CellPolygon column = clip_cell_polygon(row, 0, xs[x] - origin.x(), true);
+                column = clip_cell_polygon(column, 0, xs[x + 1] - origin.x(), false);
+                if (column.size() < 3)
+                    continue;
+                Eigen::Vector4d below = column_integrals(column, zs.front() - origin.z());
+                for (size_t z = 0; z < size[2] && zs[z] < upper.z(); ++z) {
+                    if (++work > maximum_work)
+                        return fail("Dense-region integration exceeds the face/cell work limit (8388608 operations); simplify the analysis mesh.");
+                    if ((work & 1023) == 0 && cancelled())
+                        return fail("Dense-region profile preparation was cancelled.");
+                    const Eigen::Vector4d above = column_integrals(column, zs[z + 1] - origin.z());
+                    integrals[x + size[0] * (y + size[1] * z)].add(orientation * (below - above));
+                    below = above;
+                }
+            }
+        }
+    }
+
+    const auto coordinate = [&](size_t vertex, size_t axis) { return double(mesh.vertices[vertex][axis]); };
+    using StressTree = KDTreeIndirect<3, double, decltype(coordinate)>;
+    std::vector<StressTree> stress_trees;
+    stress_trees.reserve(components.size());
+    for (auto &vertices : component_vertices)
+        stress_trees.emplace_back(coordinate, std::move(vertices));
+    const auto surface_tree = AABBTreeIndirect::build_aabb_tree_over_indexed_triangle_set(mesh.vertices, mesh.indices);
+    for (size_t id = 0; id < cell_count; ++id) {
+        if ((id & 255) == 0 && cancelled())
+            return fail("Dense-region profile preparation was cancelled.");
+        const double volume = integrals[id].value[0];
+        Vec3d lower, upper;
+        dense_cell_bounds(profile, id, lower, upper);
+        const double box_volume = (upper - lower).prod();
+        const double tolerance = std::max(box_volume * 1e-9, std::abs(signed_volume) * 1e-13);
+        if (!std::isfinite(volume) || volume < -tolerance || volume > box_volume + tolerance)
+            return fail("Integrated cells contain negative or overlapping solid volume; repair the analysis mesh.");
+        if (volume <= tolerance)
+            continue;
+        const Vec3d centroid = (origin + integrals[id].value.tail<3>() / volume).cwiseMax(lower).cwiseMin(upper);
+        size_t closest_face = 0;
+        Vec3d surface_point;
+        AABBTreeIndirect::squared_distance_to_indexed_triangle_set(
+            mesh.vertices, mesh.indices, surface_tree, centroid, closest_face, surface_point);
+        // Restrict interpolation to the nearest boundary's connected shell. A close but
+        // disconnected body must never contribute its (possibly very different) solved stress.
+        const StressTree &tree = stress_trees[face_component[closest_face]];
+        const auto nearby = find_closest_points<8>(tree, centroid);
+        double weighted_stress = 0.0, weights = 0.0;
+        for (size_t vertex : nearby) {
+            if (vertex == StressTree::npos)
+                continue;
+            const double distance_squared = (mesh.vertices[vertex].cast<double>() - centroid).squaredNorm();
+            const double weight = 1.0 / std::max(distance_squared, 1e-12);
+            weighted_stress += weight * result.vertices[vertex].von_mises_pa;
+            weights += weight;
+        }
+        if (!(weights > 0.0))
+            return fail("Could not interpolate the solved stress inside the model.");
+        profile.cells.push_back({id, std::min(volume, box_volume), weighted_stress / weights});
+    }
+    if (cancelled())
+        return fail("Dense-region profile preparation was cancelled.");
+    std::sort(profile.cells.begin(), profile.cells.end(), [](const DenseRegionCell &lhs, const DenseRegionCell &rhs) {
+        return lhs.stress_pa != rhs.stress_pa ? lhs.stress_pa > rhs.stress_pa : lhs.grid_index < rhs.grid_index;
+    });
+    double cumulative_volume = 0.0, correction = 0.0;
+    for (const DenseRegionCell &cell : profile.cells) {
+        const double corrected = cell.volume_mm3 - correction;
+        const double next = cumulative_volume + corrected;
+        correction = (next - cumulative_volume) - corrected;
+        cumulative_volume = next;
+        profile.cumulative_volume_mm3.push_back(cumulative_volume);
+    }
+    if (!(cumulative_volume > 0.0) || std::abs(cumulative_volume - std::abs(signed_volume)) > 0.001 * std::abs(signed_volume))
+        return fail("Integrated cells disagree with the enclosed mesh volume by more than 0.1%; repair the analysis mesh.");
+    profile.vertex_count = mesh.vertices.size();
+    profile.triangle_count = mesh.indices.size();
+    profile.hotspot_center_mm = mesh.vertices[profile.hotspot_vertex].cast<double>();
+    profile.sampled_volume_mm3 = cumulative_volume;
+    profile.solid_volume_m3 = cumulative_volume * MM3_TO_M3;
+    profile.mesh_result_fingerprint = dense_profile_fingerprint(mesh, result);
+    if (cancelled())
+        return fail("Dense-region profile preparation was cancelled.");
+    profile.available = true;
+    return profile;
+}
+
+DenseRegionPreview preview_dense_region(const indexed_triangle_set &mesh, const Setup &setup,
+                                        const Result &result, double target_volume_fraction,
+                                        const DenseRegionPreviewProfile *prepared_profile, bool generate_modifier_mesh,
+                                        double minimum_stress_fraction)
+{
+    DenseRegionPreview preview;
+    if (!std::isfinite(target_volume_fraction)) {
+        preview.warning = "The strengthened-volume target must be finite.";
+        return preview;
+    }
+    if (!std::isfinite(minimum_stress_fraction) || minimum_stress_fraction < 0.0 || minimum_stress_fraction > 1.0) {
+        preview.warning = "The relative stress cutoff must be within [0, 1].";
+        return preview;
+    }
+    preview.target_volume_fraction = std::clamp(target_volume_fraction, 0.0, 1.0);
+    preview.estimated_total_mass_kg = std::max(0.0, result.estimated_mass_kg);
+    preview.predicted_minimum_safety_factor = result.minimum_safety_factor;
+    preview.predicted_maximum_displacement_mm = std::max(0.0, result.maximum_displacement_m * 1000.0);
+
+    DenseRegionPreviewProfile local_profile;
+    if (prepared_profile == nullptr) {
+        local_profile = build_dense_region_preview_profile(mesh, result);
+        prepared_profile = &local_profile;
+    }
+    const DenseRegionPreviewProfile &profile = *prepared_profile;
+    if (!profile.available) {
+        preview.warning = profile.warning;
+        return preview;
+    }
+    if (!result.succeeded() || profile.vertex_count != mesh.vertices.size() ||
+        profile.triangle_count != mesh.indices.size() || result.vertices.size() != mesh.vertices.size() ||
+        profile.cells.empty() || profile.cells.size() != profile.cumulative_volume_mm3.size() ||
+        profile.mesh_result_fingerprint != dense_profile_fingerprint(mesh, result)) {
+        preview.warning = "The dense-region profile is stale; rebuild it for the current mesh and solved stress field.";
+        return preview;
+    }
+    size_t preserve_work = 0;
+    for (const SphericalRegion &preserve : setup.preserve_regions) {
+        if (!valid_region_extent(preserve) || !preserve.center_mm.allFinite() ||
+            (preserve.shape == RegionShape::Surface && std::any_of(preserve.surface_triangles.begin(),
+                preserve.surface_triangles.end(), [&](size_t face) { return face >= mesh.indices.size(); }))) {
+            preview.warning = "A preserve region is invalid; correct it before creating reinforcement.";
+            return preview;
+        }
+        const size_t cost = preserve.shape == RegionShape::Surface ? preserve.surface_triangles.size() : 1;
+        if (cost > (8 * 1024 * 1024 - preserve_work) / profile.cells.size()) {
+            preview.warning = "Dense-region preserve exclusion exceeds the cell/region work limit (8388608 checks); simplify the preserved selection.";
+            return preview;
+        }
+        preserve_work += cost * profile.cells.size();
+    }
+    const auto size = dense_grid_size(profile);
+    std::vector<unsigned char> selected(size[0] * size[1] * size[2], 0);
+    double included_volume_mm3 = 0.0, included_demand = 0.0, total_demand = 0.0;
+    const double target_volume = preview.target_volume_fraction * profile.sampled_volume_mm3;
+    const double epsilon = std::max(1e-7, bounding_box(mesh).size().cast<double>().norm() * 1e-9);
+    Vec3d summary_min = Vec3d::Constant(std::numeric_limits<double>::infinity()), summary_max = -summary_min;
+    bool skipped_preserve = false, skipped_threshold = false;
+    for (const DenseRegionCell &cell : profile.cells) {
+        total_demand += cell.volume_mm3 * cell.stress_pa;
+        if (preview.target_volume_fraction <= 0.0 ||
+            (preview.target_volume_fraction < 1.0 && included_volume_mm3 >= target_volume))
+            continue;
+        if (cell.stress_pa < minimum_stress_fraction * profile.hotspot_stress_pa) {
+            skipped_threshold = true;
+            continue;
+        }
+        Vec3d lower, upper;
+        dense_cell_bounds(profile, cell.grid_index, lower, upper);
+        if (std::any_of(setup.preserve_regions.begin(), setup.preserve_regions.end(), [&](const SphericalRegion &preserve) {
+                return cell_intersects_preserve(mesh, preserve, lower, upper, epsilon);
+            })) {
+            skipped_preserve = true;
+            continue;
+        }
+        selected[cell.grid_index] = 1;
+        ++preview.selected_cell_count;
+        included_volume_mm3 += cell.volume_mm3;
+        included_demand += cell.volume_mm3 * cell.stress_pa;
+        preview.equivalent_stress_threshold = std::clamp(cell.stress_pa / profile.hotspot_stress_pa, 0.0, 1.0);
+        summary_min = summary_min.cwiseMin(lower);
+        summary_max = summary_max.cwiseMax(upper);
+    }
+    preview.available = true;
+    preview.region.shape = RegionShape::Box;
+    preview.region.radius_mm = 0.0;
+    preview.region.size_mm.setZero();
+    if (preview.selected_cell_count > 0) {
+        preview.region.center_mm = 0.5 * (summary_min + summary_max);
+        preview.region.size_mm = summary_max - summary_min;
+        preview.region.radius_mm = 0.5 * preview.region.size_mm.norm();
+        if (generate_modifier_mesh)
+            preview.modifier_mesh = dense_boundary_mesh(profile, selected);
+    }
+    // A selected boundary vertex can belong to either side of a grid plane. Check all adjacent
+    // cells, never assign response benefit merely because it lies inside the diagnostic bounds.
+    for (size_t vertex = 0; vertex < mesh.vertices.size(); ++vertex) {
+        std::array<std::vector<size_t>, 3> adjacent;
+        for (int axis = 0; axis < 3; ++axis) {
+            const auto &planes = profile.grid_planes_mm[axis];
+            const double value = double(mesh.vertices[vertex][axis]);
+            const auto position = std::lower_bound(planes.begin(), planes.end(), value);
+            const size_t index = size_t(position - planes.begin());
+            if (index > 0)
+                adjacent[axis].push_back(index - 1);
+            if (position != planes.end() && std::abs(*position - value) <= epsilon && index < size[axis])
+                adjacent[axis].push_back(index);
+        }
+        bool affected = false;
+        for (size_t z : adjacent[2])
+            for (size_t y : adjacent[1])
+                for (size_t x : adjacent[0])
+                    affected = affected || selected[x + size[0] * (y + size[1] * z)];
+        if (affected)
+            preview.affected_vertices.push_back(vertex);
+    }
+    preview.estimated_volume_fraction = std::clamp(included_volume_mm3 / profile.sampled_volume_mm3, 0.0, 1.0);
+    preview.estimated_volume_m3 = included_volume_mm3 * MM3_TO_M3;
+    preview.stress_coverage = total_demand > 0.0 ? std::clamp(included_demand / total_demand, 0.0, 1.0) : 0.0;
+    if (skipped_preserve)
+        preview.warning = included_volume_mm3 + 1e-9 < target_volume ?
+            "Preserved features and their intersecting grid cells limit the attainable reinforced volume." :
+            "Cells intersecting preserved features were excluded from reinforcement.";
+    if (skipped_threshold) {
+        if (!preview.warning.empty())
+            preview.warning += " ";
+        preview.warning += "Cells below the requested stress threshold were excluded from reinforcement.";
+    }
+
+    const double background_fraction = effective_solid_fraction(setup.infill.background_density);
+    const double dense_fraction = effective_solid_fraction(setup.infill.dense_density);
+    const PatternFactors background_pattern = pattern_factors(setup.infill.background_pattern);
+    const PatternFactors dense_pattern = pattern_factors(setup.infill.dense_pattern);
+    const double density_ratio = dense_fraction / std::max(background_fraction, NUMERIC_EPSILON);
+    preview.local_strength_multiplier = density_ratio * dense_pattern.strength /
+        std::max(background_pattern.strength, NUMERIC_EPSILON);
+    preview.local_stiffness_multiplier = density_ratio * dense_pattern.stiffness /
+        std::max(background_pattern.stiffness, NUMERIC_EPSILON);
+    const Material material = setup.material.calibrated();
+    preview.estimated_added_mass_kg = std::max(0.0, preview.estimated_volume_m3 * material.density_kg_m3 *
+                                                       (dense_fraction - background_fraction));
+    preview.estimated_total_mass_kg = std::max(0.0, result.estimated_mass_kg) + preview.estimated_added_mass_kg;
+
+    std::vector<unsigned char> strengthened(mesh.vertices.size(), 0);
+    for (size_t vertex : preview.affected_vertices)
+        strengthened[vertex] = 1;
+    double predicted_safety_factor = std::numeric_limits<double>::infinity();
+    double predicted_displacement_mm = 0.0;
+    for (size_t vertex = 0; vertex < result.vertices.size(); ++vertex) {
+        const VertexResult &value = result.vertices[vertex];
+        const double strength_multiplier = strengthened[vertex] ? preview.local_strength_multiplier : 1.0;
+        const double stiffness_multiplier = strengthened[vertex] ? preview.local_stiffness_multiplier : 1.0;
+        if (std::isfinite(value.safety_factor))
+            predicted_safety_factor = std::min(predicted_safety_factor,
+                                               value.safety_factor * strength_multiplier);
+        if (value.displacement_m.allFinite())
+            predicted_displacement_mm = std::max(predicted_displacement_mm,
+                value.displacement_m.norm() * 1000.0 / stiffness_multiplier);
+    }
+    preview.predicted_minimum_safety_factor = predicted_safety_factor;
+    preview.predicted_maximum_displacement_mm = predicted_displacement_mm;
+    if (setup.gravity.enabled && preview.estimated_added_mass_kg > NUMERIC_EPSILON) {
+        preview.response_estimate_available = false;
+        preview.predicted_minimum_safety_factor = std::numeric_limits<double>::quiet_NaN();
+        preview.predicted_maximum_displacement_mm = std::numeric_limits<double>::quiet_NaN();
+        if (!preview.warning.empty())
+            preview.warning += " ";
+        preview.warning += "Safety factor and deformation require re-solving with the changed self-weight; only region sizing and mass are estimated.";
+    }
+    return preview;
 }
 
 std::string serialize_setup(const Setup &setup)

@@ -2,6 +2,12 @@
 
 Audit date: 2026-09-06. This is a progress record, **not a release sign-off**. The Todoist project has 21 completed items and no open items, but that administrative state does not prove all requested functionality is finished.
 
+## Follow-up: 2026-09-07
+
+- Pre-check now recalculates readiness when the selected object or accepted setup changes, without requiring a button click. Invalid numeric text is tracked separately from the last accepted setup, so it cannot leave the button or study tree showing READY. Undo/Redo and restored setups reset that input state.
+- The arm64 Release app rebuilt successfully after this change. The focused strength suite passed again: 28 cases, 113,551 assertions. These core tests exercise validation, not native widget events; interactive readiness checks remain open.
+- Independent source review found that Prepare instance orientation is **not yet synchronized by default**: the study loader reads the raw object mesh and stored layer axis, without tracking selected-instance transforms. Existing alignment tests cover applying a recommendation, not this missing synchronization. Switching or transforming instances must invalidate results; scaled-instance geometry/load/modifier coordinate handling also remains open. Do not treat the orientation audit row below as completion evidence for this requirement.
+
 ## Verified in this change
 
 - macOS arm64 Release application build succeeds.

@@ -1875,7 +1875,7 @@ void StrengthLoadPanel::build_ui()
         choice->Bind(wxEVT_CHOICE, edited_setup);
     for (wxCheckBox *checkbox : {m_load_active, m_load_whole_model})
         checkbox->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent &) {
-            save_current_load_editor();
+            collect_setup(false, false);
             persist_setup();
             mark_stale();
         });
@@ -1912,7 +1912,7 @@ void StrengthLoadPanel::load_selected_object()
         m_dense_button->Disable();
         m_orientation_button->Disable();
         m_settings_button->Disable();
-        set_precheck_state(0);
+        set_precheck_state(-1);
         if (m_session->object_index != -1) {
             m_session->object_index = -1;
             m_session->object_id = ObjectID();
@@ -2021,6 +2021,7 @@ void StrengthLoadPanel::load_selected_object()
     refresh_study_tree();
     if (new_object || changed_persisted_setup || changed_geometry)
         refresh_operation_panel();
+    refresh_precheck_state();
 }
 
 void StrengthLoadPanel::populate_material_fields()
@@ -2046,6 +2047,7 @@ void StrengthLoadPanel::populate_material_fields()
 
 void StrengthLoadPanel::populate_from_setup()
 {
+    m_numeric_inputs_valid = true;
     const SA::Setup &setup = m_session->setup;
     populate_material_fields();
     for (int axis = 0; axis < 3; ++axis)
@@ -2140,9 +2142,11 @@ bool StrengthLoadPanel::collect_setup(bool show_errors, bool validate_setup)
     numeric = read_number(m_objective_weights[2], setup.criteria.support_weight) && numeric;
     numeric = read_number(m_objective_weights[3], setup.criteria.print_time_weight) && numeric;
 
+    m_numeric_inputs_valid = numeric;
     const std::vector<std::string> errors = validate_setup ? SA::validate(m_session->mesh, setup) : std::vector<std::string>();
     if (!numeric || !errors.empty()) {
         m_session->setup = previous;
+        set_precheck_state(-1);
         if (show_errors) {
             wxString message = numeric ? wxString() : _L("One or more numeric fields are invalid.\n");
             for (const std::string &error : errors)
@@ -2153,6 +2157,8 @@ bool StrengthLoadPanel::collect_setup(bool show_errors, bool validate_setup)
     }
     if (SA::serialize_setup(setup) != previous_setup)
         mark_stale();
+    else
+        refresh_precheck_state();
     return true;
 }
 
@@ -2184,7 +2190,6 @@ void StrengthLoadPanel::mark_stale()
     // Keep accepted study edits in the project, including dialog edits made before the first
     // solve. Setup Undo/Redo owns the fine-grained history; avoid a main snapshot per keystroke.
     persist_setup(false);
-    set_precheck_state(0);
     m_session->stale = true;
     ++m_session->revision;
     m_dense_button->Disable();
@@ -2197,6 +2202,7 @@ void StrengthLoadPanel::mark_stale()
     if (m_setup_canvas != nullptr)
         m_setup_canvas->Refresh();
     refresh_study_tree();
+    refresh_precheck_state();
 }
 
 void StrengthLoadPanel::record_setup_history()
@@ -2408,8 +2414,9 @@ void StrengthLoadPanel::refresh_study_tree()
         m_session->mesh.empty() ? _L("Mesh — select a model") :
             wxString::Format(_L("Mesh — %zu triangles"), m_session->mesh.indices.size()));
     const std::vector<std::string> precheck_errors = SA::validate(m_session->mesh, m_session->setup);
-    m_study_tree->AppendItem(study, precheck_errors.empty() ? _L("Pre-check — READY") :
-        wxString::Format(_L("Pre-check — %zu issue(s)"), precheck_errors.size()));
+    const size_t precheck_issue_count = precheck_errors.size() + (m_numeric_inputs_valid ? 0 : 1);
+    m_study_tree->AppendItem(study, precheck_issue_count == 0 ? _L("Pre-check — READY") :
+        wxString::Format(_L("Pre-check — %zu issue(s)"), precheck_issue_count));
     const wxString result_state = m_session->result.status == SA::AnalysisStatus::NotRun ? _L("not solved") :
         wxString::FromUTF8(SA::to_string(m_session->result.status));
     m_study_tree->AppendItem(study,
@@ -3243,6 +3250,14 @@ bool StrengthLoadPanel::run_precheck(bool show_success)
         wxMessageBox(_L("Pre-check is ready. The study has a valid mesh, material, support, and applied load."),
                      _L("Strength study pre-check"), wxOK | wxICON_INFORMATION, this);
     return true;
+}
+
+void StrengthLoadPanel::refresh_precheck_state()
+{
+    // Use the same validation as Solve, without a dialog or any mutation of the study.
+    // A partially typed number must not leave the last accepted setup looking ready.
+    set_precheck_state(m_numeric_inputs_valid && !m_session->mesh.empty() &&
+        SA::validate(m_session->mesh, m_session->setup).empty() ? 1 : -1);
 }
 
 void StrengthLoadPanel::set_precheck_state(int state)

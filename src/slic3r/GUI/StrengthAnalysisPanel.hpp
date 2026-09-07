@@ -92,6 +92,7 @@ private:
     size_t m_setup_history_index{0};
     bool m_restoring_history{false};
     bool m_refreshing_tree{false};
+    bool m_numeric_inputs_valid{true};
 
     wxStaticText *m_object_label{nullptr};
     wxStaticText *m_status_label{nullptr};
@@ -168,6 +169,7 @@ private:
     void edit_criteria_dialog();
     void select_canvas_item(int kind, int index, bool edit);
     bool run_precheck(bool show_success);
+    void refresh_precheck_state();
     void set_precheck_state(int state);
     void run_analysis();
     void cancel_analysis();

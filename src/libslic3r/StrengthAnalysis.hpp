@@ -151,6 +151,9 @@ struct Setup {
     Material material;
     Vec3d print_layer_axis{Vec3d::UnitZ()};
     bool follow_prepare_orientation{true};
+    // Physical size of a raw-object coordinate unit along each object axis. Regions and
+    // result positions stay in raw coordinates; vectors/stresses use physical object axes.
+    Vec3d geometry_scale{Vec3d::Ones()};
     std::vector<Load> loads;
     GravityLoad gravity;
     std::vector<SphericalRegion> preserve_regions;
@@ -279,6 +282,7 @@ struct PrintSettingsCandidate {
 };
 
 struct Result {
+    Vec3d geometry_scale{Vec3d::Ones()};
     AnalysisStatus status{AnalysisStatus::NotRun};
     std::string message;
     std::vector<std::string> warnings;

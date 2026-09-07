@@ -5,6 +5,7 @@
 #include "libslic3r/Layer.hpp"
 #include "libslic3r/GCodeReader.hpp"
 #include "libslic3r/StrengthAnalysis.hpp"
+#include "libslic3r/TriangleMeshSlicer.hpp"
 
 #include "test_helpers.hpp"
 
@@ -28,8 +29,17 @@ TEST_CASE("Resizing and removing strength modifiers updates generated infill", "
     Model model;
     init_print({cube(20)}, print, model, config);
     ModelObject &object = *model.objects.front();
+    const int scale_case = GENERATE(0, 1, 2);
+    const Vec3d geometry_scale = scale_case == 0 ? Vec3d::Ones() :
+        (scale_case == 1 ? Vec3d(2.0, 2.0, 2.0) : Vec3d(2.0, 0.5, 1.5));
+    object.instances.front()->set_scaling_factor(geometry_scale);
+    object.invalidate_bounding_box();
+    object.ensure_on_bed();
+    CAPTURE(scale_case, geometry_scale.x(), geometry_scale.y(), geometry_scale.z());
+    const double physical_volume_mm3 = 8000.0 * geometry_scale.prod();
     const indexed_triangle_set mesh = object.raw_mesh().its;
     SA::Setup setup;
+    setup.geometry_scale = geometry_scale;
     // Once a response has been solved, either orientation mode uses the same native
     // reinforcement/slicing path; changing the mode must not suppress its modifier.
     setup.follow_prepare_orientation = GENERATE(true, false);
@@ -38,6 +48,7 @@ TEST_CASE("Resizing and removing strength modifiers updates generated infill", "
     setup.infill.dense_pattern = SA::InfillPattern::Gyroid;
     setup.infill.dense_density = 0.65;
     SA::Result result;
+    result.geometry_scale = geometry_scale;
     result.status = SA::AnalysisStatus::Success;
     result.vertices.resize(mesh.vertices.size());
     for (size_t i = 0; i < result.vertices.size(); ++i) {
@@ -52,6 +63,22 @@ TEST_CASE("Resizing and removing strength modifiers updates generated infill", "
     const auto slice_infill = [&]() {
         print.apply(model, config);
         print.process();
+        const ModelObject &sliced_object = *model.objects.front();
+        if (scale_case == 2 && sliced_object.volumes.size() == 2) {
+            MeshSlicingParamsEx parameters;
+            parameters.trafo = sliced_object.instances.front()->get_matrix();
+            std::vector<float> planes;
+            for (const Layer *layer : print.objects().front()->layers())
+                planes.push_back(float(layer->slice_z));
+            const auto mask_slices = slice_mesh_ex(sliced_object.volumes.back()->mesh().its, planes, parameters);
+            double mask_volume = 0.0;
+            for (size_t layer = 0; layer < mask_slices.size(); ++layer)
+                for (const auto &polygon : mask_slices[layer])
+                    mask_volume += polygon.area() * SCALING_FACTOR * SCALING_FACTOR * print.objects().front()->layers()[layer]->height;
+            CHECK_THAT(mask_volume,
+                       Catch::Matchers::WithinAbs(std::abs(its_volume(sliced_object.volumes.back()->mesh().its)) *
+                           geometry_scale.prod(), physical_volume_mm3 * 0.02));
+        }
         SlicedInfill sliced;
         for (const Layer *layer : print.objects().front()->layers()) {
             for (const LayerRegion *region : layer->regions()) {
@@ -70,8 +97,29 @@ TEST_CASE("Resizing and removing strength modifiers updates generated infill", "
     const auto apply_preview = [&](double fraction) {
         const auto preview = SA::preview_dense_region(mesh, setup, result, fraction, &profile, true, 0.0);
         REQUIRE(preview.applicable());
+        CHECK_THAT(preview.estimated_volume_m3 * 1e9 / physical_volume_mm3,
+                   Catch::Matchers::WithinAbs(preview.estimated_volume_fraction, 1e-8));
         // Use the same native parameter volume, coordinates, and keys as the GUI apply action.
         REQUIRE_FALSE(preview.modifier_mesh.empty());
+        std::map<std::pair<int, int>, size_t> edge_counts;
+        double signed_volume = 0.0;
+        for (const auto &face : preview.modifier_mesh.indices) {
+            const Vec3d a = preview.modifier_mesh.vertices[face[0]].cast<double>();
+            const Vec3d b = preview.modifier_mesh.vertices[face[1]].cast<double>();
+            const Vec3d c = preview.modifier_mesh.vertices[face[2]].cast<double>();
+            signed_volume += a.dot(b.cross(c)) / 6.0;
+            for (int edge = 0; edge < 3; ++edge) {
+                int first = face[edge], second = face[(edge + 1) % 3];
+                if (first > second) std::swap(first, second);
+                ++edge_counts[{first, second}];
+            }
+        }
+        CHECK_THAT(std::abs(signed_volume) * geometry_scale.prod() / physical_volume_mm3,
+                   Catch::Matchers::WithinAbs(preview.estimated_volume_fraction, 1e-6));
+        const size_t nonmanifold_edges = std::count_if(edge_counts.begin(), edge_counts.end(),
+            [](const auto &edge) { return edge.second != 2; });
+        INFO("Mask fraction " << fraction);
+        CHECK(nonmanifold_edges == 0);
         auto *modifier = object.add_volume(TriangleMesh(preview.modifier_mesh), ModelVolumeType::PARAMETER_MODIFIER, false);
         modifier->set_transformation(Geometry::Transformation());
         modifier->config.set_key_value("sparse_infill_density", new ConfigOptionPercent(65.0));
@@ -92,16 +140,16 @@ TEST_CASE("Resizing and removing strength modifiers updates generated infill", "
     CHECK_THAT(baseline.dense_volume_mm3, Catch::Matchers::WithinAbs(0.0, 1e-8));
     apply_preview(0.15);
     const SlicedInfill small = slice_infill();
-    CHECK_THAT(small.dense_volume_mm3 / 8000.0, Catch::Matchers::WithinAbs(0.15, 0.02));
+    CHECK_THAT(small.dense_volume_mm3 / physical_volume_mm3, Catch::Matchers::WithinAbs(0.15, 0.02));
     CHECK(small.volume_mm3 > baseline.volume_mm3);
     apply_preview(0.50);
     const SlicedInfill large = slice_infill();
-    CHECK_THAT(large.dense_volume_mm3 / 8000.0, Catch::Matchers::WithinAbs(0.50, 0.02));
+    CHECK_THAT(large.dense_volume_mm3 / physical_volume_mm3, Catch::Matchers::WithinAbs(0.50, 0.02));
     CHECK(large.dense_volume_mm3 > small.dense_volume_mm3);
     CHECK(large.volume_mm3 > small.volume_mm3);
     apply_preview(1.0);
     const SlicedInfill full = slice_infill();
-    CHECK_THAT(full.dense_volume_mm3 / 8000.0, Catch::Matchers::WithinAbs(1.0, 0.02));
+    CHECK_THAT(full.dense_volume_mm3 / physical_volume_mm3, Catch::Matchers::WithinAbs(1.0, 0.02));
     CHECK(full.volume_mm3 > large.volume_mm3);
     const Model reinforced_snapshot = model;
     const auto part_transform = object.volumes.front()->get_transformation();

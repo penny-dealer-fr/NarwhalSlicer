@@ -2025,13 +2025,14 @@ void StrengthLoadPanel::load_selected_object()
         m_status_label->SetLabel(_L("Strength setup changed through the main Undo/Redo history; results require a new solve."));
     }
     if (changed_instance || new_object || changed_persisted_setup) {
+        m_session->setup.geometry_scale = instance_transform.linear().colwise().norm().transpose();
         if (m_session->setup.follow_prepare_orientation) {
             m_session->setup.print_layer_axis = SA::print_layer_axis_for_transform(instance_transform);
             for (int axis = 0; axis < 3; ++axis)
                 m_layer_axis[axis]->ChangeValue(number(m_session->setup.print_layer_axis[axis]));
-            if (stored_setup_readable)
-                persist_setup(false);
         }
+        if (stored_setup_readable)
+            persist_setup(false);
         m_session->stale = true;
         ++m_session->revision;
     }
@@ -2092,6 +2093,7 @@ void StrengthLoadPanel::populate_material_fields()
 void StrengthLoadPanel::populate_from_setup()
 {
     m_numeric_inputs_valid = true;
+    m_session->setup.geometry_scale = m_session->instance_transform.linear().colwise().norm().transpose();
     if (m_session->setup.follow_prepare_orientation)
         m_session->setup.print_layer_axis = SA::print_layer_axis_for_transform(m_session->instance_transform);
     const SA::Setup &setup = m_session->setup;
@@ -2134,6 +2136,7 @@ bool StrengthLoadPanel::collect_setup(bool show_errors, bool validate_setup)
     const std::string previous_setup = SA::serialize_setup(m_session->setup);
     bool numeric = save_current_load_editor();
     SA::Setup &setup = m_session->setup;
+    setup.geometry_scale = m_session->instance_transform.linear().colwise().norm().transpose();
     SA::Material &m = setup.material;
     const int selected_material = m_material_choice->GetSelection();
     if (selected_material >= 0 && size_t(selected_material) < SA::builtin_materials().size()) {
@@ -3645,7 +3648,7 @@ protected:
             points.reserve(m_session->result.vertices.size());
             for (size_t index = 0; index < m_session->result.vertices.size(); ++index) {
                 const SA::VertexResult &vertex = m_session->result.vertices[index];
-                const Vec3d offset = vertex.displacement_m *
+                const Vec3d offset = vertex.displacement_m.cwiseQuotient(m_session->result.geometry_scale) *
                     (1000.0 * m_deformation_scale * preview_load_multiplier() / preview_stiffness(index));
                 points.push_back(vertex.position_mm + (offset.allFinite() ? offset : Vec3d::Zero()));
             }
@@ -3684,7 +3687,7 @@ protected:
         size_t minimum_vertex = 0, maximum_vertex = 0;
         for (size_t index = 0; index < result.vertices.size(); ++index) {
             const SA::VertexResult &vertex = result.vertices[index];
-            const Vec3d offset = vertex.displacement_m *
+            const Vec3d offset = vertex.displacement_m.cwiseQuotient(result.geometry_scale) *
                 (1000.0 * m_deformation_scale * preview_load_multiplier() / preview_stiffness(index));
             deformed.push_back(vertex.position_mm + (offset.allFinite() ? offset : Vec3d::Zero()));
             m_projected.push_back(project(deformed.back(), camera));

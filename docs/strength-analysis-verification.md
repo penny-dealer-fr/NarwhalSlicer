@@ -12,10 +12,18 @@ Audit date: 2026-09-06. This is a progress record, **not a release sign-off**. T
 
 ## Verified in this change
 
+Latest checkpoint (2026-09-07): physical instance scaling now affects mechanical distances/areas, mass, gravity, layer-normal mapping, and physical-distance stress interpolation. Raw region selections and modifier coordinates remain attached to the original object. Regression checks compare nonuniform scaling with explicitly resized geometry, test uniform force/mass similarity, and round-trip a scaled instance and its setup through 3MF.
+
+The scaled slicing regression exposed an existing overlap-cache defect: removing the combined instance-and-volume XY translation could make a valid offset modifier appear outside its parent. The bounding-box transform now removes only shared instance placement. A second check found non-manifold voxel edge contacts; exact selected cells are now partitioned into closed box pieces for native slicing. The tests check closed edges, double-precision modifier volume, direct mesh slices, and actual generated dense infill at 15%, 50%, and 100% on unscaled, uniformly scaled, and nonuniformly scaled instances in both orientation modes.
+
+Final tests for this checkpoint: **344 core cases / 283,143 assertions**, **145 FFF cases / 8,011 assertions**, randomized order, passing; arm64 Release app build succeeds. Each test target was built separately and ad-hoc signed before execution: a failed unsigned-discovery step in a multi-target build can cancel another target before its new executable is linked. Earlier runs with stale executables or failing diagnostics were not accepted as final verification.
+
+Still open: native UI testing and matching the study viewport's displayed silhouette/handles to the scaled, rotated Prepare instance. The current viewport uses raw-object coordinates; deformation vectors are mapped back into that frame. The broader material-data and optimization-workflow gaps below also remain open.
+
 - macOS arm64 Release application build succeeds.
-- Full core suite: 331 cases, 171,626 assertions, randomized order, passing.
-- Focused strength suite: 28 cases, 113,551 assertions, passing.
-- Full FFF suite: 145 cases, 3,545 assertions, randomized order, passing.
+- Full core suite: 344 cases, 283,143 assertions, randomized order, passing.
+- Earlier focused strength checkpoint: 28 cases, 113,551 assertions, passing; the expanded strength cases are included in the full core run above.
+- Full FFF suite: 145 cases, 8,011 assertions, randomized order, passing.
 - The slicing regression creates the same native parameter-modifier mesh and settings used by the GUI. It checks 15%, 50%, and 100% selected model volume, increasing actual generated infill, replacement, removal, and restored/redo model states.
 - Geometry regressions cover separate stress concentrations, low-stress gaps, cavities, thin disconnected solids, sloped faces, tetrahedra, preserve shapes, cancellation, stale profiles, zero/full targets, and threshold-to-volume conversion.
 - Both standard 3MF and native Orca project 3MF round trips retain modifier type, ownership marker, density, and pattern. The Orca path also checks generated modifier volume.
@@ -65,4 +73,4 @@ The remaining interactive checklist is:
 - Apply, replace, remove, Undo/Redo, and save/reopen the modifier through the UI. Inspect actual generated infill in Preview and confirm existing user modifiers remain untouched.
 - Check instance scaling/rotation and multiple-object changes against the analysis coordinate frame; raw-mesh unit tests alone do not prove every transformed-instance workflow.
 
-The unrelated local `resources/Icon.icns` change is intentionally outside this feature's changes until its owner confirms whether to include it. It must not be discarded just to report a clean worktree.
+Separate branding/resource/build-file changes are now present in this checkout, beyond the previously noted `resources/Icon.icns` edit. They are intentionally outside this feature's changes and must not be discarded or committed as strength work just to report a clean worktree.

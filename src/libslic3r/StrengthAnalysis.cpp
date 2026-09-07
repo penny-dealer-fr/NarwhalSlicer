@@ -50,6 +50,8 @@ std::uint64_t dense_profile_fingerprint(const indexed_triangle_set &mesh, const 
     mix(result.vertices.size());
     mix(result.maximum_stress_vertex);
     mix(result.maximum_von_mises_pa);
+    for (int axis = 0; axis < 3; ++axis)
+        mix(result.geometry_scale[axis]);
     // Hash every candidate, since a different vertex can become the hotspot while the old
     // hotspot's position and stress remain unchanged. Do not quantize away small mesh edits.
     for (const VertexResult &vertex : result.vertices) {
@@ -753,6 +755,9 @@ std::string to_string(AnalysisStatus status)
 std::vector<std::string> validate(const indexed_triangle_set &mesh, const Setup &setup)
 {
     std::vector<std::string> errors = setup.material.validate();
+    if (!setup.geometry_scale.allFinite() || setup.geometry_scale.minCoeff() <= 0.0 ||
+        !std::isfinite(setup.geometry_scale.prod()) || setup.geometry_scale.prod() <= 0.0)
+        errors.emplace_back("Instance scale must be finite and positive on every axis.");
     if (mesh.vertices.empty() || mesh.indices.empty())
         errors.emplace_back("A non-empty triangle mesh is required.");
     if (mesh.vertices.size() > setup.solver.maximum_vertices)
@@ -1031,8 +1036,9 @@ std::vector<PrintSettingsCandidate> recommend_print_settings(double solid_volume
     return output;
 }
 
-Result analyze(const indexed_triangle_set &mesh, const Setup &setup, const CancelPredicate &cancel)
+Result analyze(const indexed_triangle_set &mesh, const Setup &input_setup, const CancelPredicate &cancel)
 {
+    Setup setup = input_setup;
     Result result;
     const std::vector<std::string> errors = validate(mesh, setup);
     if (!errors.empty()) {
@@ -1052,12 +1058,19 @@ Result analyze(const indexed_triangle_set &mesh, const Setup &setup, const Cance
         return result;
     }
 
+    result.geometry_scale = setup.geometry_scale;
+    // Keep region membership and vertex indices in the original frame. Only mechanical
+    // distances/areas and the plane normal are mapped into physical object-aligned axes.
+    const auto physical_vertex = [&](size_t index) -> Vec3d {
+        return mesh.vertices[index].cast<double>().cwiseProduct(setup.geometry_scale);
+    };
+    setup.print_layer_axis = normalized_or_zero(setup.print_layer_axis.cwiseQuotient(setup.geometry_scale));
     const Material material = setup.material.calibrated();
-    const double solid_volume_m3 = std::abs(its_volume(mesh)) * MM3_TO_M3;
+    const double solid_volume_m3 = std::abs(its_volume(mesh)) * MM3_TO_M3 * setup.geometry_scale.prod();
     const double solid_fraction = effective_solid_fraction(setup.infill.background_density);
     result.effective_volume_m3 = solid_volume_m3 * solid_fraction;
     result.estimated_mass_kg = result.effective_volume_m3 * material.density_kg_m3;
-    if (!(solid_volume_m3 > NUMERIC_EPSILON)) {
+    if (!std::isfinite(solid_volume_m3) || !(solid_volume_m3 > NUMERIC_EPSILON)) {
         result.status = AnalysisStatus::InvalidInput;
         result.message = "Mesh must enclose a positive volume for mass and gravity analysis.";
         return result;
@@ -1075,9 +1088,9 @@ Result analyze(const indexed_triangle_set &mesh, const Setup &setup, const Cance
             result.message = "Mesh contains an out-of-range triangle index.";
             return result;
         }
-        const Vec3d a = mesh.vertices[face.x()].cast<double>();
-        const Vec3d b = mesh.vertices[face.y()].cast<double>();
-        const Vec3d c = mesh.vertices[face.z()].cast<double>();
+        const Vec3d a = physical_vertex(size_t(face.x()));
+        const Vec3d b = physical_vertex(size_t(face.y()));
+        const Vec3d c = physical_vertex(size_t(face.z()));
         const double area_m2 = 0.5 * (b - a).cross(c - a).norm() * 1e-6;
         const std::array<int, 3> ids{face.x(), face.y(), face.z()};
         for (int e = 0; e < 3; ++e) {
@@ -1091,7 +1104,7 @@ Result analyze(const indexed_triangle_set &mesh, const Setup &setup, const Cance
     edges.reserve(edge_face_area.size());
     double total_edge_length_m = 0.0;
     for (const auto &[indices, face_area] : edge_face_area) {
-        const Vec3d delta_m = (mesh.vertices[indices.second] - mesh.vertices[indices.first]).cast<double>() * MM_TO_M;
+        const Vec3d delta_m = (physical_vertex(indices.second) - physical_vertex(indices.first)) * MM_TO_M;
         const double length_m = delta_m.norm();
         if (length_m <= NUMERIC_EPSILON) continue;
         total_edge_length_m += length_m;
@@ -1117,7 +1130,7 @@ Result analyze(const indexed_triangle_set &mesh, const Setup &setup, const Cance
             result.status = AnalysisStatus::Cancelled; result.message = "Analysis cancelled."; return result;
         }
         const Edge &edge = edges[edge_index];
-        const Vec3d delta = (mesh.vertices[edge.b] - mesh.vertices[edge.a]).cast<double>() * MM_TO_M;
+        const Vec3d delta = (physical_vertex(edge.b) - physical_vertex(edge.a)) * MM_TO_M;
         const Vec3d direction = delta / edge.length_m;
         const double elastic_modulus = anisotropic_mix(material.elastic_modulus_xy_pa, material.elastic_modulus_z_pa,
                                                         direction, setup.print_layer_axis) * infill_factor.stiffness;
@@ -1215,7 +1228,7 @@ Result analyze(const indexed_triangle_set &mesh, const Setup &setup, const Cance
                                      displacement[Eigen::Index(3 * vertex + 2)]);
     }
     for (const Edge &edge : edges) {
-        const Vec3d delta = (mesh.vertices[edge.b] - mesh.vertices[edge.a]).cast<double>() * MM_TO_M;
+        const Vec3d delta = (physical_vertex(edge.b) - physical_vertex(edge.a)) * MM_TO_M;
         const Vec3d direction = delta / edge.length_m;
         const Vec3d relative = result.vertices[edge.b].displacement_m - result.vertices[edge.a].displacement_m;
         const double strain = relative.dot(direction) / edge.length_m;
@@ -1340,7 +1353,12 @@ Result analyze(const indexed_triangle_set &mesh, const Setup &setup, const Cance
     const double finite_reference_sf = std::isfinite(result.minimum_safety_factor) ? result.minimum_safety_factor : 100.0;
     result.infill_comparisons = compare_infill_patterns(solid_volume_m3, setup, finite_reference_sf);
     result.mass_strength_curve = estimate_mass_strength_curve(solid_volume_m3, setup, finite_reference_sf);
-    result.orientation_recommendations = recommend_orientations(mesh, setup, finite_reference_sf);
+    indexed_triangle_set physical_mesh = mesh;
+    for (size_t vertex = 0; vertex < physical_mesh.vertices.size(); ++vertex)
+        physical_mesh.vertices[vertex] = physical_vertex(vertex).cast<float>();
+    result.orientation_recommendations = recommend_orientations(physical_mesh, setup, finite_reference_sf);
+    for (OrientationRecommendation &recommendation : result.orientation_recommendations)
+        recommendation.layer_axis = normalized_or_zero(recommendation.layer_axis.cwiseProduct(setup.geometry_scale));
     result.print_settings_candidates = recommend_print_settings(solid_volume_m3, setup, finite_reference_sf,
                                                                  result.maximum_displacement_m * 1000.0);
     return result;
@@ -1455,39 +1473,54 @@ indexed_triangle_set dense_boundary_mesh(const DenseRegionPreviewProfile &profil
 {
     indexed_triangle_set mesh;
     const auto size = dense_grid_size(profile);
-    const std::array<size_t, 3> stride{1, size[0], size[0] * size[1]};
-    const size_t vx = size[0] + 1, vy = size[1] + 1;
-    std::vector<int32_t> vertices(vx * vy * (size[2] + 1), -1);
-    const auto vertex_index = [&](const std::array<size_t, 3> &point) {
-        int32_t &index = vertices[point[0] + vx * (point[1] + vy * point[2])];
-        if (index < 0) {
-            index = int32_t(mesh.vertices.size());
-            mesh.vertices.emplace_back(float(profile.grid_planes_mm[0][point[0]]),
-                                       float(profile.grid_planes_mm[1][point[1]]),
-                                       float(profile.grid_planes_mm[2][point[2]]));
-        }
-        return index;
+    std::vector<unsigned char> remaining = selected;
+    const auto index = [&](size_t x, size_t y, size_t z) {
+        return x + size[0] * (y + size[1] * z);
     };
-    // Emit each exposed face once, with outward winding; face-adjacent cells share vertices.
-    for (size_t id = 0; id < selected.size(); ++id) {
-        if (!selected[id])
+    // Partition the exact selected cells into closed, non-overlapping boxes. Sharing a
+    // single vertex/edge across diagonally touching voxels creates non-manifold boundary
+    // meshes. Separate watertight pieces retain the same union without that ambiguity;
+    // native non-zero-winding slicing unions their coincident internal faces.
+    for (size_t id = 0; id < remaining.size(); ++id) {
+        if (!remaining[id])
             continue;
-        const auto coordinate = dense_cell_coordinates(id, size);
+        const auto first = dense_cell_coordinates(id, size);
+        auto end = first;
+        for (size_t &coordinate : end) ++coordinate;
+        while (end[0] < size[0] && remaining[index(end[0], first[1], first[2])])
+            ++end[0];
+        const auto full_row = [&](size_t y, size_t z) {
+            for (size_t x = first[0]; x < end[0]; ++x)
+                if (!remaining[index(x, y, z)]) return false;
+            return true;
+        };
+        while (end[1] < size[1] && full_row(end[1], first[2]))
+            ++end[1];
+        while (end[2] < size[2]) {
+            bool full_slab = true;
+            for (size_t y = first[1]; y < end[1] && full_slab; ++y)
+                full_slab = full_row(y, end[2]);
+            if (!full_slab) break;
+            ++end[2];
+        }
+        for (size_t z = first[2]; z < end[2]; ++z)
+            for (size_t y = first[1]; y < end[1]; ++y)
+                for (size_t x = first[0]; x < end[0]; ++x)
+                    remaining[index(x, y, z)] = 0;
+        const int32_t base = int32_t(mesh.vertices.size());
+        for (int corner = 0; corner < 8; ++corner)
+            mesh.vertices.emplace_back(
+                float(profile.grid_planes_mm[0][corner & 1 ? end[0] : first[0]]),
+                float(profile.grid_planes_mm[1][corner & 2 ? end[1] : first[1]]),
+                float(profile.grid_planes_mm[2][corner & 4 ? end[2] : first[2]]));
         for (int axis = 0; axis < 3; ++axis) {
             const int u = (axis + 1) % 3, v = (axis + 2) % 3;
             for (int side = 0; side < 2; ++side) {
-                if ((side == 0 && coordinate[axis] > 0 && selected[id - stride[axis]]) ||
-                    (side == 1 && coordinate[axis] + 1 < size[axis] && selected[id + stride[axis]]))
-                    continue;
-                auto point = coordinate;
-                point[axis] += size_t(side);
-                const int32_t a = vertex_index(point);
-                ++point[u];
-                const int32_t b = vertex_index(point);
-                ++point[v];
-                const int32_t c = vertex_index(point);
-                --point[u];
-                const int32_t d = vertex_index(point);
+                const int corner = side << axis;
+                const int32_t a = base + corner;
+                const int32_t b = base + (corner | (1 << u));
+                const int32_t c = base + (corner | (1 << u) | (1 << v));
+                const int32_t d = base + (corner | (1 << v));
                 if (side == 1) {
                     mesh.indices.emplace_back(a, b, c);
                     mesh.indices.emplace_back(a, c, d);
@@ -1517,6 +1550,9 @@ DenseRegionPreviewProfile build_dense_region_preview_profile(const indexed_trian
         return fail("Dense-region profile preparation was cancelled.");
     if (!result.succeeded())
         return fail("Run a successful strength analysis before building a dense-region profile.");
+    if (!result.geometry_scale.allFinite() || result.geometry_scale.minCoeff() <= 0.0 ||
+        !std::isfinite(result.geometry_scale.prod()) || result.geometry_scale.prod() <= 0.0)
+        return fail("The solved instance scale is invalid; solve again before building reinforcement.");
     if (mesh.vertices.empty() || mesh.indices.empty() || result.vertices.size() != mesh.vertices.size())
         return fail("The solved result does not match the preview mesh.");
     constexpr size_t maximum_cells = 262144;
@@ -1662,13 +1698,20 @@ DenseRegionPreviewProfile build_dense_region_preview_profile(const indexed_trian
         }
     }
 
-    const auto coordinate = [&](size_t vertex, size_t axis) { return double(mesh.vertices[vertex][axis]); };
+    std::vector<Vec3d> physical_vertices;
+    physical_vertices.reserve(mesh.vertices.size());
+    for (const Vec3f &vertex : mesh.vertices) {
+        physical_vertices.push_back(vertex.cast<double>().cwiseProduct(result.geometry_scale));
+        if (!physical_vertices.back().allFinite())
+            return fail("Scaled preview coordinates are not finite.");
+    }
+    const auto coordinate = [&](size_t vertex, size_t axis) { return physical_vertices[vertex][axis]; };
     using StressTree = KDTreeIndirect<3, double, decltype(coordinate)>;
     std::vector<StressTree> stress_trees;
     stress_trees.reserve(components.size());
     for (auto &vertices : component_vertices)
         stress_trees.emplace_back(coordinate, std::move(vertices));
-    const auto surface_tree = AABBTreeIndirect::build_aabb_tree_over_indexed_triangle_set(mesh.vertices, mesh.indices);
+    const auto surface_tree = AABBTreeIndirect::build_aabb_tree_over_indexed_triangle_set(physical_vertices, mesh.indices);
     for (size_t id = 0; id < cell_count; ++id) {
         if ((id & 255) == 0 && cancelled())
             return fail("Dense-region profile preparation was cancelled.");
@@ -1682,19 +1725,20 @@ DenseRegionPreviewProfile build_dense_region_preview_profile(const indexed_trian
         if (volume <= tolerance)
             continue;
         const Vec3d centroid = (origin + integrals[id].value.tail<3>() / volume).cwiseMax(lower).cwiseMin(upper);
+        const Vec3d physical_centroid = centroid.cwiseProduct(result.geometry_scale);
         size_t closest_face = 0;
         Vec3d surface_point;
         AABBTreeIndirect::squared_distance_to_indexed_triangle_set(
-            mesh.vertices, mesh.indices, surface_tree, centroid, closest_face, surface_point);
+            physical_vertices, mesh.indices, surface_tree, physical_centroid, closest_face, surface_point);
         // Restrict interpolation to the nearest boundary's connected shell. A close but
         // disconnected body must never contribute its (possibly very different) solved stress.
         const StressTree &tree = stress_trees[face_component[closest_face]];
-        const auto nearby = find_closest_points<8>(tree, centroid);
+        const auto nearby = find_closest_points<8>(tree, physical_centroid);
         double weighted_stress = 0.0, weights = 0.0;
         for (size_t vertex : nearby) {
             if (vertex == StressTree::npos)
                 continue;
-            const double distance_squared = (mesh.vertices[vertex].cast<double>() - centroid).squaredNorm();
+            const double distance_squared = (physical_vertices[vertex] - physical_centroid).squaredNorm();
             const double weight = 1.0 / std::max(distance_squared, 1e-12);
             weighted_stress += weight * result.vertices[vertex].von_mises_pa;
             weights += weight;
@@ -1745,6 +1789,11 @@ DenseRegionPreview preview_dense_region(const indexed_triangle_set &mesh, const 
         return preview;
     }
     preview.target_volume_fraction = std::clamp(target_volume_fraction, 0.0, 1.0);
+    if (!result.geometry_scale.allFinite() || result.geometry_scale.minCoeff() <= 0.0 ||
+        !std::isfinite(result.geometry_scale.prod()) || result.geometry_scale.prod() <= 0.0) {
+        preview.warning = "The solved instance scale is invalid; solve again before creating reinforcement.";
+        return preview;
+    }
     preview.estimated_total_mass_kg = std::max(0.0, result.estimated_mass_kg);
     preview.predicted_minimum_safety_factor = result.minimum_safety_factor;
     preview.predicted_maximum_displacement_mm = std::max(0.0, result.maximum_displacement_m * 1000.0);
@@ -1847,7 +1896,7 @@ DenseRegionPreview preview_dense_region(const indexed_triangle_set &mesh, const 
             preview.affected_vertices.push_back(vertex);
     }
     preview.estimated_volume_fraction = std::clamp(included_volume_mm3 / profile.sampled_volume_mm3, 0.0, 1.0);
-    preview.estimated_volume_m3 = included_volume_mm3 * MM3_TO_M3;
+    preview.estimated_volume_m3 = included_volume_mm3 * MM3_TO_M3 * result.geometry_scale.prod();
     preview.stress_coverage = total_demand > 0.0 ? std::clamp(included_demand / total_demand, 0.0, 1.0) : 0.0;
     if (skipped_preserve)
         preview.warning = included_volume_mm3 + 1e-9 < target_volume ?
@@ -1928,6 +1977,7 @@ std::string serialize_setup(const Setup &setup)
     };
     j["print_layer_axis"] = vec_to_array(setup.print_layer_axis);
     j["follow_prepare_orientation"] = setup.follow_prepare_orientation;
+    j["geometry_scale"] = vec_to_array(setup.geometry_scale);
     j["loads"] = nlohmann::json::array();
     for (const Load &load : setup.loads) {
         j["loads"].push_back({{"name", load.name}, {"type", to_string(load.type)}, {"active", load.active},
@@ -1991,6 +2041,7 @@ bool deserialize_setup(const std::string &json_text, Setup &setup, std::string *
         }
         if (j.contains("print_layer_axis")) parsed.print_layer_axis = array_to_vec(j["print_layer_axis"], parsed.print_layer_axis);
         parsed.follow_prepare_orientation = j.value("follow_prepare_orientation", true);
+        if (j.contains("geometry_scale")) parsed.geometry_scale = array_to_vec(j["geometry_scale"], parsed.geometry_scale);
         static const std::map<std::string, LoadType> load_types{{"fixed", LoadType::Fixed}, {"local_force", LoadType::LocalForce},
             {"directional_force", LoadType::DirectionalForce}, {"bearing_force", LoadType::BearingForce},
             {"impact_force", LoadType::ImpactForce}, {"global_force", LoadType::GlobalForce}};

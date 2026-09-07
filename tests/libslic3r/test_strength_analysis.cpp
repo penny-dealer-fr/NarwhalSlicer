@@ -340,6 +340,7 @@ TEST_CASE("Nonfinite transforms have no valid print layer axis", "[StrengthAnaly
 TEST_CASE("Strength setup travels with its model object through 3MF", "[StrengthAnalysis][3mf]")
 {
     Setup setup;
+    setup.geometry_scale = Vec3d(2.0, 0.5, 1.5);
     setup.follow_prepare_orientation = GENERATE(true, false);
     setup.material = *find_builtin_material("abs_generic");
     setup.gravity.enabled = true;
@@ -351,6 +352,7 @@ TEST_CASE("Strength setup travels with its model object through 3MF", "[Strength
     ModelObject *source_object = source.add_object();
     source_object->add_volume(TriangleMesh(its_make_cube(12.0, 8.0, 4.0)));
     source_object->add_instance();
+    source_object->instances.front()->set_scaling_factor(setup.geometry_scale);
     const std::string encoded = serialize_setup_for_config(setup);
     REQUIRE(encoded.rfind("sa1:", 0) == 0);
     source_object->config.set_key_value("strength_analysis_setup", new ConfigOptionString(encoded));
@@ -376,6 +378,10 @@ TEST_CASE("Strength setup travels with its model object through 3MF", "[Strength
     REQUIRE(deserialize_setup_from_config(option->value, decoded));
     CHECK(decoded.material.key == "abs_generic");
     CHECK(decoded.follow_prepare_orientation == setup.follow_prepare_orientation);
+    CHECK_THAT((decoded.geometry_scale - setup.geometry_scale).norm(), WithinAbs(0.0, 1e-12));
+    REQUIRE(restored.objects.front()->instances.size() == 1);
+    CHECK_THAT((restored.objects.front()->instances.front()->get_scaling_factor() - setup.geometry_scale).norm(),
+               WithinAbs(0.0, 1e-6));
     CHECK(decoded.gravity.enabled);
     REQUIRE(decoded.loads.size() == 1);
     CHECK(decoded.loads.front().type == LoadType::Fixed);
@@ -504,6 +510,269 @@ TEST_CASE("Loads retain their requested resultant and gravity scales with densit
     REQUIRE(heavy.succeeded());
     CHECK_THAT(heavy.estimated_mass_kg, WithinRel(light.estimated_mass_kg * 2.0, 1e-10));
     CHECK_THAT(heavy.requested_resultant_force_n.z(), WithinRel(light.requested_resultant_force_n.z() * 2.0, 1e-10));
+}
+
+TEST_CASE("Uniform geometry scaling preserves raw supports and follows fixed-force similarity", "[StrengthAnalysis]")
+{
+    const indexed_triangle_set mesh = its_make_cube(20.0, 20.0, 20.0);
+    Setup setup = cube_setup(mesh);
+    setup.gravity.enabled = false;
+    setup.geometry_scale = Vec3d::Ones();
+    const auto supports = vertices_in_region(mesh, setup.loads.front().region, false);
+    REQUIRE(supports.size() == 4);
+    const Result baseline = analyze(mesh, setup);
+    INFO(baseline.message);
+    REQUIRE(baseline.succeeded());
+    REQUIRE(baseline.maximum_von_mises_pa > 0.0);
+    REQUIRE(baseline.maximum_displacement_m > 0.0);
+
+    setup.geometry_scale = Vec3d::Constant(2.0);
+    const Result scaled = analyze(mesh, setup);
+    INFO(scaled.message);
+    REQUIRE(scaled.succeeded());
+    CHECK(vertices_in_region(mesh, setup.loads.front().region, false) == supports);
+    CHECK_THAT((baseline.geometry_scale - Vec3d::Ones()).norm(), WithinAbs(0.0, 1e-12));
+    CHECK_THAT((scaled.geometry_scale - setup.geometry_scale).norm(), WithinAbs(0.0, 1e-12));
+    CHECK_THAT(scaled.effective_volume_m3, WithinRel(baseline.effective_volume_m3 * 8.0, 1e-10));
+    CHECK_THAT(scaled.estimated_mass_kg, WithinRel(baseline.estimated_mass_kg * 8.0, 1e-10));
+    CHECK_THAT((scaled.requested_resultant_force_n - baseline.requested_resultant_force_n).norm(), WithinAbs(0.0, 1e-10));
+    CHECK_THAT(scaled.maximum_von_mises_pa, WithinRel(baseline.maximum_von_mises_pa / 4.0, 1e-6));
+    CHECK_THAT(scaled.maximum_displacement_m, WithinRel(baseline.maximum_displacement_m / 2.0, 1e-6));
+    REQUIRE(scaled.vertices.size() == mesh.vertices.size());
+    REQUIRE(baseline.vertices.size() == mesh.vertices.size());
+    for (size_t vertex = 0; vertex < mesh.vertices.size(); ++vertex) {
+        CAPTURE(vertex);
+        CHECK_THAT((scaled.vertices[vertex].position_mm - mesh.vertices[vertex].cast<double>()).norm(), WithinAbs(0.0, 1e-12));
+        CHECK_THAT((scaled.vertices[vertex].displacement_m - baseline.vertices[vertex].displacement_m / 2.0).norm(),
+                   WithinAbs(0.0, baseline.maximum_displacement_m * 1e-6));
+    }
+    // Fixed supports use a finite 1e10 stiffness penalty, not exact DOF elimination.
+    // Check negligible relative motion, in addition to the per-vertex similarity above.
+    for (size_t vertex : supports)
+        CHECK(scaled.vertices[vertex].displacement_m.norm() < scaled.maximum_displacement_m * 1e-7);
+}
+
+TEST_CASE("Nonuniform geometry scaling matches physical mesh coordinates and transformed layer normals", "[StrengthAnalysis]")
+{
+    const indexed_triangle_set mesh = its_make_cube(20.0, 12.0, 8.0);
+    Setup setup = cube_setup(mesh);
+    setup.geometry_scale = Vec3d(2.0, 0.5, 3.0);
+    setup.print_layer_axis = Vec3d(1.0, 2.0, 3.0).normalized();
+    setup.gravity.enabled = GENERATE(false, true);
+    setup.gravity.acceleration_m_s2 = Vec3d(2.0, -3.0, -9.0);
+    setup.loads.front().region.shape = RegionShape::Box;
+    setup.loads.front().region.size_mm = Vec3d(0.1, 13.0, 9.0);
+    setup.loads.back().direction = Vec3d(2.0, -1.0, 3.0);
+    setup.loads.back().region.shape = RegionShape::Surface;
+    for (size_t triangle = 0; triangle < mesh.indices.size(); ++triangle) {
+        bool right_face = true;
+        for (int corner = 0; corner < 3; ++corner)
+            right_face = right_face && std::abs(mesh.vertices[mesh.indices[triangle][corner]].x() - 20.0f) < 1e-6f;
+        if (right_face)
+            setup.loads.back().region.surface_triangles.push_back(triangle);
+    }
+    REQUIRE(setup.loads.back().region.surface_triangles.size() == 2);
+
+    indexed_triangle_set physical_mesh = mesh;
+    for (Vec3f &vertex : physical_mesh.vertices)
+        vertex = vertex.cast<double>().cwiseProduct(setup.geometry_scale).cast<float>().eval();
+    Setup physical_setup = setup;
+    physical_setup.geometry_scale = Vec3d::Ones();
+    physical_setup.print_layer_axis = setup.print_layer_axis.cwiseQuotient(setup.geometry_scale).normalized();
+    for (Load &load : physical_setup.loads) {
+        load.region.center_mm = load.region.center_mm.cwiseProduct(setup.geometry_scale).eval();
+        load.region.size_mm = load.region.size_mm.cwiseProduct(setup.geometry_scale).eval();
+    }
+    for (size_t load = 0; load < setup.loads.size(); ++load) {
+        const auto selected = vertices_in_region(mesh, setup.loads[load].region, false);
+        REQUIRE(selected.size() == 4);
+        CHECK(selected == vertices_in_region(physical_mesh, physical_setup.loads[load].region, false));
+    }
+
+    const Result scaled = analyze(mesh, setup);
+    const Result physical = analyze(physical_mesh, physical_setup);
+    INFO(scaled.message);
+    INFO(physical.message);
+    REQUIRE(scaled.succeeded());
+    REQUIRE(physical.succeeded());
+    REQUIRE(physical.maximum_displacement_m > 0.0);
+    REQUIRE(physical.maximum_von_mises_pa > 0.0);
+    CHECK_THAT((scaled.geometry_scale - setup.geometry_scale).norm(), WithinAbs(0.0, 1e-12));
+    CHECK_THAT(scaled.effective_volume_m3, WithinRel(physical.effective_volume_m3, 1e-10));
+    CHECK_THAT(scaled.estimated_mass_kg, WithinRel(physical.estimated_mass_kg, 1e-10));
+    Vec3d expected_force = setup.loads.back().direction.normalized() * setup.loads.back().magnitude_n;
+    if (setup.gravity.enabled)
+        expected_force += scaled.estimated_mass_kg * setup.gravity.acceleration_m_s2;
+    CHECK_THAT((scaled.requested_resultant_force_n - expected_force).norm(), WithinAbs(0.0, 1e-10));
+    CHECK_THAT((scaled.requested_resultant_force_n - physical.requested_resultant_force_n).norm(), WithinAbs(0.0, 1e-10));
+    CHECK_THAT(scaled.maximum_displacement_m, WithinRel(physical.maximum_displacement_m, 1e-6));
+    CHECK_THAT(scaled.maximum_von_mises_pa, WithinRel(physical.maximum_von_mises_pa, 1e-6));
+    CHECK_THAT(scaled.minimum_safety_factor, WithinRel(physical.minimum_safety_factor, 1e-6));
+    REQUIRE(scaled.vertices.size() == mesh.vertices.size());
+    REQUIRE(physical.vertices.size() == mesh.vertices.size());
+    for (size_t vertex = 0; vertex < mesh.vertices.size(); ++vertex) {
+        CAPTURE(vertex);
+        const VertexResult &actual = scaled.vertices[vertex];
+        const VertexResult &expected = physical.vertices[vertex];
+        CHECK_THAT((actual.position_mm - mesh.vertices[vertex].cast<double>()).norm(), WithinAbs(0.0, 1e-12));
+        CHECK_THAT((expected.position_mm - physical_mesh.vertices[vertex].cast<double>()).norm(), WithinAbs(0.0, 1e-12));
+        // Displacements already use physical meters; do not multiply or divide them by geometry_scale.
+        CHECK_THAT((actual.displacement_m - expected.displacement_m).norm(),
+                   WithinAbs(0.0, physical.maximum_displacement_m * 1e-6));
+        CHECK_THAT((actual.normal_stress_pa - expected.normal_stress_pa).norm(),
+                   WithinAbs(0.0, physical.maximum_von_mises_pa * 1e-6));
+        CHECK_THAT((actual.shear_stress_pa - expected.shear_stress_pa).norm(),
+                   WithinAbs(0.0, physical.maximum_von_mises_pa * 1e-6));
+    }
+}
+
+TEST_CASE("Uniform geometry scaling multiplies gravity mass and force by the volume factor", "[StrengthAnalysis]")
+{
+    const indexed_triangle_set mesh = its_make_cube(20.0, 20.0, 20.0);
+    Setup setup = cube_setup(mesh);
+    setup.loads.back().active = false;
+    setup.gravity.enabled = true;
+    setup.gravity.acceleration_m_s2 = Vec3d(1.0, -2.0, -9.0);
+    setup.geometry_scale = Vec3d::Ones();
+    const Result baseline = analyze(mesh, setup);
+    REQUIRE(baseline.succeeded());
+    REQUIRE(baseline.estimated_mass_kg > 0.0);
+    setup.geometry_scale = Vec3d::Constant(2.0);
+    const Result scaled = analyze(mesh, setup);
+    REQUIRE(scaled.succeeded());
+    CHECK_THAT(scaled.estimated_mass_kg, WithinRel(baseline.estimated_mass_kg * 8.0, 1e-10));
+    for (int axis = 0; axis < 3; ++axis) {
+        CAPTURE(axis);
+        CHECK_THAT(scaled.requested_resultant_force_n[axis], WithinRel(baseline.requested_resultant_force_n[axis] * 8.0, 1e-10));
+        CHECK_THAT(scaled.requested_resultant_force_n[axis],
+                   WithinRel(scaled.estimated_mass_kg * setup.gravity.acceleration_m_s2[axis], 1e-10));
+    }
+}
+
+TEST_CASE("Geometry scale rejects zero negative and nonfinite components", "[StrengthAnalysis]")
+{
+    const indexed_triangle_set mesh = its_make_cube(20.0, 20.0, 20.0);
+    Setup setup = cube_setup(mesh);
+    REQUIRE(validate(mesh, setup).empty());
+    const int axis = GENERATE(0, 1, 2);
+    const double invalid_scale = GENERATE(0.0, -1.0, std::numeric_limits<double>::infinity(),
+                                          -std::numeric_limits<double>::infinity(), std::numeric_limits<double>::quiet_NaN());
+    CAPTURE(axis, invalid_scale);
+    setup.geometry_scale[axis] = invalid_scale;
+    CHECK_FALSE(validate(mesh, setup).empty());
+    const Result result = analyze(mesh, setup);
+    CHECK(result.status == AnalysisStatus::InvalidInput);
+    CHECK_FALSE(result.message.empty());
+}
+
+TEST_CASE("Geometry scale survives JSON and defaults to ones for older setups", "[StrengthAnalysis]")
+{
+    Setup setup;
+    CHECK_THAT((setup.geometry_scale - Vec3d::Ones()).norm(), WithinAbs(0.0, 1e-12));
+    CHECK_THAT((Result{}.geometry_scale - Vec3d::Ones()).norm(), WithinAbs(0.0, 1e-12));
+    setup.geometry_scale = Vec3d(2.0, 0.5, 3.0);
+    auto json = nlohmann::json::parse(serialize_setup(setup));
+    REQUIRE(json.contains("geometry_scale"));
+    REQUIRE(json.at("geometry_scale").is_array());
+    REQUIRE(json.at("geometry_scale").size() == 3);
+    for (int axis = 0; axis < 3; ++axis)
+        CHECK_THAT(json.at("geometry_scale").at(axis).get<double>(), WithinRel(setup.geometry_scale[axis], 1e-12));
+    Setup decoded;
+    REQUIRE(deserialize_setup(json.dump(), decoded));
+    CHECK_THAT((decoded.geometry_scale - setup.geometry_scale).norm(), WithinAbs(0.0, 1e-12));
+    REQUIRE(deserialize_setup_from_config(serialize_setup_for_config(setup), decoded));
+    CHECK_THAT((decoded.geometry_scale - setup.geometry_scale).norm(), WithinAbs(0.0, 1e-12));
+
+    json.erase("geometry_scale");
+    // Decoding legacy data must reset a reused destination's previous nonunit scale.
+    REQUIRE(deserialize_setup(json.dump(), decoded));
+    CHECK_THAT((decoded.geometry_scale - Vec3d::Ones()).norm(), WithinAbs(0.0, 1e-12));
+}
+
+TEST_CASE("Dense-region preview scales physical volume and mass while retaining raw cells", "[StrengthAnalysis]")
+{
+    const indexed_triangle_set mesh = its_make_cube(20.0, 20.0, 20.0);
+    Setup setup;
+    setup.infill.background_density = 0.20;
+    setup.infill.dense_density = 0.65;
+    const Result baseline = synthetic_result(mesh);
+    Result scaled = baseline;
+    scaled.geometry_scale = Vec3d::Constant(2.0);
+    scaled.estimated_mass_kg *= 8.0;
+    // A subsequent setup change must not replace the scale recorded by the solved result.
+    setup.geometry_scale = Vec3d::Constant(3.0);
+    const auto baseline_profile = build_dense_region_preview_profile(mesh, baseline);
+    const auto scaled_profile = build_dense_region_preview_profile(mesh, scaled);
+    REQUIRE(baseline_profile.available);
+    REQUIRE(scaled_profile.available);
+    REQUIRE(scaled_profile.cells.size() == baseline_profile.cells.size());
+    for (size_t cell = 0; cell < baseline_profile.cells.size(); ++cell) {
+        CHECK(scaled_profile.cells[cell].grid_index == baseline_profile.cells[cell].grid_index);
+        CHECK_THAT(scaled_profile.cells[cell].volume_mm3, WithinRel(baseline_profile.cells[cell].volume_mm3, 1e-12));
+    }
+    const auto original = preview_dense_region(mesh, setup, baseline, 0.25, &baseline_profile);
+    const auto enlarged = preview_dense_region(mesh, setup, scaled, 0.25, &scaled_profile);
+    REQUIRE(original.applicable());
+    REQUIRE(enlarged.applicable());
+    REQUIRE(original.estimated_volume_m3 > 0.0);
+    REQUIRE(original.estimated_added_mass_kg > 0.0);
+    CHECK_THAT(original.estimated_volume_m3,
+               WithinRel(original.estimated_volume_fraction * std::abs(its_volume(mesh)) * 1e-9, 1e-6));
+    CHECK_THAT(enlarged.estimated_volume_m3, WithinRel(original.estimated_volume_m3 * 8.0, 1e-10));
+    CHECK_THAT(enlarged.estimated_added_mass_kg, WithinRel(original.estimated_added_mass_kg * 8.0, 1e-10));
+    CHECK_THAT(enlarged.estimated_total_mass_kg, WithinRel(original.estimated_total_mass_kg * 8.0, 1e-10));
+    CHECK_THAT(enlarged.estimated_volume_fraction, WithinRel(original.estimated_volume_fraction, 1e-12));
+    CHECK(enlarged.selected_cell_count == original.selected_cell_count);
+    CHECK(enlarged.affected_vertices == original.affected_vertices);
+    CHECK_THAT((enlarged.region.center_mm - original.region.center_mm).norm(), WithinAbs(0.0, 1e-12));
+    CHECK_THAT((enlarged.region.size_mm - original.region.size_mm).norm(), WithinAbs(0.0, 1e-12));
+    REQUIRE(enlarged.modifier_mesh.vertices.size() == original.modifier_mesh.vertices.size());
+    REQUIRE(enlarged.modifier_mesh.indices.size() == original.modifier_mesh.indices.size());
+    for (size_t vertex = 0; vertex < original.modifier_mesh.vertices.size(); ++vertex)
+        CHECK_THAT(double((enlarged.modifier_mesh.vertices[vertex] - original.modifier_mesh.vertices[vertex]).norm()),
+                   WithinAbs(0.0, 1e-12));
+    for (size_t triangle = 0; triangle < original.modifier_mesh.indices.size(); ++triangle)
+        CHECK((enlarged.modifier_mesh.indices[triangle] - original.modifier_mesh.indices[triangle]).squaredNorm() == 0);
+}
+
+TEST_CASE("Dense stress interpolation measures distance in physical scaled coordinates", "[StrengthAnalysis]")
+{
+    const auto mesh = its_make_cube(20.0, 20.0, 20.0);
+    Result result = synthetic_result(mesh);
+    result.geometry_scale = Vec3d(3.0, 0.5, 2.0);
+    const auto profile = build_dense_region_preview_profile(mesh, result);
+    REQUIRE(profile.available);
+    REQUIRE(mesh.vertices.size() == 8);
+    REQUIRE(profile.cells.size() > 2);
+    const size_t nx = profile.grid_planes_mm[0].size() - 1;
+    const size_t ny = profile.grid_planes_mm[1].size() - 1;
+    bool distinguishes_unscaled_distance = false;
+    for (size_t rank : {size_t(0), profile.cells.size() / 2, profile.cells.size() - 1}) {
+        const auto &cell = profile.cells[rank];
+        const std::array<size_t, 3> cell_index{cell.grid_index % nx, (cell.grid_index / nx) % ny, cell.grid_index / (nx * ny)};
+        Vec3d center;
+        for (int axis = 0; axis < 3; ++axis)
+            center[axis] = 0.5 * (profile.grid_planes_mm[axis][cell_index[axis]] +
+                                  profile.grid_planes_mm[axis][cell_index[axis] + 1]);
+        double total_weight = 0.0, weighted_stress = 0.0;
+        double unscaled_weights = 0.0, unscaled_stress = 0.0;
+        for (size_t vertex = 0; vertex < mesh.vertices.size(); ++vertex) {
+            const double distance_squared = (mesh.vertices[vertex].cast<double>() - center)
+                .cwiseProduct(result.geometry_scale).squaredNorm();
+            const double weight = 1.0 / std::max(distance_squared, 1e-12);
+            total_weight += weight;
+            weighted_stress += weight * result.vertices[vertex].von_mises_pa;
+            const double raw_weight = 1.0 / std::max((mesh.vertices[vertex].cast<double>() - center).squaredNorm(), 1e-12);
+            unscaled_weights += raw_weight;
+            unscaled_stress += raw_weight * result.vertices[vertex].von_mises_pa;
+        }
+        // The profile uses integrated cell centroids. Compare the analytic cube midpoint
+        // to one part per million and require a signal larger than that tolerance.
+        CHECK_THAT(cell.stress_pa, WithinRel(weighted_stress / total_weight, 1e-6));
+        distinguishes_unscaled_distance = distinguishes_unscaled_distance ||
+            std::abs(unscaled_stress / unscaled_weights - weighted_stress / total_weight) > cell.stress_pa * 1e-4;
+    }
+    CHECK(distinguishes_unscaled_distance);
 }
 
 TEST_CASE("Every supported force type produces its intended equivalent-static resultant", "[StrengthAnalysis]")

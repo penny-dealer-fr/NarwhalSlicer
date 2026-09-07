@@ -38,6 +38,9 @@ struct StrengthAnalysisSession
     std::string persisted_setup;
     ObjectID object_id;
     int object_index{-1};
+    ObjectID instance_id;
+    int instance_index{-1};
+    Transform3d instance_transform{Transform3d::Identity()};
     bool stale{true};
     uint64_t revision{0};
     uint64_t solved_revision{0};
@@ -101,6 +104,7 @@ private:
     std::vector<wxTextCtrl *> m_calibration_fields;
     wxTextCtrl *m_calibration_source{nullptr};
     wxTextCtrl *m_layer_axis[3]{};
+    wxCheckBox *m_follow_prepare_orientation{nullptr};
 
     wxListBox *m_load_list{nullptr};
     wxTextCtrl *m_load_name{nullptr};

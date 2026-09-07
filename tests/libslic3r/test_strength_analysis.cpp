@@ -1,5 +1,8 @@
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
+
+#include <nlohmann/json.hpp>
 
 #include "libslic3r/StrengthAnalysis.hpp"
 #include "libslic3r/Format/3mf.hpp"
@@ -232,9 +235,112 @@ TEST_CASE("Strength setup survives a versioned JSON round trip", "[StrengthAnaly
     CHECK(decoded.preserve_regions.front().center_mm.isApprox(Vec3d(1.0, 2.0, 3.0)));
 }
 
+TEST_CASE("Strength setup follows Prepare orientation by default and preserves the choice in JSON", "[StrengthAnalysis]")
+{
+    Setup setup;
+    REQUIRE(setup.follow_prepare_orientation);
+    const bool follow_prepare_orientation = GENERATE(true, false);
+    CAPTURE(follow_prepare_orientation);
+    setup.follow_prepare_orientation = follow_prepare_orientation;
+
+    const std::string encoded = serialize_setup(setup);
+    const auto json = nlohmann::json::parse(encoded);
+    REQUIRE(json.contains("follow_prepare_orientation"));
+    REQUIRE(json.at("follow_prepare_orientation").is_boolean());
+    CHECK(json.at("follow_prepare_orientation").get<bool>() == follow_prepare_orientation);
+
+    Setup decoded;
+    decoded.follow_prepare_orientation = !follow_prepare_orientation;
+    std::string error;
+    REQUIRE(deserialize_setup(encoded, decoded, &error));
+    CHECK(error.empty());
+    CHECK(decoded.follow_prepare_orientation == follow_prepare_orientation);
+}
+
+TEST_CASE("Older strength setup JSON follows Prepare orientation when the choice is missing", "[StrengthAnalysis]")
+{
+    Setup setup;
+    setup.follow_prepare_orientation = false;
+    setup.print_layer_axis = Vec3d::UnitY();
+    auto json = nlohmann::json::parse(serialize_setup(setup));
+    REQUIRE(json.erase("follow_prepare_orientation") == 1);
+
+    Setup decoded;
+    decoded.follow_prepare_orientation = false;
+    std::string error;
+    REQUIRE(deserialize_setup(json.dump(), decoded, &error));
+    CHECK(error.empty());
+    CHECK(decoded.follow_prepare_orientation);
+    CHECK_THAT((decoded.print_layer_axis - Vec3d::UnitY()).norm(), WithinAbs(0.0, 1e-12));
+}
+
+TEST_CASE("Print layer axes recover the world layer normal after rotation scaling and mirroring", "[StrengthAnalysis]")
+{
+    const double mirror = GENERATE(1.0, -1.0);
+    CAPTURE(mirror);
+    Transform3d transform = Transform3d::Identity();
+    transform.rotate(Eigen::AngleAxisd(0.71, Vec3d(1.0, 2.0, 3.0).normalized()));
+    transform.scale(Vec3d(2.0 * mirror, 0.5, 3.0));
+
+    const Vec3d axis = print_layer_axis_for_transform(transform);
+    REQUIRE(axis.allFinite());
+    REQUIRE_THAT(axis.norm(), WithinAbs(1.0, 1e-12));
+    // A plane normal maps to world coordinates by the inverse transpose,
+    // including under nonuniform scaling and a change of handedness.
+    const Vec3d world_normal = (transform.linear().inverse().transpose() * axis).normalized();
+    CHECK_THAT((world_normal - Vec3d::UnitZ()).norm(), WithinAbs(0.0, 1e-12));
+}
+
+TEST_CASE("Translation does not change the print layer axis", "[StrengthAnalysis]")
+{
+    Transform3d transform = Transform3d::Identity();
+    CHECK_THAT((print_layer_axis_for_transform(transform) - Vec3d::UnitZ()).norm(), WithinAbs(0.0, 1e-12));
+    transform.rotate(Eigen::AngleAxisd(0.71, Vec3d(1.0, 2.0, 3.0).normalized()));
+    transform.scale(Vec3d(-2.0, 0.5, 3.0));
+    const Vec3d untranslated_axis = print_layer_axis_for_transform(transform);
+    REQUIRE_THAT(untranslated_axis.norm(), WithinAbs(1.0, 1e-12));
+
+    transform.translation() = Vec3d(123.0, -456.0, 789.0);
+    CHECK_THAT((print_layer_axis_for_transform(transform) - untranslated_axis).norm(), WithinAbs(0.0, 1e-12));
+}
+
+TEST_CASE("Singular transforms have no valid print layer axis", "[StrengthAnalysis]")
+{
+    const int collapsed_axis = GENERATE(0, 1, 2, 3);
+    CAPTURE(collapsed_axis);
+    Transform3d transform = Transform3d::Identity();
+    if (collapsed_axis == 3)
+        transform.linear().setZero();
+    else
+        transform.linear()(collapsed_axis, collapsed_axis) = 0.0;
+
+    // Collapsing X or Y still leaves a nonzero transpose-times-Z vector,
+    // but the singular transform cannot define a valid plane normal.
+    const Vec3d axis = print_layer_axis_for_transform(transform);
+    REQUIRE(axis.allFinite());
+    CHECK_THAT(axis.norm(), WithinAbs(0.0, 0.0));
+}
+
+TEST_CASE("Nonfinite transforms have no valid print layer axis", "[StrengthAnalysis]")
+{
+    const double invalid = GENERATE(std::numeric_limits<double>::quiet_NaN(),
+                                   std::numeric_limits<double>::infinity(),
+                                   -std::numeric_limits<double>::infinity());
+    const int row = GENERATE(0, 1, 2, 3);
+    const int column = GENERATE(0, 1, 2, 3);
+    CAPTURE(invalid, row, column);
+    Transform3d transform = Transform3d::Identity();
+    transform.matrix()(row, column) = invalid;
+
+    const Vec3d axis = print_layer_axis_for_transform(transform);
+    REQUIRE(axis.allFinite());
+    CHECK_THAT(axis.norm(), WithinAbs(0.0, 0.0));
+}
+
 TEST_CASE("Strength setup travels with its model object through 3MF", "[StrengthAnalysis][3mf]")
 {
     Setup setup;
+    setup.follow_prepare_orientation = GENERATE(true, false);
     setup.material = *find_builtin_material("abs_generic");
     setup.gravity.enabled = true;
     Load fixed;
@@ -269,6 +375,7 @@ TEST_CASE("Strength setup travels with its model object through 3MF", "[Strength
     Setup decoded;
     REQUIRE(deserialize_setup_from_config(option->value, decoded));
     CHECK(decoded.material.key == "abs_generic");
+    CHECK(decoded.follow_prepare_orientation == setup.follow_prepare_orientation);
     CHECK(decoded.gravity.enabled);
     REQUIRE(decoded.loads.size() == 1);
     CHECK(decoded.loads.front().type == LoadType::Fixed);

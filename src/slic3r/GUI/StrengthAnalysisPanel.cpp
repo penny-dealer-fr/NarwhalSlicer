@@ -2,6 +2,7 @@
 
 #include "I18N.hpp"
 #include "Plater.hpp"
+#include "Selection.hpp"
 #include "Widgets/Button.hpp"
 
 #include "libslic3r/Geometry.hpp"
@@ -1632,6 +1633,19 @@ void StrengthLoadPanel::build_ui()
                    wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
     layer_row->Add(vector_editor(this, m_layer_axis, Vec3d::UnitZ()), 0);
     material->Add(layer_row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
+    m_follow_prepare_orientation = new wxCheckBox(this, wxID_ANY, _L("Follow selected instance orientation in Prepare"));
+    m_follow_prepare_orientation->SetValue(true);
+    material->Add(m_follow_prepare_orientation, 0, wxLEFT | wxRIGHT | wxBOTTOM, gap);
+    m_follow_prepare_orientation->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent &) {
+        m_session->setup.follow_prepare_orientation = m_follow_prepare_orientation->GetValue();
+        if (m_session->setup.follow_prepare_orientation)
+            m_session->setup.print_layer_axis = SA::print_layer_axis_for_transform(m_session->instance_transform);
+        for (int axis = 0; axis < 3; ++axis) {
+            m_layer_axis[axis]->ChangeValue(number(m_session->setup.print_layer_axis[axis]));
+            m_layer_axis[axis]->Enable(!m_session->setup.follow_prepare_orientation);
+        }
+        mark_stale();
+    });
     root->Add(material, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
 
     auto *loads = new wxStaticBoxSizer(wxVERTICAL, this, _L("Loads, constraints, and per-load safety factor"));
@@ -1904,8 +1918,18 @@ void StrengthLoadPanel::load_selected_object()
     int index = m_plater->get_selected_object_idx();
     if (index < 0 && m_plater->model().objects.size() == 1)
         index = 0;
+    int instance_index = m_plater->get_selection().get_instance_idx();
+    if (m_plater->get_selection().get_object_idx() != index)
+        instance_index = -1;
+    if (index >= 0 && size_t(index) < m_plater->model().objects.size()) {
+        const auto &instances = m_plater->model().objects[size_t(index)]->instances;
+        if (instances.size() == 1)
+            instance_index = 0;
+        if (instance_index < 0 || size_t(instance_index) >= instances.size())
+            index = -1;
+    }
     if (index < 0 || size_t(index) >= m_plater->model().objects.size()) {
-        m_object_label->SetLabel(_L("Select one model object in Prepare."));
+        m_object_label->SetLabel(_L("Select one model instance in Prepare."));
         m_run_button->Disable();
         m_precheck_button->Disable();
         m_remove_dense_button->Disable();
@@ -1916,6 +1940,8 @@ void StrengthLoadPanel::load_selected_object()
         if (m_session->object_index != -1) {
             m_session->object_index = -1;
             m_session->object_id = ObjectID();
+            m_session->instance_id = ObjectID();
+            m_session->instance_index = -1;
             m_session->mesh = {};
             m_session->result = {};
             m_session->solved_mesh = {};
@@ -1939,6 +1965,13 @@ void StrengthLoadPanel::load_selected_object()
 
     ModelObject *object = m_plater->model().objects[size_t(index)];
     const bool new_object = object->id() != m_session->object_id;
+    const ModelInstance *instance = object->instances[size_t(instance_index)];
+    const Transform3d instance_transform = instance->get_matrix();
+    const bool changed_instance = new_object || instance->id() != m_session->instance_id ||
+        !instance_transform.matrix().isApprox(m_session->instance_transform.matrix(), 1e-12);
+    m_session->instance_id = instance->id();
+    m_session->instance_index = instance_index;
+    m_session->instance_transform = instance_transform;
     const indexed_triangle_set current_mesh = object->raw_mesh().its;
     const bool changed_geometry = !new_object && !meshes_equal(current_mesh, m_session->mesh);
     m_session->object_index = index;
@@ -1990,6 +2023,17 @@ void StrengthLoadPanel::load_selected_object()
         m_setup_history_index = 0;
         update_setup_history_buttons();
         m_status_label->SetLabel(_L("Strength setup changed through the main Undo/Redo history; results require a new solve."));
+    }
+    if (changed_instance || new_object || changed_persisted_setup) {
+        if (m_session->setup.follow_prepare_orientation) {
+            m_session->setup.print_layer_axis = SA::print_layer_axis_for_transform(instance_transform);
+            for (int axis = 0; axis < 3; ++axis)
+                m_layer_axis[axis]->ChangeValue(number(m_session->setup.print_layer_axis[axis]));
+            if (stored_setup_readable)
+                persist_setup(false);
+        }
+        m_session->stale = true;
+        ++m_session->revision;
     }
     if (changed_geometry) {
         set_precheck_state(0);
@@ -2048,10 +2092,15 @@ void StrengthLoadPanel::populate_material_fields()
 void StrengthLoadPanel::populate_from_setup()
 {
     m_numeric_inputs_valid = true;
+    if (m_session->setup.follow_prepare_orientation)
+        m_session->setup.print_layer_axis = SA::print_layer_axis_for_transform(m_session->instance_transform);
     const SA::Setup &setup = m_session->setup;
     populate_material_fields();
-    for (int axis = 0; axis < 3; ++axis)
+    m_follow_prepare_orientation->SetValue(setup.follow_prepare_orientation);
+    for (int axis = 0; axis < 3; ++axis) {
         m_layer_axis[axis]->ChangeValue(number(setup.print_layer_axis[axis]));
+        m_layer_axis[axis]->Enable(!setup.follow_prepare_orientation);
+    }
     m_gravity_enabled->SetValue(setup.gravity.enabled);
     for (int axis = 0; axis < 3; ++axis)
         m_gravity[axis]->ChangeValue(number(setup.gravity.acceleration_m_s2[axis]));
@@ -2126,7 +2175,10 @@ bool StrengthLoadPanel::collect_setup(bool show_errors, bool validate_setup)
     m.calibration.strength_z_scale = scales[3];
     m.calibration.shear_scale = scales[4];
     m.calibration.source = m_calibration_source->GetValue().utf8_string();
-    numeric = read_vector_strict(m_layer_axis, setup.print_layer_axis) && numeric;
+    if (setup.follow_prepare_orientation)
+        setup.print_layer_axis = SA::print_layer_axis_for_transform(m_session->instance_transform);
+    else
+        numeric = read_vector_strict(m_layer_axis, setup.print_layer_axis) && numeric;
     setup.gravity.enabled = m_gravity_enabled->GetValue();
     numeric = read_vector_strict(m_gravity, setup.gravity.acceleration_m_s2) && numeric;
     setup.infill.background_pattern = SA::InfillPattern(std::max(0, m_background_pattern->GetSelection()));
@@ -2987,6 +3039,8 @@ void StrengthLoadPanel::edit_material_dialog()
     wxTextCtrl *layer_axis[3]{};
     add_labeled(calibration_grid, content, _L("Layer-normal axis"),
                 vector_editor(content, layer_axis, m_session->setup.print_layer_axis), 1);
+    for (wxTextCtrl *field : layer_axis)
+        field->Enable(!m_session->setup.follow_prepare_orientation);
     content_sizer->Add(calibration_grid, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
     content->SetSizer(content_sizer);
     root->Add(content, 1, wxEXPAND);
@@ -3505,7 +3559,8 @@ void StrengthLoadPanel::apply_recommended_orientation()
     const Vec3d layer_axis = m_session->result.orientation_recommendations.front().layer_axis;
     m_plater->take_snapshot("Apply strength-optimized orientation");
     ModelObject *object = m_plater->model().objects[size_t(index)];
-    for (ModelInstance *instance : object->instances) {
+    if (m_session->instance_index >= 0 && size_t(m_session->instance_index) < object->instances.size()) {
+        ModelInstance *instance = object->instances[size_t(m_session->instance_index)];
         // A layer axis is a plane normal. Transform it with the inverse transpose before
         // alignment, including any existing instance rotation, nonuniform scale, or mirror.
         const Vec3d world_layer_axis = instance->get_matrix().linear().inverse().transpose() * layer_axis;
@@ -3514,12 +3569,15 @@ void StrengthLoadPanel::apply_recommended_orientation()
         Matrix3d rotation;
         Geometry::rotation_from_two_vectors(world_layer_axis, Vec3d::UnitZ(), rotation_axis, angle, &rotation);
         instance->rotate(rotation);
+        m_session->instance_transform = instance->get_matrix();
     }
     object->invalidate_bounding_box();
     m_session->setup.print_layer_axis = layer_axis;
+    m_session->setup.follow_prepare_orientation = true;
     populate_from_setup();
     persist_setup(false);
     m_plater->changed_object(index);
+    load_selected_object();
     mark_stale();
     m_status_label->SetLabel(_L("Applied the best estimated print orientation. Rerun to validate the rotated part."));
 }

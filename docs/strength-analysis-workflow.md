@@ -4,10 +4,10 @@ Strength Analysis runs locally and does not require a cloud solver or a paid ser
 
 ## Set up and solve
 
-1. Select a part in **Prepare**, then open **Load**.
+1. Select one part instance in **Prepare**, then open **Load**. When there are multiple copies, select the specific copy to study.
 2. Select faces or place region tools in the 3D view. Add fixed constraints, forces, preserve regions, and optional gravity. Edit an operation through its dialog or the selected-operation panel.
-3. Choose material properties, print-layer direction, calibration, background/dense infill settings, and optimization criteria. Generic material values and pattern factors are estimates; measured properties for the actual material and printing process are preferable.
-4. Run **Pre-check**. Green means the current inputs pass the input checks; orange means issues need attention. Passing does not validate physical accuracy.
+3. Choose material properties, calibration, background/dense infill settings, and optimization criteria. **Follow selected instance orientation in Prepare** is enabled by default; turn it off to enter a hypothetical layer-normal axis manually. **Apply best orientation** rotates only the selected copy and returns to following Prepare. Generic material values and pattern factors are estimates; measured properties for the actual material and printing process are preferable.
+4. **Pre-check** updates automatically. Green means the current inputs pass the input checks; orange means issues need attention. Click it for details. Passing does not validate physical accuracy.
 5. **Solve** prepares the response and reinforcement profile in a cancellable background worker. If inputs change during calculation, its obsolete result is discarded.
 
 ## Size and apply reinforcement
@@ -24,11 +24,13 @@ Strength Analysis runs locally and does not require a cloud solver or a paid ser
 
 Select a load, constraint, or preserve operation in the study tree or viewport, then use **Delete operation**. **Undo setup** and **Redo setup** handle study edits. The main application Undo/Redo handles applied model and modifier changes. **Remove dense modifier** removes only modifiers marked as managed by Strength Analysis; it does not delete similarly named user modifiers.
 
-Saving a project as 3MF retains the setup and native modifier settings. Geometry or setup changes mark the old results stale. A new solve is required before applying another result.
+Saving a project as 3MF retains the setup, orientation-follow choice, and native modifier settings. Geometry, selected-instance transforms, or setup changes mark the old results stale when the study synchronizes on activation or before an action. A new solve is required before applying another result.
 
 ## Interpretation limits
 
 The solver is a small-deformation, linear-elastic edge-network approximation with directional material properties. The interactive reinforcement response scales the existing local response; it does not re-solve redistributed load paths, nonlinear failure, fatigue, impact dynamics, buckling, or the exact printed lattice. The stress-ranked interior field is interpolated from the solved mesh, not a Fusion topology-optimization result.
+
+Instance orientation now determines the layer normal, but analysis geometry still uses the raw object's dimensions: Prepare instance scaling is not yet incorporated into physical mass, stress, or displacement. Scaling invalidates existing results, but rerunning does not yet resolve this limitation. Do not interpret results for scaled copies as validated scaled-part predictions.
 
 Added material changes self-weight. With gravity enabled and added mass, the preview therefore does **not** report an updated safety factor or deformation; contours and probes retain the baseline response. Validate the reinforced design with appropriate physical testing or a suitable independent analysis. Input pre-checks, an estimated safety-factor target, and a successful slice do not replace that validation.
 

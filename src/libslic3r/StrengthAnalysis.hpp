@@ -150,6 +150,7 @@ struct Setup {
     int schema_version{1};
     Material material;
     Vec3d print_layer_axis{Vec3d::UnitZ()};
+    bool follow_prepare_orientation{true};
     std::vector<Load> loads;
     GravityLoad gravity;
     std::vector<SphericalRegion> preserve_regions;
@@ -341,6 +342,9 @@ std::vector<PrintSettingsCandidate> recommend_print_settings(double solid_volume
                                                               double reference_displacement_mm = 0.0);
 
 std::string serialize_setup(const Setup &setup);
+// Pull the build-plate plane normal back into raw-object coordinates. Invalid or singular
+// instance transforms return zero, which ordinary setup validation rejects.
+Vec3d print_layer_axis_for_transform(const Transform3d &transform);
 bool deserialize_setup(const std::string &json_text, Setup &setup, std::string *error = nullptr);
 // Object config values are written into a quoted 3MF XML attribute by existing exporters. This
 // XML-safe wrapper avoids raw JSON punctuation while retaining raw-JSON backward compatibility.

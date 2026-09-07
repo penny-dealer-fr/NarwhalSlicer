@@ -30,6 +30,9 @@ TEST_CASE("Resizing and removing strength modifiers updates generated infill", "
     ModelObject &object = *model.objects.front();
     const indexed_triangle_set mesh = object.raw_mesh().its;
     SA::Setup setup;
+    // Once a response has been solved, either orientation mode uses the same native
+    // reinforcement/slicing path; changing the mode must not suppress its modifier.
+    setup.follow_prepare_orientation = GENERATE(true, false);
     setup.infill.background_pattern = SA::InfillPattern::Rectilinear;
     setup.infill.background_density = 0.2;
     setup.infill.dense_pattern = SA::InfillPattern::Gyroid;

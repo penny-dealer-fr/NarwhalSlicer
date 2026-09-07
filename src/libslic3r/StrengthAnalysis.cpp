@@ -1902,6 +1902,14 @@ DenseRegionPreview preview_dense_region(const indexed_triangle_set &mesh, const 
     return preview;
 }
 
+Vec3d print_layer_axis_for_transform(const Transform3d &transform)
+{
+    const Matrix3d linear = transform.linear();
+    if (!transform.matrix().allFinite() || !std::isfinite(linear.determinant()) || linear.determinant() == 0.0)
+        return Vec3d::Zero();
+    return normalized_or_zero(linear.transpose() * Vec3d::UnitZ());
+}
+
 std::string serialize_setup(const Setup &setup)
 {
     nlohmann::json j;
@@ -1919,6 +1927,7 @@ std::string serialize_setup(const Setup &setup)
                          {"shear_scale", m.calibration.shear_scale}, {"source", m.calibration.source}}}
     };
     j["print_layer_axis"] = vec_to_array(setup.print_layer_axis);
+    j["follow_prepare_orientation"] = setup.follow_prepare_orientation;
     j["loads"] = nlohmann::json::array();
     for (const Load &load : setup.loads) {
         j["loads"].push_back({{"name", load.name}, {"type", to_string(load.type)}, {"active", load.active},
@@ -1981,6 +1990,7 @@ bool deserialize_setup(const std::string &json_text, Setup &setup, std::string *
             }
         }
         if (j.contains("print_layer_axis")) parsed.print_layer_axis = array_to_vec(j["print_layer_axis"], parsed.print_layer_axis);
+        parsed.follow_prepare_orientation = j.value("follow_prepare_orientation", true);
         static const std::map<std::string, LoadType> load_types{{"fixed", LoadType::Fixed}, {"local_force", LoadType::LocalForce},
             {"directional_force", LoadType::DirectionalForce}, {"bearing_force", LoadType::BearingForce},
             {"impact_force", LoadType::ImpactForce}, {"global_force", LoadType::GlobalForce}};

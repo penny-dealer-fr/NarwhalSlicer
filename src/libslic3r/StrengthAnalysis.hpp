@@ -349,6 +349,19 @@ std::string serialize_setup(const Setup &setup);
 // Pull the build-plate plane normal back into raw-object coordinates. Invalid or singular
 // instance transforms return zero, which ordinary setup validation rejects.
 Vec3d print_layer_axis_for_transform(const Transform3d &transform);
+// Shared coordinate mapping for study display, picking and physical result vectors.
+// Translation is deliberately excluded: the study camera fits the selected part.
+struct StudyCoordinateFrame {
+    Matrix3d model_to_scene{Matrix3d::Identity()};
+    Matrix3d scene_to_model{Matrix3d::Identity()};
+    Vec3d scale{Vec3d::Ones()};
+    bool valid{true};
+    explicit StudyCoordinateFrame(const Transform3d &transform = Transform3d::Identity());
+    Vec3d physical_vector_to_model(const Vec3d &vector) const { return vector.cwiseQuotient(scale); }
+    Vec3d physical_vector_to_scene(const Vec3d &vector) const { return model_to_scene * physical_vector_to_model(vector); }
+    Vec3d scene_vector_to_physical(const Vec3d &vector) const { return (scene_to_model * vector).cwiseProduct(scale); }
+    Vec3d normal_to_scene(const Vec3d &normal) const { return scene_to_model.transpose() * normal; }
+};
 bool deserialize_setup(const std::string &json_text, Setup &setup, std::string *error = nullptr);
 // Object config values are written into a quoted 3MF XML attribute by existing exporters. This
 // XML-safe wrapper avoids raw JSON punctuation while retaining raw-JSON backward compatibility.

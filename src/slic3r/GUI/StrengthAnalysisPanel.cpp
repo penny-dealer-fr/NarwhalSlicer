@@ -226,6 +226,7 @@ bool material_properties_match(const SA::Material &lhs, const SA::Material &rhs)
 
 struct CameraFrame
 {
+    SA::StudyCoordinateFrame coordinates;
     Vec3d center{Vec3d::Zero()};
     Vec3d right{Vec3d::UnitX()};
     Vec3d up{Vec3d::UnitZ()};
@@ -396,6 +397,7 @@ public:
     }
 
 protected:
+    virtual Transform3d instance_transform() const { return Transform3d::Identity(); }
     virtual std::vector<Vec3d> scene_points() const = 0;
     virtual void draw_scene(wxDC &dc, const CameraFrame &camera) = 0;
     virtual void clicked(const wxPoint &, bool) {}
@@ -409,7 +411,10 @@ protected:
     CameraFrame camera() const
     {
         CameraFrame output;
-        const std::vector<Vec3d> points = scene_points();
+        output.coordinates = SA::StudyCoordinateFrame(instance_transform());
+        std::vector<Vec3d> points = scene_points();
+        for (Vec3d &point : points)
+            point = output.coordinates.model_to_scene * point;
         if (!points.empty()) {
             Vec3d minimum = points.front();
             Vec3d maximum = points.front();
@@ -426,6 +431,7 @@ protected:
             const double available_height = std::max(80, size.y);
             output.scale = 0.43 * std::min(available_width, available_height) / std::max(radius, 1e-6) * m_zoom;
             output.origin = wxPoint2DDouble(0.5 * available_width + m_pan.m_x, 0.5 * available_height + m_pan.m_y);
+            output.center = output.coordinates.scene_to_model * output.center;
         }
         output.forward = Vec3d(std::cos(m_pitch) * std::cos(m_yaw),
                                std::cos(m_pitch) * std::sin(m_yaw), std::sin(m_pitch));
@@ -436,7 +442,7 @@ protected:
 
     ScreenVertex project(const Vec3d &point, const CameraFrame &camera) const
     {
-        const Vec3d delta = point - camera.center;
+        const Vec3d delta = camera.coordinates.model_to_scene * (point - camera.center);
         return {
             wxPoint(int(std::lround(camera.origin.m_x + delta.dot(camera.right) * camera.scale)),
                     int(std::lround(camera.origin.m_y - delta.dot(camera.up) * camera.scale))),
@@ -535,18 +541,27 @@ protected:
                             const wxColour &colour, bool selected) const
     {
         const ScreenVertex projected_center = project(center, camera);
-        const int screen_radius = std::clamp(int(std::lround(std::max(radius, 1e-6) * camera.scale)),
-                                             FromDIP(4), FromDIP(240));
-        // The circle is the exact orthographic silhouette of the spherical solver region. The
-        // surrounding box is retained as a familiar Fusion-style editable extent/manipulator.
+        // An affine-transformed sphere projects to an ellipse. Use its screen-space
+        // covariance so non-uniform scale and rotation match the actual solver region.
+        const Vec3d x = camera.coordinates.model_to_scene.transpose() * camera.right;
+        const Vec3d y = -camera.coordinates.model_to_scene.transpose() * camera.up;
+        const double xx = x.squaredNorm(), yy = y.squaredNorm(), xy = x.dot(y);
+        const double spread = std::hypot(xx - yy, 2.0 * xy);
+        const double major = radius * camera.scale * std::sqrt(std::max(0.0, 0.5 * (xx + yy + spread)));
+        const double minor = radius * camera.scale * std::sqrt(std::max(0.0, 0.5 * (xx + yy - spread)));
+        const double angle = 0.5 * std::atan2(2.0 * xy, xx - yy);
+        std::array<wxPoint, 64> outline;
+        for (size_t i = 0; i < outline.size(); ++i) {
+            const double phase = 2.0 * M_PI * double(i) / double(outline.size());
+            const double u = major * std::cos(phase), v = minor * std::sin(phase);
+            outline[i] = projected_center.point + wxPoint(
+                int(std::lround(u * std::cos(angle) - v * std::sin(angle))),
+                int(std::lround(u * std::sin(angle) + v * std::cos(angle))));
+        }
         dc.SetPen(wxPen(colour, selected ? 3 : 2, selected ? wxPENSTYLE_SOLID : wxPENSTYLE_SHORT_DASH));
         dc.SetBrush(wxBrush(blend_colour(wxColour(236, 241, 247), colour, selected ? 0.20 : 0.11),
                             wxBRUSHSTYLE_BDIAGONAL_HATCH));
-        dc.DrawCircle(projected_center.point, screen_radius);
-        dc.DrawLine(projected_center.point + wxPoint(-screen_radius, 0),
-                    projected_center.point + wxPoint(screen_radius, 0));
-        dc.DrawLine(projected_center.point + wxPoint(0, -screen_radius),
-                    projected_center.point + wxPoint(0, screen_radius));
+        dc.DrawPolygon(int(outline.size()), outline.data());
     }
 
     void draw_region_shape(wxDC &dc, const CameraFrame &camera, const SA::SphericalRegion &region,
@@ -563,20 +578,21 @@ protected:
         case SA::RegionShape::Cylinder: {
             const Vec3d axis = region.axis.squaredNorm() > 1e-12 ? region.axis.normalized() : Vec3d::UnitZ();
             const Vec3d half_axis = axis * (0.5 * std::max(region.size_mm.z(), 1e-6));
-            const ScreenVertex first = project(region.center_mm - half_axis, camera);
-            const ScreenVertex second = project(region.center_mm + half_axis, camera);
-            const int radius = std::clamp(int(std::lround(std::max(region.radius_mm, 1e-6) * camera.scale)),
-                                          FromDIP(4), FromDIP(240));
-            const double dx = double(second.point.x - first.point.x), dy = double(second.point.y - first.point.y);
-            const double length = std::max(1.0, std::hypot(dx, dy));
-            const wxPoint side(int(std::lround(-dy / length * radius)), int(std::lround(dx / length * radius)));
+            const Vec3d radial_u = axis.unitOrthogonal(), radial_v = axis.cross(radial_u);
+            std::array<wxPoint, 64> first, second;
+            for (size_t i = 0; i < first.size(); ++i) {
+                const double phase = 2.0 * M_PI * double(i) / double(first.size());
+                const Vec3d radial = region.radius_mm * (radial_u * std::cos(phase) + radial_v * std::sin(phase));
+                first[i] = project(region.center_mm - half_axis + radial, camera).point;
+                second[i] = project(region.center_mm + half_axis + radial, camera).point;
+            }
             dc.SetPen(wxPen(colour, selected ? 3 : 2, selected ? wxPENSTYLE_SOLID : wxPENSTYLE_SHORT_DASH));
             dc.SetBrush(wxBrush(blend_colour(wxColour(236, 241, 247), colour, selected ? 0.20 : 0.11),
                                 wxBRUSHSTYLE_BDIAGONAL_HATCH));
-            dc.DrawCircle(first.point, radius);
-            dc.DrawCircle(second.point, radius);
-            dc.DrawLine(first.point + side, second.point + side);
-            dc.DrawLine(first.point - side, second.point - side);
+            dc.DrawPolygon(int(first.size()), first.data());
+            dc.DrawPolygon(int(second.size()), second.data());
+            for (size_t i = 0; i < first.size(); i += first.size() / 4)
+                dc.DrawLine(first[i], second[i]);
             break;
         }
         case SA::RegionShape::Surface: {
@@ -587,6 +603,19 @@ protected:
             break;
         }
         }
+    }
+
+    Vec3d size_handle_axis(const CameraFrame &camera) const
+    {
+        return (camera.coordinates.scene_to_model * camera.right).normalized();
+    }
+
+    Vec2d height_handle_axis(const Vec3d &axis, const CameraFrame &camera) const
+    {
+        const Vec3d mapped = camera.coordinates.model_to_scene * axis;
+        const Vec2d screen_axis(mapped.dot(camera.right), -mapped.dot(camera.up));
+        // Keep a usable handle when the cylinder axis points into the screen.
+        return screen_axis.norm() < 0.1 * mapped.norm() ? Vec2d(0.0, -mapped.norm()) : screen_axis;
     }
 
     void draw_orientation_gizmo(wxDC &dc, const CameraFrame &camera) const
@@ -784,6 +813,8 @@ public:
     }
 
 protected:
+    Transform3d instance_transform() const override { return m_session->instance_transform; }
+
     std::vector<Vec3d> scene_points() const override
     {
         std::vector<Vec3d> points;
@@ -850,7 +881,7 @@ protected:
             const Vec3d a = mesh.vertices[size_t(triangle[0])].cast<double>();
             const Vec3d b = mesh.vertices[size_t(triangle[1])].cast<double>();
             const Vec3d c = mesh.vertices[size_t(triangle[2])].cast<double>();
-            const Vec3d cross = (b - a).cross(c - a);
+            const Vec3d cross = camera.coordinates.normal_to_scene((b - a).cross(c - a));
             const double shade = cross.squaredNorm() > 1e-12 ? 0.55 + 0.35 * std::abs(cross.normalized().dot(light)) : 0.65;
             const int base = int(std::lround(205.0 * shade));
             wxColour surface(std::clamp(base + 18, 0, 255), std::clamp(base + 25, 0, 255),
@@ -891,7 +922,7 @@ protected:
 
         double radius = 1.0;
         for (const Vec3f &point : mesh.vertices)
-            radius = std::max(radius, (point.cast<double>() - camera.center).norm());
+            radius = std::max(radius, (camera.coordinates.model_to_scene * (point.cast<double>() - camera.center)).norm());
         const double glyph_length = 0.30 * radius;
         double maximum_load = 0.0;
         for (const SA::Load &load : m_session->setup.loads)
@@ -925,7 +956,7 @@ protected:
                     (load.type == SA::LoadType::ImpactForce ? load.impact_factor : 1.0);
                 const double length_scale = maximum_load > 0.0 ?
                     std::clamp(std::sqrt(std::max(0.0, effective_magnitude) / maximum_load), 0.55, 1.35) : 1.0;
-                const ScreenVertex tip = project(center + direction * glyph_length * length_scale, camera);
+                const ScreenVertex tip = project(center + camera.coordinates.physical_vector_to_model(direction) * glyph_length * length_scale, camera);
                 draw_arrow(dc, anchor.point, tip.point, colour, width);
                 glyph_end = tip.point;
                 dc.SetPen(wxPen(colour, width));
@@ -945,17 +976,12 @@ protected:
                 if (!load.region.whole_model && load.region.shape != SA::RegionShape::Surface) {
                     const double extent = load.region.shape == SA::RegionShape::Box ?
                         0.5 * load.region.size_mm.norm() : load.region.radius_mm;
-                    m_size_handle = project(center + camera.right * extent, camera).point;
+                    m_size_handle = project(center + size_handle_axis(camera) * extent, camera).point;
                     draw_handle(dc, m_size_handle, colour, false);
                     if (load.region.shape == SA::RegionShape::Cylinder) {
                         const Vec3d axis = load.region.axis.squaredNorm() > 1e-12 ?
                             load.region.axis.normalized() : Vec3d::UnitZ();
-                        Vec3d screen_axis(axis.dot(camera.right), -axis.dot(camera.up), 0.0);
-                        const double projected = screen_axis.head<2>().norm();
-                        if (projected < 0.1)
-                            screen_axis = Vec3d(0.0, -1.0, 0.0);
-                        else
-                            screen_axis /= projected;
+                        const Vec2d screen_axis = height_handle_axis(axis, camera);
                         m_height_handle = anchor.point + wxPoint(
                             int(std::lround(screen_axis.x() * 0.5 * load.region.size_mm.z() * camera.scale)),
                             int(std::lround(screen_axis.y() * 0.5 * load.region.size_mm.z() * camera.scale)));
@@ -968,9 +994,10 @@ protected:
         if (m_session->setup.gravity.enabled) {
             const Vec3d direction = m_session->setup.gravity.acceleration_m_s2.squaredNorm() > 1e-12 ?
                 m_session->setup.gravity.acceleration_m_s2.normalized() : -Vec3d::UnitZ();
-            const Vec3d start = camera.center - direction * 0.55 * radius;
+            const Vec3d raw_direction = camera.coordinates.physical_vector_to_model(direction);
+            const Vec3d start = camera.center - raw_direction * 0.55 * radius;
             const ScreenVertex p0 = project(start, camera);
-            const ScreenVertex p1 = project(start + direction * glyph_length, camera);
+            const ScreenVertex p1 = project(start + raw_direction * glyph_length, camera);
             draw_arrow(dc, p0.point, p1.point, wxColour(38, 133, 140), m_selected_kind == 3 ? 5 : 3);
             dc.SetTextForeground(wxColour(28, 95, 102));
             dc.DrawText(_L("Gravity"), p0.point + wxPoint(8, -18));
@@ -992,16 +1019,11 @@ protected:
                 m_center_handle = center.point;
                 draw_handle(dc, m_center_handle, wxColour(35, 129, 211), false);
                 if (region.shape != SA::RegionShape::Surface) {
-                    m_size_handle = project(region.center_mm + camera.right * world_extent, camera).point;
+                    m_size_handle = project(region.center_mm + size_handle_axis(camera) * world_extent, camera).point;
                     draw_handle(dc, m_size_handle, wxColour(43, 153, 91), false);
                     if (region.shape == SA::RegionShape::Cylinder) {
                         const Vec3d axis = region.axis.squaredNorm() > 1e-12 ? region.axis.normalized() : Vec3d::UnitZ();
-                        Vec3d screen_axis(axis.dot(camera.right), -axis.dot(camera.up), 0.0);
-                        const double projected = screen_axis.head<2>().norm();
-                        if (projected < 0.1)
-                            screen_axis = Vec3d(0.0, -1.0, 0.0);
-                        else
-                            screen_axis /= projected;
+                        const Vec2d screen_axis = height_handle_axis(axis, camera);
                         m_height_handle = center.point + wxPoint(
                             int(std::lround(screen_axis.x() * 0.5 * region.size_mm.z() * camera.scale)),
                             int(std::lround(screen_axis.y() * 0.5 * region.size_mm.z() * camera.scale)));
@@ -1026,7 +1048,7 @@ protected:
                                    center.point + wxPoint(half, half)};
                 dc.DrawPolygon(3, support);
             } else if (m_preview_kind == 1) {
-                const ScreenVertex tip = project(m_preview_region.center_mm + m_preview_direction * glyph_length, camera);
+                const ScreenVertex tip = project(m_preview_region.center_mm + camera.coordinates.physical_vector_to_model(m_preview_direction) * glyph_length, camera);
                 draw_arrow(dc, center.point, tip.point, colour, 4);
             }
         } else if (m_hover_surface) {
@@ -1046,7 +1068,7 @@ protected:
                 dc.DrawPolygon(3, support);
             } else if (!preserve) {
                 draw_arrow(dc, center.point,
-                           project(m_hover_region.center_mm + m_hover_direction * glyph_length, camera).point,
+                           project(m_hover_region.center_mm + camera.coordinates.physical_vector_to_model(m_hover_direction) * glyph_length, camera).point,
                            colour, 3);
             }
         }
@@ -1087,7 +1109,8 @@ protected:
             m_hover_region.radius_mm = 5.0;
             m_hover_region.shape = SA::RegionShape::Surface;
             m_hover_region.surface_triangles = selection_faces(face);
-            m_hover_direction = normal.squaredNorm() > 1e-12 ? Vec3d(-normal.normalized()) : Vec3d(0.0, 0.0, -1.0);
+            const Vec3d physical_normal = normal.cwiseQuotient(m_session->setup.geometry_scale);
+            m_hover_direction = physical_normal.squaredNorm() > 1e-12 ? Vec3d(-physical_normal.normalized()) : Vec3d(0.0, 0.0, -1.0);
             m_hover_face = face;
         }
         if (m_hover_surface != found || found) {
@@ -1201,7 +1224,8 @@ protected:
                 if (region->shape == SA::RegionShape::Surface)
                     region->surface_triangles = selection_faces(face);
             } else if (region->shape != SA::RegionShape::Surface) {
-                region->center_mm = m_original_region.center_mm + (frame.right * dx - frame.up * dy) / frame.scale;
+                region->center_mm = m_original_region.center_mm + frame.coordinates.scene_to_model *
+                    (frame.right * dx - frame.up * dy) / frame.scale;
             }
         } else if (m_active_handle == Handle::Direction && load != nullptr) {
             const ScreenVertex center = project(region->center_mm, frame);
@@ -1210,14 +1234,18 @@ protected:
             const double projected_length = std::max(1.0, std::hypot(screen_x, screen_y));
             const Vec3d original_direction = m_original_direction.squaredNorm() > 1e-12 ?
                 m_original_direction.normalized() : Vec3d::UnitZ();
-            const Vec3d candidate = frame.right * screen_x - frame.up * screen_y +
-                frame.forward * (original_direction.dot(frame.forward) * projected_length);
+            const Vec3d world_direction = frame.coordinates.physical_vector_to_scene(original_direction);
+            const double original_planar = std::max(1e-3, std::hypot(world_direction.dot(frame.right),
+                                                                    world_direction.dot(frame.up)));
+            const Vec3d candidate = frame.coordinates.scene_vector_to_physical(frame.right * screen_x - frame.up * screen_y +
+                frame.forward * (world_direction.dot(frame.forward) * projected_length / original_planar));
             if (candidate.squaredNorm() > 1e-12)
                 load->direction = candidate.normalized();
         } else if (m_active_handle == Handle::Size) {
             const ScreenVertex center = project(region->center_mm, frame);
+            const double axis_scale = (frame.coordinates.model_to_scene * size_handle_axis(frame)).norm();
             const double extent = std::max(0.1, std::hypot(double(point.x - center.point.x),
-                                                          double(point.y - center.point.y)) / frame.scale);
+                                                          double(point.y - center.point.y)) / (frame.scale * axis_scale));
             if (region->shape == SA::RegionShape::Box) {
                 const double original_extent = std::max(1e-9, 0.5 * m_original_region.size_mm.norm());
                 region->size_mm = m_original_region.size_mm * (extent / original_extent);
@@ -1230,17 +1258,10 @@ protected:
             }
         } else if (m_active_handle == Handle::Height && region->shape == SA::RegionShape::Cylinder) {
             const Vec3d axis = region->axis.squaredNorm() > 1e-12 ? region->axis.normalized() : Vec3d::UnitZ();
-            Vec2d screen_axis(axis.dot(frame.right), -axis.dot(frame.up));
-            double projected = screen_axis.norm();
-            if (projected < 0.1) {
-                screen_axis = Vec2d(0.0, -1.0);
-                projected = 1.0;
-            } else {
-                screen_axis /= projected;
-            }
+            const Vec2d screen_axis = height_handle_axis(axis, frame);
             const ScreenVertex center = project(region->center_mm, frame);
             const Vec2d cursor(double(point.x - center.point.x), double(point.y - center.point.y));
-            const double half_height = std::abs(cursor.dot(screen_axis)) / frame.scale;
+            const double half_height = std::abs(cursor.dot(screen_axis)) / (frame.scale * screen_axis.squaredNorm());
             region->size_mm.z() = std::max(0.2, 2.0 * half_height);
         }
         m_item_changed(false);
@@ -1360,7 +1381,7 @@ private:
             best_depth = depth;
             position = weights[0] * a + weights[1] * b + weights[2] * c;
             normal = cross.normalized();
-            if (normal.dot(frame.forward) < 0.0)
+            if (frame.coordinates.normal_to_scene(normal).dot(frame.forward) < 0.0)
                 normal = -normal;
             face_index = face;
             found = true;
@@ -2551,7 +2572,8 @@ void StrengthLoadPanel::place_load_at(SA::LoadType type, const Vec3d &position_m
     load.region.center_mm = position_mm;
     load.region.shape = SA::RegionShape::Surface;
     load.region.surface_triangles = surface_triangles;
-    load.direction = normal.squaredNorm() > 1e-12 ? Vec3d(-normal.normalized()) : Vec3d(0.0, 0.0, -1.0);
+    const Vec3d physical_normal = normal.cwiseQuotient(m_session->setup.geometry_scale);
+    load.direction = physical_normal.squaredNorm() > 1e-12 ? Vec3d(-physical_normal.normalized()) : Vec3d(0.0, 0.0, -1.0);
     const wxString type_name = wxString::FromUTF8(SA::to_string(type));
     load.name = wxString::Format("%s %zu", type_name, m_session->setup.loads.size() + 1).utf8_string();
     if (type == SA::LoadType::Fixed) {
@@ -3429,6 +3451,7 @@ void StrengthLoadPanel::on_analysis_finished()
     if (stored.succeeded()) {
         m_session->solved_mesh = m_session->mesh;
         m_session->solved_setup = m_session->setup;
+        m_session->solved_instance_transform = m_session->instance_transform;
     } else {
         m_session->solved_mesh = {};
         m_session->solved_setup = SA::Setup{};
@@ -3640,6 +3663,11 @@ public:
     }
 
 protected:
+    Transform3d instance_transform() const override
+    {
+        return m_session->result.succeeded() && !m_session->solved_mesh.empty() ?
+            m_session->solved_instance_transform : m_session->instance_transform;
+    }
     std::vector<Vec3d> scene_points() const override
     {
         std::vector<Vec3d> points;
@@ -3761,7 +3789,7 @@ protected:
                 const Vec3d normal = (vertices[triangle[1]] - vertices[triangle[0]]).cast<double>().cross(
                     (vertices[triangle[2]] - vertices[triangle[0]]).cast<double>());
                 const double shade = normal.squaredNorm() > 1e-18 ?
-                    0.6 + 0.4 * std::abs(normal.normalized().dot(camera.forward)) : 1.0;
+                    0.6 + 0.4 * std::abs(camera.coordinates.normal_to_scene(normal).normalized().dot(camera.forward)) : 1.0;
                 const wxColour shaded(int(colour.Red() * shade), int(colour.Green() * shade), int(colour.Blue() * shade), 135);
                 mask.triangle(projected_mask[triangle[0]], projected_mask[triangle[1]], projected_mask[triangle[2]],
                     [shaded](double, double, double) { return shaded; });
@@ -3954,7 +3982,7 @@ private:
         const SA::Setup &setup = display_setup();
         double radius = 1.0;
         for (const Vec3f &point : mesh.vertices)
-            radius = std::max(radius, (point.cast<double>() - camera.center).norm());
+            radius = std::max(radius, (camera.coordinates.model_to_scene * (point.cast<double>() - camera.center)).norm());
         const double length = 0.24 * radius;
         for (const SA::Load &load : setup.loads) {
             if (!load.active)
@@ -3975,7 +4003,7 @@ private:
                 dc.SetTextForeground(colour);
             } else {
                 const Vec3d direction = load.direction.squaredNorm() > 1e-12 ? load.direction.normalized() : Vec3d::UnitZ();
-                const ScreenVertex tip = project(center + direction * length, camera);
+                const ScreenVertex tip = project(center + camera.coordinates.physical_vector_to_model(direction) * length, camera);
                 draw_arrow(dc, anchor.point, tip.point, colour, 3);
                 dc.SetPen(wxPen(colour, 3));
                 dc.SetBrush(wxBrush(wxColour(255, 255, 255)));
@@ -3986,9 +4014,10 @@ private:
         }
         if (setup.gravity.enabled) {
             const Vec3d direction = setup.gravity.acceleration_m_s2.normalized();
-            const Vec3d start = camera.center - direction * 0.5 * radius;
+            const Vec3d raw_direction = camera.coordinates.physical_vector_to_model(direction);
+            const Vec3d start = camera.center - raw_direction * 0.5 * radius;
             const wxPoint anchor = project(start, camera).point;
-            draw_arrow(dc, anchor, project(start + direction * length, camera).point, wxColour(38, 133, 140), 3);
+            draw_arrow(dc, anchor, project(start + raw_direction * length, camera).point, wxColour(38, 133, 140), 3);
             dc.SetTextForeground(wxColour(28, 95, 102));
             dc.DrawText(_L("Gravity"), anchor + wxPoint(9, -17));
         }

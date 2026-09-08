@@ -304,6 +304,43 @@ TEST_CASE("Translation does not change the print layer axis", "[StrengthAnalysis
     CHECK_THAT((print_layer_axis_for_transform(transform) - untranslated_axis).norm(), WithinAbs(0.0, 1e-12));
 }
 
+TEST_CASE("Study coordinate mapping keeps points normals and physical vectors in their proper frames", "[StrengthAnalysis]")
+{
+    const double mirror = GENERATE(1.0, -1.0);
+    Transform3d transform = Transform3d::Identity();
+    transform.rotate(Eigen::AngleAxisd(0.7, Vec3d(1.0, 2.0, 3.0).normalized()));
+    transform.scale(Vec3d(2.0 * mirror, 0.5, 3.0));
+    transform.translation() = Vec3d(500.0, -250.0, 40.0);
+    const StudyCoordinateFrame frame(transform);
+    REQUIRE(frame.valid);
+    const Vec3d point(4.0, -2.0, 7.0);
+    CHECK_THAT((frame.scene_to_model * (frame.model_to_scene * point) - point).norm(), WithinAbs(0.0, 1e-12));
+    const Vec3d displacement(0.001, -0.002, 0.003);
+    const Vec3d scene_vector = frame.physical_vector_to_scene(displacement);
+    CHECK_THAT(scene_vector.norm(), WithinRel(displacement.norm(), 1e-12));
+    CHECK_THAT((frame.scene_vector_to_physical(scene_vector) - displacement).norm(), WithinAbs(0.0, 1e-12));
+    CHECK_THAT((frame.physical_vector_to_model(displacement).cwiseProduct(frame.scale) - displacement).norm(),
+               WithinAbs(0.0, 1e-12));
+    const Vec3d tangent(1.0, 2.0, 0.0);
+    const Vec3d normal(-2.0, 1.0, 0.0);
+    CHECK_THAT(frame.normal_to_scene(normal).dot(frame.model_to_scene * tangent), WithinAbs(0.0, 1e-12));
+    const Vec3d screen_drag(2.0, -3.0, 0.0);
+    const Vec3d raw_drag = frame.scene_to_model * screen_drag;
+    CHECK_THAT((frame.model_to_scene * (point + raw_drag) - frame.model_to_scene * point - screen_drag).norm(),
+               WithinAbs(0.0, 1e-12));
+}
+
+TEST_CASE("Invalid study coordinate mappings remain finite and explicitly invalid", "[StrengthAnalysis]")
+{
+    Transform3d transform = Transform3d::Identity();
+    transform.linear()(1, 1) = GENERATE(0.0, std::numeric_limits<double>::infinity());
+    const StudyCoordinateFrame frame(transform);
+    CHECK_FALSE(frame.valid);
+    CHECK(frame.model_to_scene.allFinite());
+    CHECK(frame.scene_to_model.allFinite());
+    CHECK_THAT((frame.physical_vector_to_model(Vec3d::Ones()) - Vec3d::Ones()).norm(), WithinAbs(0.0, 0.0));
+}
+
 TEST_CASE("Singular transforms have no valid print layer axis", "[StrengthAnalysis]")
 {
     const int collapsed_axis = GENERATE(0, 1, 2, 3);

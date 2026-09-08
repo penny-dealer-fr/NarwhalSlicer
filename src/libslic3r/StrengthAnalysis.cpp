@@ -1953,10 +1953,29 @@ DenseRegionPreview preview_dense_region(const indexed_triangle_set &mesh, const 
 
 Vec3d print_layer_axis_for_transform(const Transform3d &transform)
 {
-    const Matrix3d linear = transform.linear();
-    if (!transform.matrix().allFinite() || !std::isfinite(linear.determinant()) || linear.determinant() == 0.0)
+    const StudyCoordinateFrame frame(transform);
+    if (!frame.valid)
         return Vec3d::Zero();
-    return normalized_or_zero(linear.transpose() * Vec3d::UnitZ());
+    return normalized_or_zero(frame.model_to_scene.transpose() * Vec3d::UnitZ());
+}
+
+StudyCoordinateFrame::StudyCoordinateFrame(const Transform3d &transform)
+{
+    const Matrix3d linear = transform.linear();
+    const double determinant = linear.determinant();
+    if (!transform.matrix().allFinite() || !std::isfinite(determinant) || determinant == 0.0) {
+        valid = false;
+        return;
+    }
+    const Matrix3d inverse = linear.inverse();
+    const Vec3d lengths = linear.colwise().norm().transpose();
+    if (!inverse.allFinite() || !lengths.allFinite() || lengths.minCoeff() <= 0.0) {
+        valid = false;
+        return;
+    }
+    model_to_scene = linear;
+    scene_to_model = inverse;
+    scale = lengths;
 }
 
 std::string serialize_setup(const Setup &setup)

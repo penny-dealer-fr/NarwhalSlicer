@@ -41,6 +41,7 @@ struct StrengthAnalysisSession
     ObjectID instance_id;
     int instance_index{-1};
     Transform3d instance_transform{Transform3d::Identity()};
+    Transform3d solved_instance_transform{Transform3d::Identity()};
     bool stale{true};
     uint64_t revision{0};
     uint64_t solved_revision{0};

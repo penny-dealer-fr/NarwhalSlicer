@@ -18,10 +18,10 @@ The scaled slicing regression exposed an existing overlap-cache defect: removing
 
 Final tests for this checkpoint: **344 core cases / 283,143 assertions**, **145 FFF cases / 8,011 assertions**, randomized order, passing; arm64 Release app build succeeds. Each test target was built separately and ad-hoc signed before execution: a failed unsigned-discovery step in a multi-target build can cancel another target before its new executable is linked. Earlier runs with stale executables or failing diagnostics were not accepted as final verification.
 
-Still open: native UI testing and matching the study viewport's displayed silhouette/handles to the scaled, rotated Prepare instance. The current viewport uses raw-object coordinates; deformation vectors are mapped back into that frame. The broader material-data and optimization-workflow gaps below also remain open.
+Follow-up viewport checkpoint: both study canvases now project through the selected Prepare instance's rotation, scale, and reflection. Camera fitting, surface picking, physical force/deformation vectors, and region handles use the same mapping. Sphere outlines project as ellipses and cylinder caps use transformed rings. Stored regions/modifiers remain raw-object coordinates; stale results retain their solved transform. Two new core cases check point/vector/normal mapping under rotation, nonuniform scale, reflection, and invalid transforms. Full core results: **346 cases / 283,165 assertions**, passing. Native interaction and visual verification remain open, as do the broader material-data and optimization-workflow gaps below.
 
 - macOS arm64 Release application build succeeds.
-- Full core suite: 344 cases, 283,143 assertions, randomized order, passing.
+- Full core suite: 346 cases, 283,165 assertions, randomized order, passing.
 - Earlier focused strength checkpoint: 28 cases, 113,551 assertions, passing; the expanded strength cases are included in the full core run above.
 - Full FFF suite: 145 cases, 8,011 assertions, randomized order, passing.
 - The slicing regression creates the same native parameter-modifier mesh and settings used by the GUI. It checks 15%, 50%, and 100% selected model volume, increasing actual generated infill, replacement, removal, and restored/redo model states.

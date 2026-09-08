@@ -2,6 +2,7 @@
 #define slic3r_GUI_StrengthAnalysisPanel_hpp_
 
 #include "libslic3r/StrengthAnalysis.hpp"
+#include "libslic3r/StrengthTransient.hpp"
 #include "libslic3r/ObjectID.hpp"
 
 #include <wx/scrolwin.h>
@@ -17,6 +18,7 @@ class wxCheckBox;
 class wxChoice;
 class wxListBox;
 class wxPanel;
+class wxPopupTransientWindow;
 class wxSlider;
 class wxStaticText;
 class wxTextCtrl;
@@ -30,6 +32,7 @@ class Plater;
 struct StrengthAnalysisSession
 {
     StrengthAnalysis::Setup setup;
+    StrengthAnalysis::TransientSettings print_settings;
     StrengthAnalysis::Result result;
     indexed_triangle_set mesh;
     indexed_triangle_set solved_mesh;
@@ -56,6 +59,8 @@ public:
     void activate();
     void set_result_callback(std::function<void()> callback) { m_result_callback = std::move(callback); }
     void set_preview_callback(std::function<void()> callback) { m_preview_callback = std::move(callback); }
+    bool has_dense_modifier() const;
+    void remove_dense_modifier();
     bool create_dense_modifier_from_preview(const StrengthAnalysis::DenseRegionPreview &preview);
 
 private:
@@ -137,6 +142,7 @@ private:
     wxTextCtrl *m_objective_weights[4]{};
     wxButton *m_run_button{nullptr};
     Button *m_precheck_button{nullptr};
+    int m_precheck_state{0};
     wxButton *m_cancel_button{nullptr};
     wxButton *m_dense_button{nullptr};
     wxButton *m_remove_dense_button{nullptr};
@@ -180,7 +186,6 @@ private:
     void cancel_analysis();
     void on_analysis_finished();
     void preview_dense_region();
-    void remove_dense_modifier();
     void apply_recommended_orientation();
     void apply_optimized_settings();
 };
@@ -190,15 +195,29 @@ class StrengthSimulationPanel final : public wxScrolledWindow
 public:
     StrengthSimulationPanel(wxWindow *parent, std::shared_ptr<StrengthAnalysisSession> session,
                             std::function<void()> synchronize_session = {},
-                            std::function<bool(const StrengthAnalysis::DenseRegionPreview &)> apply_dense_preview = {});
+                            std::function<bool(const StrengthAnalysis::DenseRegionPreview &)> apply_dense_preview = {},
+                            std::function<bool()> has_dense_modifier = {},
+                            std::function<void()> remove_dense_modifier = {});
     void activate();
     void refresh();
 
 private:
     class ResultCanvas;
+    struct AnimationRun {
+        std::shared_ptr<StrengthAnalysisSession> snapshot;
+        StrengthAnalysis::LoadRamp ramp;
+        std::shared_ptr<const StrengthAnalysis::TransientResult> history;
+        wxString name;
+    };
+    std::vector<AnimationRun> m_animation_runs;
+    void show_animation();
+    void show_comparison();
+    void show_animation_view(const std::vector<AnimationRun> &runs, bool allow_save);
     std::shared_ptr<StrengthAnalysisSession> m_session;
     std::function<void()> m_synchronize_session;
     std::function<bool(const StrengthAnalysis::DenseRegionPreview &)> m_apply_dense_preview;
+    std::function<bool()> m_has_dense_modifier;
+    std::function<void()> m_remove_dense_modifier;
     std::shared_ptr<const StrengthAnalysis::DenseRegionPreviewProfile> m_dense_profile;
     StrengthAnalysis::DenseRegionPreview m_dense_preview;
     size_t m_probe_vertex{size_t(-1)};
@@ -213,6 +232,7 @@ private:
     wxCheckBox *m_show_dense_preview{nullptr};
     wxSlider *m_dense_volume_slider{nullptr};
     wxTextCtrl *m_target_safety_factor{nullptr};
+    wxPopupTransientWindow *m_target_popup{nullptr};
     wxButton *m_size_to_safety_factor{nullptr};
     wxButton *m_use_stress_threshold{nullptr};
     wxStaticText *m_dense_volume_value{nullptr};
@@ -222,6 +242,7 @@ private:
     wxTextCtrl *m_summary{nullptr};
     ResultCanvas *m_canvas{nullptr};
 
+    void show_target_safety_factor_popup();
     void update_dense_preview();
     void size_dense_preview_to_target();
     void size_dense_preview_to_threshold();

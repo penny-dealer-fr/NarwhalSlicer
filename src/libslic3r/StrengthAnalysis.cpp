@@ -2170,4 +2170,70 @@ bool deserialize_setup_from_config(const std::string &config_text, Setup &setup,
     return deserialize_setup(json, setup, error);
 }
 
+LoadRamp make_load_ramp(const indexed_triangle_set &mesh, const Setup &setup, const Result &result, double duration_s)
+{
+    LoadRamp ramp;
+    if (!result.succeeded() || mesh.vertices.size() != result.vertices.size() || result.vertices.empty() ||
+        !std::isfinite(duration_s) || duration_s <= 0.0)
+        return ramp;
+    ramp.duration_s = duration_s;
+    const double strength = pattern_factors(setup.infill.background_pattern).strength;
+    const Vec3d axis = normalized_or_zero(setup.print_layer_axis);
+    for (const VertexResult &v : result.vertices) {
+        Eigen::Matrix3d tensor;
+        tensor << v.normal_stress_pa.x(), v.shear_stress_pa.x(), v.shear_stress_pa.y(),
+                  v.shear_stress_pa.x(), v.normal_stress_pa.y(), v.shear_stress_pa.z(),
+                  v.shear_stress_pa.y(), v.shear_stress_pa.z(), v.normal_stress_pa.z();
+        const double layer = v.von_mises_pa > NUMERIC_EPSILON ?
+            std::clamp((tensor * axis).norm() / v.von_mises_pa, 0.0, 1.0) : 0.0;
+        // Ultimate strength and requested safety factors must never masquerade as yield.
+        const auto allowable = strength_for_basis(setup, StrengthBasis::CalibratedYield, layer);
+        if (v.von_mises_pa > NUMERIC_EPSILON)
+            ramp.elastic_limit_fraction = std::min(ramp.elastic_limit_fraction, allowable.first * strength / v.von_mises_pa);
+        if (v.maximum_shear_pa > NUMERIC_EPSILON)
+            ramp.elastic_limit_fraction = std::min(ramp.elastic_limit_fraction, allowable.second * strength / v.maximum_shear_pa);
+    }
+    for (const Load &load : setup.loads) {
+        if (!load.active || load.type == LoadType::Fixed) continue;
+        SphericalRegion region = load.region;
+        if (load.type == LoadType::GlobalForce) region.whole_model = true;
+        const auto vertices = vertices_in_region(mesh, region);
+        if (vertices.empty()) continue;
+        // Report the most displaced application-region node, retaining its exact identity.
+        const size_t vertex = *std::max_element(vertices.begin(), vertices.end(), [&](size_t a, size_t b) {
+            return result.vertices[a].displacement_m.squaredNorm() < result.vertices[b].displacement_m.squaredNorm();
+        });
+        ramp.probes.push_back({load.name, vertex,
+            load.magnitude_n * (load.type == LoadType::ImpactForce ? load.impact_factor : 1.0),
+            result.vertices[vertex].displacement_m.norm() * 1000.0});
+    }
+    return ramp;
+}
+
+Result load_ramp_frame(const Result &endpoint, double fraction)
+{
+    Result frame = endpoint;
+    const double scale = std::isfinite(fraction) ? std::clamp(fraction, 0.0, 1.0) : 0.0;
+    for (VertexResult &v : frame.vertices) {
+        v.displacement_m *= scale;
+        v.normal_stress_pa *= scale;
+        v.shear_stress_pa *= scale;
+        v.von_mises_pa *= scale;
+        v.maximum_shear_pa *= scale;
+        v.safety_factor = scale > 0.0 ? v.safety_factor / scale : std::numeric_limits<double>::infinity();
+    }
+    frame.maximum_displacement_m *= scale;
+    frame.maximum_von_mises_pa *= scale;
+    frame.requested_resultant_force_n *= scale;
+    frame.minimum_safety_factor = scale > 0.0 ? frame.minimum_safety_factor / scale : std::numeric_limits<double>::infinity();
+    frame.safety_factor_target_met = frame.minimum_safety_factor >= frame.governing_target_safety_factor;
+    // Recommendations describe the endpoint, and are not frame results.
+    frame.dense_region = {};
+    frame.infill_comparisons.clear();
+    frame.mass_strength_curve.clear();
+    frame.orientation_recommendations.clear();
+    frame.print_settings_candidates.clear();
+    return frame;
+}
+
 } // namespace Slic3r::StrengthAnalysis

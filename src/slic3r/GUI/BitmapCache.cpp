@@ -237,6 +237,7 @@ wxBitmap* BitmapCache::load_png(const std::string &bitmap_name, unsigned width, 
     std::string bitmap_key = bitmap_name + ( height !=0 ? 
                                            "-h" + std::to_string(height) : 
                                            "-w" + std::to_string(width))
+                                         + (m_scale != 1.0f ? "-s" + float_to_string_decimal_point(m_scale) : "")
                                          + (grayscale ? "-gs" : "");
 
     auto it = m_map.find(bitmap_key);
@@ -251,23 +252,31 @@ wxBitmap* BitmapCache::load_png(const std::string &bitmap_name, unsigned width, 
     if (height == 0 && width == 0)
         height = image.GetHeight();
 
-    if (height != 0 && unsigned(image.GetHeight()) != height)
+    if (height != 0)
         width   = unsigned(0.5f + float(image.GetWidth()) * height / image.GetHeight());
-    else if (width != 0 && unsigned(image.GetWidth()) != width)
+    else if (width != 0)
         height  = unsigned(0.5f + float(image.GetHeight()) * width / image.GetWidth());
 
+    // Match SVG loading: sizes are logical pixels on macOS. Keep Retina backing
+    // pixels and their scale together so raster logos remain sharp at the same size.
+    width  = unsigned(0.5f + width * m_scale);
+    height = unsigned(0.5f + height * m_scale);
     if (height != 0 && width != 0) {
         // BBS: support resize by fill border
-        if (scale_in_center > 0)
+        if (scale_in_center > 0) {
+            if (m_scale != 1.0f)
+                image.Rescale(unsigned(0.5f + image.GetWidth() * m_scale), unsigned(0.5f + image.GetHeight() * m_scale),
+                              wxIMAGE_QUALITY_HIGH);
             image.Resize({ (int)width, (int)height }, { (int)(width - image.GetWidth()) / 2, (int)(height - image.GetHeight()) / 2 });
+        }
         else
-            image.Rescale(width, height, wxIMAGE_QUALITY_BILINEAR);
+            image.Rescale(width, height, wxIMAGE_QUALITY_HIGH);
     }
 
     if (grayscale)
         image = image.ConvertToGreyscale(m_gs, m_gs, m_gs);
 
-    return this->insert(bitmap_key, wxImage_to_wxBitmap_with_alpha(std::move(image)));
+    return this->insert(bitmap_key, wxImage_to_wxBitmap_with_alpha(std::move(image), m_scale));
 }
 
 NSVGimage* BitmapCache::nsvgParseFromFileWithReplace(const char* filename, const char* units, float dpi, const std::map<std::string, std::string>& replaces)

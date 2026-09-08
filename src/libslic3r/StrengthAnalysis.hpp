@@ -308,6 +308,22 @@ struct Result {
     bool succeeded() const { return status == AnalysisStatus::Success; }
 };
 
+// Quasi-static proportional playback of a solved elastic field. Time is a playback
+// coordinate, not a dynamic/viscoelastic solve. No post-yield displacement is predicted.
+struct LoadRampProbe {
+    std::string name;
+    size_t vertex_index{0};
+    double force_n{0.0};
+    double displacement_mm{0.0};
+};
+struct LoadRamp {
+    double duration_s{0.0};
+    double elastic_limit_fraction{std::numeric_limits<double>::infinity()};
+    std::vector<LoadRampProbe> probes;
+};
+LoadRamp make_load_ramp(const indexed_triangle_set &mesh, const Setup &setup, const Result &result, double duration_s);
+Result load_ramp_frame(const Result &endpoint, double fraction);
+
 using CancelPredicate = std::function<bool()>;
 
 std::vector<std::string> validate(const indexed_triangle_set &mesh, const Setup &setup);

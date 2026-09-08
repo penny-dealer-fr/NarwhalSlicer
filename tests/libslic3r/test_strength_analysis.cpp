@@ -341,6 +341,22 @@ TEST_CASE("Invalid study coordinate mappings remain finite and explicitly invali
     CHECK_THAT((frame.physical_vector_to_model(Vec3d::Ones()) - Vec3d::Ones()).norm(), WithinAbs(0.0, 0.0));
 }
 
+TEST_CASE("Prepare downward gravity preserves world direction and magnitude on transformed instances", "[StrengthAnalysis]")
+{
+    Transform3d transform = Transform3d::Identity();
+    transform.rotate(Eigen::AngleAxisd(1.1, Vec3d(2.0, -1.0, 3.0).normalized()));
+    const double mirror = GENERATE(1.0, -1.0);
+    transform.scale(Vec3d(2.0 * mirror, 0.5, 3.0));
+    const StudyCoordinateFrame frame(transform);
+    REQUIRE(frame.valid);
+    const Vec3d down(0.0, 0.0, -9.80665);
+    const Vec3d object_gravity = frame.scene_vector_to_physical(down);
+    CHECK_THAT(object_gravity.norm(), WithinRel(down.norm(), 1e-12));
+    CHECK_THAT((frame.physical_vector_to_scene(object_gravity) - down).norm(), WithinAbs(0.0, 1e-12));
+    // Raw inverse-transform components would incorrectly scale the acceleration.
+    CHECK((object_gravity - frame.scene_to_model * down).norm() > 1.0);
+}
+
 TEST_CASE("Singular transforms have no valid print layer axis", "[StrengthAnalysis]")
 {
     const int collapsed_axis = GENERATE(0, 1, 2, 3);
@@ -1381,4 +1397,175 @@ TEST_CASE("Optimization comparisons are deterministic and mass targets are monot
         CHECK(curve[index].target_safety_factor >= curve[index - 1].target_safety_factor);
         CHECK(curve[index].estimated_mass_kg >= curve[index - 1].estimated_mass_kg);
     }
+}
+
+TEST_CASE("Load ramp agrees with a proportional solve including gravity and impact", "[StrengthAnalysis][LoadRamp]")
+{
+    const auto mesh = its_make_cube(20.0, 20.0, 20.0);
+    Setup setup = cube_setup(mesh);
+    setup.loads.back().type = LoadType::ImpactForce;
+    setup.loads.back().impact_factor = 2.5;
+    setup.gravity.enabled = true;
+    const Result endpoint = analyze(mesh, setup);
+    REQUIRE(endpoint.succeeded());
+    const auto ramp = make_load_ramp(mesh, setup, endpoint, 8.0);
+    REQUIRE(ramp.probes.size() == 1);
+    CHECK_THAT(ramp.probes.front().force_n, WithinRel(250.0, 1e-10));
+    CHECK_THAT(ramp.duration_s, WithinAbs(8.0, 1e-10));
+    const Result zero = load_ramp_frame(endpoint, 0.0);
+    CHECK_THAT(zero.requested_resultant_force_n.norm(), WithinAbs(0.0, 1e-12));
+    CHECK_THAT(zero.maximum_displacement_m, WithinAbs(0.0, 1e-12));
+    CHECK(std::isinf(zero.minimum_safety_factor));
+    setup.loads.back().magnitude_n *= 0.4;
+    setup.gravity.acceleration_m_s2 *= 0.4;
+    const Result solved = analyze(mesh, setup);
+    const Result frame = load_ramp_frame(endpoint, 0.4);
+    REQUIRE(solved.succeeded());
+    CHECK_THAT(frame.maximum_displacement_m, WithinRel(solved.maximum_displacement_m, 1e-8));
+    CHECK_THAT(frame.maximum_von_mises_pa, WithinRel(solved.maximum_von_mises_pa, 1e-8));
+    for (size_t i = 0; i < frame.vertices.size(); ++i) {
+        CHECK_THAT((frame.vertices[i].displacement_m - solved.vertices[i].displacement_m).norm(), WithinAbs(0.0, 1e-10));
+        CHECK_THAT((frame.vertices[i].shear_stress_pa - solved.vertices[i].shear_stress_pa).norm(), WithinAbs(0.0, 1e-5));
+    }
+    CHECK_THAT(load_ramp_frame(endpoint, 1.0).maximum_displacement_m, WithinRel(endpoint.maximum_displacement_m, 1e-12));
+}
+
+TEST_CASE("Ramp elastic limit is independent of ultimate strength and target safety factor", "[StrengthAnalysis][LoadRamp]")
+{
+    const auto mesh = its_make_cube(20.0, 20.0, 20.0);
+    Setup setup = cube_setup(mesh);
+    const Result result = analyze(mesh, setup);
+    REQUIRE(result.succeeded());
+    const auto original = make_load_ramp(mesh, setup, result, 3.0);
+    REQUIRE(std::isfinite(original.elastic_limit_fraction));
+    setup.loads.back().strength_basis = StrengthBasis::Ultimate;
+    setup.loads.back().target_safety_factor = 100.0;
+    setup.material.ultimate_strength_xy_pa *= 10.0;
+    setup.material.ultimate_strength_z_pa *= 10.0;
+    CHECK_THAT(make_load_ramp(mesh, setup, result, 3.0).elastic_limit_fraction,
+               WithinRel(original.elastic_limit_fraction, 1e-12));
+    setup.material.yield_strength_xy_pa *= 0.5;
+    setup.material.yield_strength_z_pa *= 0.5;
+    setup.material.shear_strength_xy_pa *= 0.5;
+    setup.material.shear_strength_xz_pa *= 0.5;
+    CHECK_THAT(make_load_ramp(mesh, setup, result, 3.0).elastic_limit_fraction,
+               WithinRel(original.elastic_limit_fraction * 0.5, 1e-12));
+    CHECK_THAT(make_load_ramp(mesh, setup, result, -1.0).duration_s, WithinAbs(0.0, 1e-12));
+    CHECK_THAT(make_load_ramp(mesh, setup, result, std::numeric_limits<double>::quiet_NaN()).duration_s, WithinAbs(0.0, 1e-12));
+}
+
+#include "libslic3r/StrengthTransient.hpp"
+
+namespace {
+Setup transient_cube_setup(double force_n)
+{
+    Setup setup;
+    setup.infill.background_density = 1.0;
+    setup.infill.dense_density = 1.0;
+    Load support;
+    support.type = LoadType::Fixed;
+    support.region.shape = RegionShape::Box;
+    support.region.center_mm = Vec3d(0.5,2,2);
+    support.region.size_mm = Vec3d(1.01,5,5);
+    setup.loads.push_back(support);
+    Load force;
+    force.direction = Vec3d::UnitX();
+    force.magnitude_n = force_n;
+    force.region.shape = RegionShape::Box;
+    force.region.center_mm = Vec3d(3.5,2,2);
+    force.region.size_mm = Vec3d(1.01,5,5);
+    setup.loads.push_back(force);
+    return setup;
+}
+TransientSettings small_transient_settings()
+{
+    TransientSettings settings;
+    settings.layer_height_mm = 1.0;
+    settings.first_layer_height_mm = 1.0;
+    settings.cell_width_mm = 1.0;
+    settings.increments = 20;
+    settings.wall_loops = 0;
+    return settings;
+}
+}
+
+TEST_CASE("Layer-resolved elastic loading springs back after unloading", "[StrengthAnalysis][Transient]")
+{
+    const auto mesh = its_make_cube(4,4,4);
+    auto settings = small_transient_settings();
+    settings.plasticity = false;
+    settings.fracture = false;
+    const auto result = analyze_transient(mesh, transient_cube_setup(10), settings);
+    INFO(result.message);
+    REQUIRE(result.succeeded());
+    REQUIRE(result.frames.size() == settings.increments + 1);
+    CHECK(result.layer_count == 4);
+    CHECK_THAT(result.frames.front().probe_displacements_mm[0], WithinAbs(0,1e-12));
+    CHECK(result.frames[10].probe_displacements_mm[0] > 0);
+    CHECK_THAT(result.frames.back().probe_displacements_mm[0], WithinAbs(0,1e-8));
+    CHECK_THAT(result.frames[5].probe_displacements_mm[0], WithinRel(result.frames[15].probe_displacements_mm[0],1e-7));
+    CHECK_THAT(result.frames.back().applied_forces_n[0], WithinAbs(0,1e-12));
+    const Result display = transient_display_frame(result,10);
+    CHECK(display.vertices.size() == result.display_mesh.vertices.size());
+    CHECK(display.maximum_displacement_m > 0);
+}
+
+TEST_CASE("Plastic loading leaves permanent deformation after force removal", "[StrengthAnalysis][Transient]")
+{
+    auto settings = small_transient_settings();
+    settings.fracture = false;
+    const auto result = analyze_transient(its_make_cube(4,4,4), transient_cube_setup(1000), settings);
+    INFO(result.message);
+    REQUIRE(result.succeeded());
+    CHECK(std::isfinite(result.first_yield_time_s));
+    CHECK(result.frames.back().probe_displacements_mm[0] > 0.001);
+    CHECK(result.frames.back().probe_displacements_mm[0] < result.frames[10].probe_displacements_mm[0]);
+    CHECK_THAT(result.frames.back().applied_forces_n[0], WithinAbs(0,1e-12));
+    CHECK(result.frames.back().maximum_plastic_strain > 0);
+}
+
+TEST_CASE("Failed load paths never reconnect or regain force during unloading", "[StrengthAnalysis][Transient]")
+{
+    auto settings = small_transient_settings();
+    settings.failure_plastic_strain = 0.002;
+    const auto result = analyze_transient(its_make_cube(4,4,4), transient_cube_setup(3000), settings);
+    INFO(result.message);
+    REQUIRE(result.succeeded());
+    CHECK(std::isfinite(result.first_failure_time_s));
+    CHECK(result.frames.back().detached_cells > 0);
+    size_t previous_failed = 0, previous_detached = 0;
+    bool released = false;
+    for (const auto &frame : result.frames) {
+        CHECK(frame.failed_bonds >= previous_failed);
+        CHECK(frame.detached_cells >= previous_detached);
+        previous_failed = frame.failed_bonds;
+        previous_detached = frame.detached_cells;
+        if (frame.detached_cells && frame.applied_forces_n[0] < 1e-10) released = true;
+        if (released) CHECK_THAT(frame.applied_forces_n[0], WithinAbs(0,1e-10));
+    }
+    CHECK(released);
+}
+
+TEST_CASE("Layer geometry and thermal bonding respond to print inputs", "[StrengthAnalysis][Transient]")
+{
+    auto settings = small_transient_settings();
+    settings.thermal_bonding = true;
+    settings.bonding_scale = 0.7;
+    settings.increments = 4;
+    const auto mesh = its_make_cube(4,4,4);
+    const auto setup = transient_cube_setup(10);
+    const auto baseline = analyze_transient(mesh, setup, settings);
+    REQUIRE(baseline.succeeded());
+    settings.first_layer_height_mm = 0.5;
+    settings.layer_height_mm = 0.5;
+    settings.nozzle_temperature_c = 170;
+    const auto changed = analyze_transient(mesh, setup, settings);
+    INFO(changed.message);
+    REQUIRE(changed.succeeded());
+    CHECK(changed.layer_count == baseline.layer_count * 2);
+    CHECK(changed.layer_bond_factors.back() < baseline.layer_bond_factors.back());
+    CHECK(changed.layer_interface_temperature_c.back() < baseline.layer_interface_temperature_c.back());
+    settings.maximum_cells = 8;
+    CHECK(analyze_transient(mesh, setup, settings).status == AnalysisStatus::InvalidInput);
+    CHECK(analyze_transient(mesh, setup, small_transient_settings(), [] { return true; }).status == AnalysisStatus::Cancelled);
 }

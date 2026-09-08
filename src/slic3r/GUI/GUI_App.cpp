@@ -334,7 +334,10 @@ public:
         bool dark_mode = m_fg_color != wxColour("#6B6A6A");
         wxSize sz  = m_window->GetClientSize();
         BitmapCache bmp_cache;
-        m_logo_bmp = *bmp_cache.load_svg(dark_mode ? "splash_logo_dark" : "splash_logo", sz.GetWidth(), sz.GetHeight());
+        // The supplied artwork is a raster image; NanoSVG cannot render embedded PNGs.
+        if (auto* logo = bmp_cache.load_png(dark_mode ? "NarwhalSlicer_splash_dark" : "NarwhalSlicer_splash_light",
+                                           sz.GetWidth(), sz.GetHeight()))
+            m_logo_bmp = *logo;
 
         m_window->Bind(wxEVT_PAINT, &SplashScreen::OnPaint, this);
         m_window->Refresh();

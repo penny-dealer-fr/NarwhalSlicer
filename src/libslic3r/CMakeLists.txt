@@ -393,6 +393,8 @@ set(lisbslic3r_sources
     ShortestPath.hpp
     StrengthAnalysis.cpp
     StrengthAnalysis.hpp
+    StrengthTransient.cpp
+    StrengthTransient.hpp
     SLA/AGGRaster.hpp
     SLA/BoostAdapter.hpp
     SLA/Clustering.cpp

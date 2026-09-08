@@ -290,10 +290,10 @@ void DesktopIntegrationDialog::perform_desktop_integration()
     // slicer icon
     // iterate thru target_candidates to find icons folder
     for (size_t i = 0; i < target_candidates.size(); ++i) {
-        // Copy icon OrcaSlicer.png from resources_dir()/icons to target_dir_icons/icons/
+        // Install the Narwhal artwork under the existing desktop-entry icon name.
         if (contains_path_dir(target_candidates[i], "images")) {
             target_dir_icons = target_candidates[i];
-            std::string icon_path = GUI::format("%1%/images/OrcaSlicer.png",resources_dir());
+            std::string icon_path = GUI::format("%1%/images/NarwhalSlicer.png",resources_dir());
             std::string dest_path = GUI::format("%1%/images/%2%OrcaSlicer%3%.png", target_dir_icons, icon_theme_path, version_suffix);
             if (copy_icon(icon_path, dest_path))
                 break; // success
@@ -305,7 +305,7 @@ void DesktopIntegrationDialog::perform_desktop_integration()
                 create_path(into_u8(wxFileName::GetHomeDir()), ".local/share/icons" + icon_theme_dirs);
                 // copy icon
                 target_dir_icons = GUI::format("%1%/.local/share",wxFileName::GetHomeDir());
-                std::string icon_path = GUI::format("%1%/images/OrcaSlicer.png",resources_dir());
+                std::string icon_path = GUI::format("%1%/images/NarwhalSlicer.png",resources_dir());
                 std::string dest_path = GUI::format("%1%/images/%2%OrcaSlicer%3%.png", target_dir_icons, icon_theme_path, version_suffix);
                 if (!contains_path_dir(target_dir_icons, "images") 
                     || !copy_icon(icon_path, dest_path)) {
@@ -389,7 +389,7 @@ void DesktopIntegrationDialog::perform_desktop_integration()
         // Icon
         if (!target_dir_icons.empty())
         {
-            std::string icon_path = GUI::format("%1%/images/OrcaSlicer-gcodeviewer_192px.png",resources_dir());
+            std::string icon_path = GUI::format("%1%/images/NarwhalSlicer-gcodeviewer_192px.png",resources_dir());
             std::string dest_path = GUI::format("%1%/images/%2%OrcaSlicer-gcodeviewer%3%.png", target_dir_icons, icon_theme_path, version_suffix);
             if (copy_icon(icon_path, dest_path))
                 // save path to icon

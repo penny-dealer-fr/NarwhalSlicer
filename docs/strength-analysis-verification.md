@@ -21,7 +21,7 @@ Final tests for this checkpoint: **344 core cases / 283,143 assertions**, **145 
 Follow-up viewport checkpoint: both study canvases now project through the selected Prepare instance's rotation, scale, and reflection. Camera fitting, surface picking, physical force/deformation vectors, and region handles use the same mapping. Sphere outlines project as ellipses and cylinder caps use transformed rings. Stored regions/modifiers remain raw-object coordinates; stale results retain their solved transform. Two new core cases check point/vector/normal mapping under rotation, nonuniform scale, reflection, and invalid transforms. Full core results: **346 cases / 283,165 assertions**, passing. Native interaction and visual verification remain open, as do the broader material-data and optimization-workflow gaps below.
 
 - macOS arm64 Release application build succeeds.
-- Full core suite: 346 cases, 283,165 assertions, randomized order, passing.
+- Full core suite: 347 cases, 283,173 assertions, randomized order, passing.
 - Earlier focused strength checkpoint: 28 cases, 113,551 assertions, passing; the expanded strength cases are included in the full core run above.
 - Full FFF suite: 145 cases, 8,011 assertions, randomized order, passing.
 - The slicing regression creates the same native parameter-modifier mesh and settings used by the GUI. It checks 15%, 50%, and 100% selected model volume, increasing actual generated infill, replacement, removal, and restored/redo model states.
@@ -62,13 +62,16 @@ The solver remains a linear-elastic edge-network engineering approximation. It d
 
 ## Native UI gate still open
 
+Coordinate-clarity follow-up (2026-09-07): force/gravity fields explicitly identify object axes. The gravity dialog offers a Prepare -Z preset, converted without changing physical acceleration magnitude; existing saved vectors retain their meaning. The initial clicked-surface arrow now uses the same scaled normal as the confirmed load. A rotated, nonuniformly scaled, mirrored-instance gravity regression passes; the arm64 Release app builds and all 347 core cases pass. Preset confirm/cancel, layout, and visual direction checks are still part of the native UI gate, not covered by this core test.
+
 macOS denied the UI-control attempt with “osascript is not allowed assistive access.” Accessibility permission is needed before that interaction route can be used. A screenshot of the app's Prepare tab is not evidence that the Load/Simulation controls work. No alternate input route was used to bypass the denial.
 
 The remaining interactive checklist is:
 
 - Light/dark screenshots; standard/HiDPI scaling; narrow-window and localized-label layout; keyboard focus and Delete/Backspace behavior.
-- Place, edit, drag, delete, undo, and redo supports, forces, gravity, and preserve regions. Confirm dragged positions survive pre-check and solve.
+- Place, edit, drag, delete, undo, and redo supports, forces, gravity, and preserve regions. Confirm dragged positions survive pre-check and solve. With canvas/tree focus, check Cmd/Ctrl+Z, Cmd/Ctrl+Shift+Z, Cmd/Ctrl+Y, Delete, and Backspace, including history limits and editing after undo. Text fields must retain normal text undo and deletion.
 - Confirm invalid numeric input gives an orange pre-check state and corrected inputs give green. Confirm stale results cannot be applied and canceled/obsolete workers cannot overwrite current state.
+- At 0% selected or calculated volume, confirm Remove Slice Modifier is enabled only when a managed modifier exists; remove it and confirm the button disables. Return to positive volume and confirm Create Slice Modifier returns. Repeat after sizing to a target and after project Undo/Redo.
 - Inspect 0%, intermediate, and 100% volume masks; use the setup threshold and reachable/unreachable safety-factor targets; verify baseline-only response labels with gravity.
 - Apply, replace, remove, Undo/Redo, and save/reopen the modifier through the UI. Inspect actual generated infill in Preview and confirm existing user modifiers remain untouched.
 - Check instance scaling/rotation and multiple-object changes against the analysis coordinate frame; raw-mesh unit tests alone do not prove every transformed-instance workflow.

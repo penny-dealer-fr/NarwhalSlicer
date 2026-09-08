@@ -269,7 +269,7 @@ static wxIcon main_frame_icon(GUI_App::EAppMode app_mode)
     }
     return wxIcon(path, wxBITMAP_TYPE_ICO);
 #else // _WIN32
-    return wxIcon(Slic3r::var("OrcaSlicer_128px.png"), wxBITMAP_TYPE_PNG);
+    return wxIcon(Slic3r::var("NarwhalSlicer_128px.png"), wxBITMAP_TYPE_PNG);
 #endif // _WIN32
 }
 
@@ -396,7 +396,7 @@ DPIFrame(NULL, wxID_ANY, "", wxDefaultPosition, wxDefaultSize, BORDERLESS_FRAME_
     default:
     case GUI_App::EAppMode::Editor:
         m_taskbar_icon = std::make_unique<OrcaSlicerTaskBarIcon>(wxTBI_DOCK);
-        m_taskbar_icon->SetIcon(wxIcon(Slic3r::var("OrcaSlicer-mac_256px.ico"), wxBITMAP_TYPE_ICO), "OrcaSlicer");
+        m_taskbar_icon->SetIcon(wxIcon(Slic3r::var("NarwhalSlicer.ico"), wxBITMAP_TYPE_ICO), "NarwhalSlicer");
         break;
     case GUI_App::EAppMode::GCodeViewer:
         break;
@@ -1340,6 +1340,11 @@ void MainFrame::init_tabpanel() {
             m_strength_load_panel->activate();
     }, [this](const StrengthAnalysis::DenseRegionPreview &preview) {
         return m_strength_load_panel != nullptr && m_strength_load_panel->create_dense_modifier_from_preview(preview);
+    }, [this] {
+        return m_strength_load_panel != nullptr && m_strength_load_panel->has_dense_modifier();
+    }, [this] {
+        if (m_strength_load_panel != nullptr)
+            m_strength_load_panel->remove_dense_modifier();
     });
     m_strength_load_panel->set_result_callback([this] {
         if (m_strength_simulation_panel != nullptr)
@@ -3172,6 +3177,16 @@ void MainFrame::init_menubar_as_editor()
         add_common_view_menu_items(viewMenu, this, std::bind(&MainFrame::can_change_view, this));
         viewMenu->AppendSeparator();
 
+        auto *workspace_menu = new wxMenu;
+        append_menu_item(workspace_menu, wxID_ANY, _L("Prepare"), _L("Open the Prepare workspace"),
+                         [this](wxCommandEvent &) { select_tab(TAB_ID_PREPARE); });
+        append_menu_item(workspace_menu, wxID_ANY, _L("Load"), _L("Open the strength study setup workspace"),
+                         [this](wxCommandEvent &) { select_tab(TAB_ID_STRENGTH_LOAD); });
+        append_menu_item(workspace_menu, wxID_ANY, _L("Simulation"), _L("Open the strength study results workspace"),
+                         [this](wxCommandEvent &) { select_tab(TAB_ID_STRENGTH_SIMULATION); });
+        viewMenu->AppendSubMenu(workspace_menu, _L("Workspace"));
+        viewMenu->AppendSeparator();
+
         //BBS perspective view
         wxWindowID camera_id_base = wxWindow::NewControlId(int(wxID_CAMERA_COUNT));
         auto perspective_item = append_menu_radio_item(viewMenu, wxID_CAMERA_PERSPECTIVE + camera_id_base, _L("Use Perspective View"), _L("Use Perspective View"),
@@ -4554,7 +4569,7 @@ SettingsDialog::SettingsDialog(MainFrame* mainframe)
         SetIcon(wxIcon(szExeFileName, wxBITMAP_TYPE_ICO));
     }
 #else
-    SetIcon(wxIcon(var("OrcaSlicer_128px.png"), wxBITMAP_TYPE_PNG));
+    SetIcon(wxIcon(var("NarwhalSlicer_128px.png"), wxBITMAP_TYPE_PNG));
 #endif // _WIN32
 
     //just hide the Frame on closing

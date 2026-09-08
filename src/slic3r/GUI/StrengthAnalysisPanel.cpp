@@ -4,6 +4,14 @@
 #include "Plater.hpp"
 #include "Selection.hpp"
 #include "Widgets/Button.hpp"
+#include "wxExtensions.hpp"
+#include "libslic3r/AppConfig.hpp"
+#include <wx/menu.h>
+#include <wx/popupwin.h>
+#include <wx/timer.h>
+#include <wx/display.h>
+#include <wx/statline.h>
+#include <wx/wrapsizer.h>
 
 #include "libslic3r/Geometry.hpp"
 #include "libslic3r/Model.hpp"
@@ -29,6 +37,10 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <chrono>
+#include <future>
+#include <wx/progdlg.h>
+#include <wx/notebook.h>
 #include <limits>
 #include <numeric>
 #include <sstream>
@@ -40,6 +52,308 @@ wxDEFINE_EVENT(EVT_STRENGTH_ANALYSIS_FINISHED, wxThreadEvent);
 namespace {
 
 namespace SA = StrengthAnalysis;
+
+// Shared ribbon: commands keep their existing handlers and enabled-state ownership.
+// Preferences are UI-only, deliberately outside the serialized simulation study.
+class StudyToolbar final : public wxPanel
+{
+    struct Tool {
+        std::string key;
+        wxString label;
+        std::string icon;
+        std::function<void()> run;
+        std::function<bool()> enabled;
+        std::function<bool()> checked;
+        bool pinned;
+        bool hidden;
+        Button *button;
+        std::function<std::string()> state_icon;
+    };
+    struct Group {
+        wxPanel *panel;
+        wxBoxSizer *icons;
+        wxButton *menu;
+        std::vector<Tool> tools;
+    };
+    std::string m_scope;
+    std::vector<Group> m_groups;
+    wxBoxSizer *m_row;
+    wxPopupWindow *m_hover{nullptr};
+    wxStaticText *m_hover_text{nullptr};
+    wxTimer m_hover_timer{this};
+    wxTimer m_state_timer{this};
+    size_t m_hover_group{0}, m_hover_tool{0};
+
+    wxString explanation(const Tool &tool) const
+    {
+        const std::string &key = tool.key;
+        if (key == "fixed") return _L("Fix the selected region so it cannot move during the study.");
+        if (key == "preserve") return _L("Protect a region from replacement by the strengthened infill modifier.");
+        if (key == "force") return _L("Place a directional force on the model, then edit its direction and magnitude.");
+        if (key == "local-force") return _L("Apply a localized force to a selected region of the model.");
+        if (key == "bearing") return _L("Place a bearing load on a selected region and edit its force direction.");
+        if (key == "impact") return _L("Define an impact load and its equivalent force for the study.");
+        if (key == "global") return _L("Apply a force across the whole model.");
+        if (key == "gravity") return _L("Enable self-weight and set the gravity vector in object coordinates.");
+        if (key == "faces") return _L("Group coplanar mesh triangles into selectable solid-like faces without changing the geometry.");
+        if (key == "objectives") return _L("Edit safety-factor, displacement, mass, stiffness, support, and print-time objectives.");
+        if (key == "precheck") return _L("Check mesh, material, supports, loads, and objectives. Green: ready. Yellow: not checked or incomplete. Red: validation failed. Click for details.");
+        if (key == "solve") return _L("Solve the current study and prepare stress, deformation, safety-factor, and reinforcement results.");
+        if (key == "cancel-solve") return _L("Stop the current background analysis.");
+        if (key == "material") return _L("Choose the study material and edit its mechanical properties and calibration.");
+        if (key == "structure") return _L("Edit the background and dense infill patterns, densities, and stress threshold.");
+        if (key == "dense" || key == "print-dense") return _L("Open the stress-directed dense-region preview before applying a slicer modifier.");
+        if (key == "orientation") return _L("Apply the best estimated print orientation to the selected instance. Solve again after applying.");
+        if (key == "settings") return _L("Apply the feasible optimized print settings to the selected object. Solve again after applying.");
+        if (key == "undo") return _L("Undo the previous study setup edit. Use Cmd/Ctrl+Z from the Load workspace.");
+        if (key == "redo") return _L("Restore an undone study setup edit. Use Cmd/Ctrl+Shift+Z from the Load workspace.");
+        if (key == "fit") return _L("Center the model and adjust the camera to fit it in the viewport.");
+        if (key == "cancel-placement") return _L("Leave the current placement tool without adding another region. Escape also cancels placement.");
+        if (key == "delete") return _L("Delete the selected load, support, or preserve region. This can be undone.");
+        if (key == "save") return _L("Validate and save the current study setup on the model object.");
+        if (key == "remove" || key == "remove-dense") return _L("Remove the managed strength modifier from the object. Other modifiers are preserved.");
+        if (key == "apply") return _L("Create or update the managed dense-infill modifier using the current preview.");
+        if (key == "target") return _L("Enter a target estimated safety factor and find the smallest qualifying region in 1% volume steps.");
+        if (key == "threshold") return _L("Set the preview volume using the study's stress threshold and preserve regions.");
+        if (key == "probe") return _L("Click the visible model surface to inspect position, displacement, stress, and safety factor at a nearby vertex.");
+        if (key == "section") return _L("Toggle an uncapped surface cut at the midpoint of object Z. Retain the lower half to inspect the result surface.");
+        if (key == "loads") return _L("Show or hide the study's loads and constraints over the result model.");
+        if (key == "wireframe") return _L("Show or hide mesh edges and the undeformed reference wireframe.");
+        if (key == "contours") return _L("Switch between smooth and discrete color bands in the result contours.");
+        if (key.find("result-") == 0) return _L("Display this result field on the model. Read its units and value range in the viewport legend.");
+        if (key.find("view-") == 0) return _L("Set the camera to this standard view without changing the model's print orientation.");
+        return _L("Choose how geometry is selected: an individual triangle, a coplanar solid face, or a connected component.");
+    }
+
+    void hide_hover()
+    {
+        m_hover_timer.Stop();
+        if (m_hover) m_hover->Hide();
+    }
+
+    void show_hover(size_t group, size_t index, bool details)
+    {
+        const Tool &tool = m_groups[group].tools[index];
+        if (!tool.button->IsShownOnScreen()) return;
+        if (!m_hover) {
+            m_hover = new wxPopupWindow(this, wxBORDER_SIMPLE);
+            m_hover_text = new wxStaticText(m_hover, wxID_ANY, wxEmptyString);
+            auto *sizer = new wxBoxSizer(wxVERTICAL);
+            sizer->Add(m_hover_text, 0, wxALL, FromDIP(8));
+            m_hover->SetSizer(sizer);
+            wxGetApp().UpdateDarkUI(m_hover);
+            wxGetApp().UpdateDarkUI(m_hover_text);
+        }
+        m_hover_text->SetLabel(tool.label + (details ? "\n\n" + explanation(tool) : wxString()));
+        if (details) m_hover_text->Wrap(FromDIP(280));
+        m_hover->Fit();
+        const wxRect anchor = tool.button->GetScreenRect();
+        m_hover->Position(wxPoint(anchor.x, anchor.GetBottom() + FromDIP(4)), wxSize(0, 0));
+        m_hover->Show();
+        m_hover_group = group;
+        m_hover_tool = index;
+        if (!details) m_hover_timer.StartOnce(2200);
+    }
+
+
+    void resize_tools()
+    {
+        if (m_groups.empty())
+            return;
+        hide_hover();
+        const int step = FromDIP(40);
+        const int available = std::max(0, std::min(GetClientSize().x, GetParent()->GetClientSize().x - FromDIP(32)));
+        std::vector<int> widths;
+        std::vector<std::vector<size_t>> candidates(m_groups.size());
+        std::vector<size_t> counts(m_groups.size(), 0);
+        int used = FromDIP(8) * int(m_groups.size()) + int(m_groups.size() - 1);
+        for (size_t g = 0; g < m_groups.size(); ++g) {
+            Group &group = m_groups[g];
+            widths.push_back(group.menu->GetBestSize().x);
+            used += widths.back();
+            for (Tool &tool : group.tools) group.icons->Show(tool.button, false);
+            // Pinned tools get first choice. Other tools fill spare space unless explicitly unpinned.
+            for (bool pinned : {true, false})
+                for (size_t i = 0; i < group.tools.size(); ++i)
+                    if (!group.tools[i].hidden && group.tools[i].pinned == pinned) candidates[g].push_back(i);
+        }
+        bool added = true;
+        while (added) {
+            added = false;
+            for (size_t g = 0; g < m_groups.size(); ++g) {
+                if (counts[g] == candidates[g].size()) continue;
+                const int width = std::max(widths[g], int(counts[g] + 1) * step);
+                if (used + width - widths[g] > available) continue;
+                used += width - widths[g];
+                widths[g] = width;
+                ++counts[g];
+                added = true;
+            }
+        }
+        for (size_t g = 0; g < m_groups.size(); ++g) {
+            Group &group = m_groups[g];
+            for (size_t i = 0; i < counts[g]; ++i) group.icons->Show(group.tools[candidates[g][i]].button, true);
+            group.panel->SetMinSize(wxSize(widths[g], FromDIP(72)));
+            group.panel->InvalidateBestSize();
+            group.panel->Layout();
+        }
+        Layout();
+    }
+
+    void on_parent_size(wxSizeEvent &event)
+    {
+        resize_tools();
+        event.Skip();
+    }
+
+    void menu(size_t index)
+    {
+        hide_hover();
+        Group &group = m_groups[index];
+        wxMenu menu;
+        auto *pins = new wxMenu;
+        for (size_t i = 0; i < group.tools.size(); ++i) {
+            const Tool &tool = group.tools[i];
+            const int id = wxWindow::NewControlId();
+            auto *item = menu.Append(id, tool.label, wxEmptyString, tool.checked ? wxITEM_CHECK : wxITEM_NORMAL);
+            if (tool.checked) item->Check(tool.checked());
+            item->SetBitmap(ScalableBitmap(this, tool.state_icon ? tool.state_icon() : tool.icon, 16).bmp());
+            item->Enable(!tool.enabled || tool.enabled());
+            menu.Bind(wxEVT_MENU, [this, index, i](wxCommandEvent &) {
+                const Tool &tool = m_groups[index].tools[i];
+                if (!tool.enabled || tool.enabled()) tool.run();
+            }, id);
+            const int pin_id = wxWindow::NewControlId();
+            pins->AppendCheckItem(pin_id, tool.label)->Check(tool.pinned);
+            pins->Bind(wxEVT_MENU, [this, index, i](wxCommandEvent &event) {
+                Tool &tool = m_groups[index].tools[i];
+                tool.pinned = event.IsChecked();
+                tool.hidden = !tool.pinned;
+                wxGetApp().app_config->set("strength_toolbar", m_scope + "." + tool.key, tool.pinned ? "1" : "0");
+                resize_tools();
+            }, pin_id);
+        }
+        menu.AppendSeparator();
+        menu.AppendSubMenu(pins, _L("Pin to toolbar"));
+        PopupMenu(&menu, group.panel->GetPosition() + group.menu->GetPosition() + wxPoint(0, group.menu->GetSize().y));
+    }
+
+public:
+    StudyToolbar(wxWindow *parent, const std::string &scope) : wxPanel(parent), m_scope(scope)
+    {
+        m_row = new wxBoxSizer(wxHORIZONTAL);
+        SetSizer(m_row);
+        SetMinSize(FromDIP(wxSize(400, 72)));
+        wxGetApp().UpdateDarkUI(this);
+        Bind(wxEVT_SIZE, [this](wxSizeEvent &event) { resize_tools(); event.Skip(); });
+        parent->Bind(wxEVT_SIZE, &StudyToolbar::on_parent_size, this);
+        Bind(wxEVT_TIMER, [this](wxTimerEvent &) {
+            if (!IsShownOnScreen()) return;
+            for (Group &group : m_groups)
+                for (Tool &tool : group.tools) tool.button->UpdateWindowUI();
+        }, m_state_timer.GetId());
+        m_state_timer.Start(150);
+        Bind(wxEVT_TIMER, [this](wxTimerEvent &) {
+            const Tool &tool = m_groups[m_hover_group].tools[m_hover_tool];
+            if (tool.button->GetScreenRect().Contains(wxGetMousePosition()))
+                show_hover(m_hover_group, m_hover_tool, true);
+            else hide_hover();
+        }, m_hover_timer.GetId());
+    }
+
+    ~StudyToolbar() override
+    {
+        m_hover_timer.Stop();
+        m_state_timer.Stop();
+        GetParent()->Unbind(wxEVT_SIZE, &StudyToolbar::on_parent_size, this);
+    }
+
+    size_t group(const wxString &name)
+    {
+        if (!m_groups.empty())
+            m_row->Add(new wxStaticLine(this, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxLI_VERTICAL),
+                       0, wxEXPAND | wxTOP | wxBOTTOM, FromDIP(10));
+        auto *panel = new wxPanel(this);
+        wxGetApp().UpdateDarkUI(panel);
+        auto *column = new wxBoxSizer(wxVERTICAL);
+        auto *icons = new wxBoxSizer(wxHORIZONTAL);
+        column->Add(icons, 1, wxALIGN_CENTER_HORIZONTAL | wxTOP, FromDIP(4));
+        auto *label = new wxButton(panel, wxID_ANY, name + wxString::FromUTF8(" ▾"),
+                                   wxDefaultPosition, wxDefaultSize, wxBU_EXACTFIT | wxBORDER_NONE);
+        wxGetApp().UpdateDarkUI(label);
+        label->SetToolTip(_L("All tools in this section. Use Pin to toolbar to customize shortcuts."));
+        column->Add(label, 0, wxALIGN_CENTER_HORIZONTAL | wxBOTTOM, FromDIP(3));
+        panel->SetSizer(column);
+        m_row->Add(panel, 0, wxEXPAND | wxLEFT | wxRIGHT, FromDIP(4));
+        const size_t index = m_groups.size();
+        m_groups.push_back({panel, icons, label, {}});
+        label->Bind(wxEVT_BUTTON, [this, index](wxCommandEvent &) { menu(index); });
+        return index;
+    }
+
+    void add(size_t group, const std::string &key, const wxString &label, const std::string &icon,
+             bool pinned, std::function<void()> run, std::function<bool()> enabled = {}, std::function<bool()> checked = {},
+             std::function<std::string()> state_icon = {})
+    {
+        const std::string preference = m_scope + "." + key;
+        const bool customized = wxGetApp().app_config->has("strength_toolbar", preference);
+        if (customized)
+            pinned = wxGetApp().app_config->get("strength_toolbar", preference) == "1";
+        Group &g = m_groups[group];
+        auto *button = new Button(g.panel, wxEmptyString, wxString::FromUTF8(icon), 0, 24);
+        button->SetStyle(ButtonStyle::Regular, ButtonType::Icon);
+        button->SetPaddingSize(FromDIP(wxSize(6, 8)));
+        button->SetName(label);
+        button->SetMinSize(FromDIP(wxSize(36, 40)));
+        button->SetBackgroundColor(StateColor(
+            std::pair<wxColour, int>(wxGetApp().get_highlight_default_clr(), StateColor::Hovered),
+            std::pair<wxColour, int>(g.panel->GetBackgroundColour(), StateColor::Normal)));
+        button->SetBorderColor(StateColor(g.panel->GetBackgroundColour()));
+        g.icons->Add(button, 0, wxRIGHT, FromDIP(4));
+        const size_t index = g.tools.size();
+        g.tools.push_back({key, label, icon, std::move(run), std::move(enabled), std::move(checked), pinned, customized && !pinned, button, std::move(state_icon)});
+        button->Bind(wxEVT_BUTTON, [this, group, index](wxCommandEvent &) {
+            hide_hover();
+            const Tool &tool = m_groups[group].tools[index];
+            if (!tool.enabled || tool.enabled()) tool.run();
+        });
+        button->Bind(wxEVT_UPDATE_UI, [this, group, index](wxUpdateUIEvent &event) {
+            Tool &tool = m_groups[group].tools[index];
+            const bool enabled = !tool.enabled || tool.enabled();
+            if (tool.key == "undo" || tool.key == "redo") {
+                const std::string icon = "strength_" + tool.key + (enabled ? "" : "_disabled");
+                if (icon != tool.icon) { tool.icon = icon; tool.button->SetIcon(wxString::FromUTF8(icon)); }
+            }
+            if (tool.state_icon) {
+                const std::string icon = tool.state_icon();
+                if (icon != tool.icon) {
+                    tool.icon = icon;
+                    tool.button->SetIcon(wxString::FromUTF8(icon));
+                }
+            }
+            event.Enable(enabled);
+            tool.button->SetValue(tool.checked && tool.checked());
+            tool.button->SetForegroundColour(tool.checked && tool.checked() ? wxGetApp().get_label_clr_modified() :
+                                              wxGetApp().get_label_clr_default());
+        });
+        button->Bind(wxEVT_CONTEXT_MENU, [this, group](wxContextMenuEvent &) { menu(group); });
+        button->Bind(wxEVT_ENTER_WINDOW, [this, group, index](wxMouseEvent &event) { show_hover(group, index, false); event.Skip(); });
+        button->Bind(wxEVT_LEAVE_WINDOW, [this](wxMouseEvent &event) { hide_hover(); event.Skip(); });
+        button->Bind(wxEVT_KILL_FOCUS, [this](wxFocusEvent &event) { hide_hover(); event.Skip(); });
+        resize_tools();
+    }
+
+    void command(size_t group, const std::string &key, wxButton *source, const wxString &label,
+                 const std::string &icon, bool pinned = true)
+    {
+        source->Hide();
+        add(group, key, label, icon, pinned, [source] {
+            wxCommandEvent event(wxEVT_BUTTON, source->GetId());
+            event.SetEventObject(source);
+            source->GetEventHandler()->ProcessEvent(event);
+        }, [source] { return source->IsEnabled(); });
+    }
+};
 
 constexpr const char *STRENGTH_MODIFIER_NAME = "Strength dense region";
 
@@ -1136,7 +1450,8 @@ protected:
             m_preview_region.surface_triangles = selection_faces(face);
             m_preview_face = face;
             m_preview_load_type = placement == int(Placement::Preserve) ? SA::LoadType::Fixed : SA::LoadType(placement);
-            m_preview_direction = normal.squaredNorm() > 1e-12 ? Vec3d(-normal.normalized()) : Vec3d(0.0, 0.0, -1.0);
+            const Vec3d physical_normal = normal.cwiseQuotient(m_session->setup.geometry_scale);
+            m_preview_direction = physical_normal.squaredNorm() > 1e-12 ? Vec3d(-physical_normal.normalized()) : Vec3d(0.0, 0.0, -1.0);
             Refresh();
             Update();
             if (placement == int(Placement::Preserve))
@@ -1395,7 +1710,7 @@ StrengthLoadPanel::StrengthLoadPanel(wxWindow *parent, Plater *plater, std::shar
     , m_plater(plater)
     , m_session(std::move(session))
 {
-    SetBackgroundColour(*wxWHITE);
+    SetBackgroundColour(wxSystemSettings::GetColour(wxSYS_COLOUR_WINDOW));
     SetScrollRate(FromDIP(12), FromDIP(12));
     build_ui();
     Bind(EVT_STRENGTH_ANALYSIS_FINISHED, [this](wxThreadEvent &) { on_analysis_finished(); });
@@ -1410,6 +1725,27 @@ StrengthLoadPanel::~StrengthLoadPanel()
 
 void StrengthLoadPanel::build_ui()
 {
+    Bind(wxEVT_CHAR_HOOK, [this](wxKeyEvent &event) {
+        // Let text fields handle their own editing shortcuts.
+        if (dynamic_cast<wxTextCtrl *>(wxWindow::FindFocus()) != nullptr) {
+            event.Skip();
+            return;
+        }
+        const int key = event.GetKeyCode();
+        if (event.CmdDown() && !event.AltDown() && (key == 'Z' || key == 'Y')) {
+            const bool redo = key == 'Y' || event.ShiftDown();
+            if (redo && m_setup_history_index + 1 < m_setup_history.size())
+                restore_setup_history(m_setup_history_index + 1);
+            else if (!redo && m_setup_history_index > 0)
+                restore_setup_history(m_setup_history_index - 1);
+            return;
+        }
+        if (!event.HasAnyModifiers() && (key == WXK_DELETE || key == WXK_BACK) && m_selected_kind >= 1 && m_selected_kind <= 3) {
+            delete_selected_operation();
+            return;
+        }
+        event.Skip();
+    });
     const int gap = FromDIP(8);
     auto *root = new wxBoxSizer(wxVERTICAL);
     root->Add(new wxStaticText(this, wxID_ANY, _L("Strength Analysis — Load Setup")), 0, wxLEFT | wxRIGHT | wxTOP, gap);
@@ -1420,7 +1756,6 @@ void StrengthLoadPanel::build_ui()
     root->Add(m_status_label, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
 
     auto *workspace = new wxStaticBoxSizer(wxVERTICAL, this, _L("Simulation study workspace"));
-    auto *placement_tools = new wxBoxSizer(wxHORIZONTAL);
     auto *place_fixed = new wxButton(this, wxID_ANY, _L("Fixed support"));
     auto *place_force = new wxButton(this, wxID_ANY, _L("Force"));
     auto *place_bearing = new wxButton(this, wxID_ANY, _L("Bearing"));
@@ -1433,21 +1768,19 @@ void StrengthLoadPanel::build_ui()
                                         {_L("Triangle"), _L("Solid face"), _L("Component")});
     selection_mode->SetSelection(1);
     auto *cancel_placement = new wxButton(this, wxID_ANY, _L("Cancel placement"));
-    for (wxButton *button : {place_fixed, place_force, place_bearing, place_impact, place_global,
-                             place_preserve, gravity_dialog, generate_faces, cancel_placement})
-        placement_tools->Add(button, 0, wxRIGHT, gap);
-    placement_tools->Add(new wxStaticText(this, wxID_ANY, _L("Selection")), 0,
-                         wxALIGN_CENTER_VERTICAL | wxRIGHT, FromDIP(4));
-    placement_tools->Add(selection_mode, 0, wxRIGHT, gap);
-    workspace->Add(placement_tools, 0, wxEXPAND | wxALL, gap);
-
-    auto *study_tools = new wxBoxSizer(wxHORIZONTAL);
     auto *material_dialog = new wxButton(this, wxID_ANY, _L("Study material"));
     auto *infill_dialog = new wxButton(this, wxID_ANY, _L("Print structure"));
     auto *criteria_dialog = new wxButton(this, wxID_ANY, _L("Optimization objectives"));
     auto *fit_view = new wxButton(this, wxID_ANY, _L("Fit"));
     m_setup_undo = new wxButton(this, wxID_ANY, _L("Undo setup"));
     m_setup_redo = new wxButton(this, wxID_ANY, _L("Redo setup"));
+#ifdef __WXOSX__
+    m_setup_undo->SetToolTip(_L("Undo setup (Cmd+Z)"));
+    m_setup_redo->SetToolTip(_L("Redo setup (Cmd+Shift+Z or Cmd+Y)"));
+#else
+    m_setup_undo->SetToolTip(_L("Undo setup (Ctrl+Z)"));
+    m_setup_redo->SetToolTip(_L("Redo setup (Ctrl+Shift+Z or Ctrl+Y)"));
+#endif
     auto *view = new wxChoice(this, wxID_ANY, wxDefaultPosition, wxDefaultSize,
                               {_L("Isometric"), _L("Front"), _L("Top"), _L("Right")});
     view->SetSelection(0);
@@ -1457,17 +1790,40 @@ void StrengthLoadPanel::build_ui()
     set_precheck_state(0);
     m_run_button = new wxButton(this, wxID_ANY, _L("Solve"));
     m_cancel_button = new wxButton(this, wxID_ANY, _L("Cancel solve"));
-    for (wxButton *button : {material_dialog, infill_dialog, criteria_dialog, fit_view})
-        study_tools->Add(button, 0, wxRIGHT, gap);
-    study_tools->Add(new wxStaticText(this, wxID_ANY, _L("View")), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, FromDIP(4));
-    study_tools->Add(view, 0, wxRIGHT, gap);
-    study_tools->Add(m_setup_undo, 0, wxRIGHT, gap);
-    study_tools->Add(m_setup_redo, 0, wxRIGHT, gap);
-    study_tools->AddStretchSpacer();
-    study_tools->Add(m_precheck_button, 0, wxRIGHT, gap);
-    study_tools->Add(m_run_button, 0, wxRIGHT, gap);
-    study_tools->Add(m_cancel_button, 0);
-    workspace->Add(study_tools, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
+    auto *toolbar = new StudyToolbar(this, "load");
+    workspace->Add(toolbar, 0, wxEXPAND | wxALL, gap);
+    const auto setup_group = toolbar->group(_L("Setup"));
+    const auto loads_group = toolbar->group(_L("Loads"));
+    const auto study_group = toolbar->group(_L("Study"));
+    const auto print_group = toolbar->group(_L("Print"));
+    const auto tools_group = toolbar->group(_L("Tools"));
+    toolbar->command(setup_group, "fixed", place_fixed, _L("Fixed"), "strength_fixed");
+    toolbar->command(setup_group, "preserve", place_preserve, _L("Preserve"), "strength_preserve");
+    toolbar->command(setup_group, "faces", generate_faces, _L("Solid faces"), "strength_faces", false);
+    toolbar->command(loads_group, "force", place_force, _L("Force"), "strength_force");
+    toolbar->add(loads_group, "local-force", _L("Local force"), "strength_force", false,
+                 [this] { begin_place_load(SA::LoadType::LocalForce); });
+    toolbar->command(loads_group, "bearing", place_bearing, _L("Bearing"), "strength_bearing");
+    toolbar->command(loads_group, "impact", place_impact, _L("Impact"), "strength_impact", false);
+    toolbar->command(loads_group, "global", place_global, _L("Global load"), "strength_global", false);
+    toolbar->command(loads_group, "gravity", gravity_dialog, _L("Gravity"), "strength_gravity", false);
+    toolbar->command(study_group, "objectives", criteria_dialog, _L("Objectives"), "strength_objectives");
+    toolbar->command(print_group, "material", material_dialog, _L("Material"), "strength_material");
+    toolbar->command(print_group, "structure", infill_dialog, _L("Structure"), "strength_dense", false);
+    toolbar->command(tools_group, "fit", fit_view, _L("Fit"), "strength_fit");
+    toolbar->command(tools_group, "undo", m_setup_undo, _L("Undo"), "strength_undo");
+    toolbar->command(tools_group, "redo", m_setup_redo, _L("Redo"), "strength_redo", false);
+    toolbar->command(tools_group, "cancel-placement", cancel_placement, _L("Cancel placement"), "strength_cancel", false);
+    selection_mode->Hide();
+    view->Hide();
+    m_precheck_button->Hide();
+    toolbar->add(study_group, "precheck", _L("Pre-check"), "strength_precheck_pending", true,
+                 [this] { run_precheck(true); }, [this] { return !m_analysis_running; }, {}, [this] {
+                     return std::string(m_precheck_state > 0 ? "strength_precheck_ready" :
+                                        m_precheck_state < 0 ? "strength_precheck_failed" : "strength_precheck_pending");
+                 });
+    toolbar->command(study_group, "solve", m_run_button, _L("Solve"), "strength_solve");
+    toolbar->command(study_group, "cancel-solve", m_cancel_button, _L("Cancel solve"), "strength_cancel", false);
 
     m_setup_canvas = new SetupCanvas(this, m_session,
         [this](SA::LoadType type, const Vec3d &position, const Vec3d &normal, const std::vector<size_t> &faces) {
@@ -1517,7 +1873,7 @@ void StrengthLoadPanel::build_ui()
     add_labeled(operation_grid, m_operation_panel, _L("Radius (mm)"), m_operation_radius, 1);
     add_labeled(operation_grid, m_operation_panel, _L("Region axis"),
                 vector_editor(m_operation_panel, m_operation_axis, Vec3d::UnitZ(), {}, 54), 1);
-    add_labeled(operation_grid, m_operation_panel, _L("Force direction"),
+    add_labeled(operation_grid, m_operation_panel, _L("Direction (object axes)"),
                 vector_editor(m_operation_panel, m_operation_direction, Vec3d::UnitZ(), {}, 54), 1);
     m_operation_magnitude = number_input(m_operation_panel, 100.0, 100);
     add_labeled(operation_grid, m_operation_panel, _L("Force (N)"), m_operation_magnitude, 1);
@@ -1692,7 +2048,7 @@ void StrengthLoadPanel::build_ui()
     add_labeled(load_grid, this, _L("Region center (mm)"), vector_editor(this, m_load_center, Vec3d::Zero()), 1);
     m_load_radius = number_input(this, 5.0);
     add_labeled(load_grid, this, _L("Region radius (mm)"), m_load_radius, 1);
-    add_labeled(load_grid, this, _L("Direction"), vector_editor(this, m_load_direction, Vec3d::UnitZ()), 1);
+    add_labeled(load_grid, this, _L("Direction (object axes)"), vector_editor(this, m_load_direction, Vec3d::UnitZ()), 1);
     m_load_magnitude = number_input(this, 100.0);
     add_labeled(load_grid, this, _L("Magnitude (N)"), m_load_magnitude, 1);
     m_load_impact = number_input(this, 2.0);
@@ -1709,7 +2065,7 @@ void StrengthLoadPanel::build_ui()
     m_gravity_enabled = new wxCheckBox(this, wxID_ANY, _L("Include gravity and estimated part mass"));
     environment->Add(m_gravity_enabled, 0, wxALL, gap);
     auto *gravity_row = new wxBoxSizer(wxHORIZONTAL);
-    gravity_row->Add(new wxStaticText(this, wxID_ANY, _L("Gravity acceleration")), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
+    gravity_row->Add(new wxStaticText(this, wxID_ANY, _L("Gravity acceleration (object axes)")), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
     gravity_row->Add(vector_editor(this, m_gravity, Vec3d(0.0, 0.0, -9.80665), _L("m/s²")), 0);
     environment->Add(gravity_row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
     auto *infill_grid = new wxFlexGridSizer(2, gap, gap);
@@ -1758,15 +2114,28 @@ void StrengthLoadPanel::build_ui()
     criteria->Add(criteria_grid, 0, wxEXPAND | wxALL, gap);
     root->Add(criteria, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
 
-    auto *actions = new wxBoxSizer(wxHORIZONTAL);
     auto *save_button = new wxButton(this, wxID_ANY, _L("Save setup"));
     m_dense_button = new wxButton(this, wxID_ANY, _L("Preview dense region"));
     m_remove_dense_button = new wxButton(this, wxID_ANY, _L("Remove dense modifier"));
     m_orientation_button = new wxButton(this, wxID_ANY, _L("Apply best orientation"));
     m_settings_button = new wxButton(this, wxID_ANY, _L("Apply optimized settings"));
-    for (wxButton *button : {save_button, m_dense_button, m_remove_dense_button, m_orientation_button, m_settings_button})
-        actions->Add(button, 0, wxRIGHT, gap);
-    root->Add(actions, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
+    toolbar->command(study_group, "dense", m_dense_button, _L("Dense region"), "strength_dense");
+    toolbar->command(print_group, "print-dense", m_dense_button, _L("Dense region"), "strength_dense", false);
+    toolbar->command(print_group, "orientation", m_orientation_button, _L("Orientation"), "strength_orientation");
+    toolbar->command(print_group, "settings", m_settings_button, _L("Settings"), "strength_settings", false);
+    toolbar->command(print_group, "remove-dense", m_remove_dense_button, _L("Remove dense modifier"), "strength_delete", false);
+    toolbar->command(study_group, "save", save_button, _L("Save setup"), "strength_save", false);
+    toolbar->add(tools_group, "delete", _L("Delete"), "strength_delete", false,
+                 [this] { delete_selected_operation(); }, [this] { return m_operation_delete->IsEnabled(); });
+    for (unsigned i = 0; i < view->GetCount(); ++i)
+        toolbar->add(tools_group, "view-" + std::to_string(i), view->GetString(i), "strength_view", false,
+                     [this, view, i] { view->SetSelection(i); m_setup_canvas->set_view(i); }, {},
+                     [view, i] { return view->GetSelection() == int(i); });
+    for (unsigned i = 0; i < selection_mode->GetCount(); ++i)
+        toolbar->add(setup_group, "selection-" + std::to_string(i), _L("Select") + " " + selection_mode->GetString(i),
+                     "strength_select", false,
+                     [this, selection_mode, i] { selection_mode->SetSelection(i); m_setup_canvas->set_selection_mode(i); }, {},
+                     [selection_mode, i] { return selection_mode->GetSelection() == int(i); });
     SetSizer(root);
 
     m_material_choice->Bind(wxEVT_CHOICE, [this](wxCommandEvent &) {
@@ -1985,6 +2354,36 @@ void StrengthLoadPanel::load_selected_object()
     }
 
     ModelObject *object = m_plater->model().objects[size_t(index)];
+    // Capture effective process values for an animation snapshot, without changing
+    // the persisted load case or invalidating the ordinary elastic solver.
+    if (m_plater->config()) {
+        DynamicPrintConfig process = *m_plater->config();
+        process.apply(object->config.get());
+        auto &settings = m_session->print_settings;
+        const auto scalar = [&](const char *key, double fallback) {
+            const ConfigOption *option = process.option(key);
+            if (const auto *v = dynamic_cast<const ConfigOptionFloat *>(option)) return v->value;
+            if (const auto *v = dynamic_cast<const ConfigOptionInt *>(option)) return double(v->value);
+            if (const auto *v = dynamic_cast<const ConfigOptionFloatOrPercent *>(option))
+                return v->percent ? fallback * v->value / 100.0 : v->value;
+            return fallback;
+        };
+        const int filament = std::max(0, int(scalar("extruder", 1.0)) - 1);
+        const auto temperature = [&](const char *key, double fallback) {
+            if (const auto *v = process.option<ConfigOptionInts>(key); v && !v->values.empty())
+                return double(v->get_at(size_t(filament)));
+            return fallback;
+        };
+        settings.layer_height_mm = scalar("layer_height", 0.2);
+        settings.first_layer_height_mm = scalar("initial_layer_print_height", settings.layer_height_mm);
+        settings.wall_loops = int(scalar("wall_loops", 2));
+        settings.line_width_mm = scalar("line_width", 0.4);
+        if (settings.line_width_mm <= 0.0) settings.line_width_mm = 0.4;
+        settings.nozzle_temperature_c = temperature("nozzle_temperature", 210.0);
+        settings.chamber_temperature_c = temperature("chamber_temperature", 25.0);
+        if (const auto *bed = process.option<ConfigOptionEnum<BedType>>("curr_bed_type"))
+            settings.bed_temperature_c = temperature(get_bed_temp_key(bed->value).c_str(), 60.0);
+    }
     const bool new_object = object->id() != m_session->object_id;
     const ModelInstance *instance = object->instances[size_t(instance_index)];
     const Transform3d instance_transform = instance->get_matrix();
@@ -2754,10 +3153,10 @@ bool StrengthLoadPanel::edit_load_dialog(SA::Load &load, bool creating)
                 vector_editor(&dialog, size, load.region.size_mm), 1);
     add_labeled(grid, &dialog, _L("Region radius (mm)"), radius, 1);
     add_labeled(grid, &dialog, _L("Cylinder axis"), vector_editor(&dialog, axis, load.region.axis), 1);
-    add_labeled(grid, &dialog, _L("Direction preset"), direction_mode, 1);
+    add_labeled(grid, &dialog, _L("Direction preset (object axes)"), direction_mode, 1);
     auto *direction_row = vector_editor(&dialog, direction, load.direction);
     direction_row->Add(flip_direction, 0, wxLEFT, gap);
-    add_labeled(grid, &dialog, _L("Direction / force vector"), direction_row, 1);
+    add_labeled(grid, &dialog, _L("Force direction (object axes)"), direction_row, 1);
     add_labeled(grid, &dialog, _L("Magnitude (N)"), magnitude, 1);
     add_labeled(grid, &dialog, _L("Impact multiplier"), impact, 1);
     add_labeled(grid, &dialog, _L("Required safety factor"), target, 1);
@@ -2974,11 +3373,22 @@ void StrengthLoadPanel::edit_gravity_dialog()
     auto *grid = new wxFlexGridSizer(2, gap, gap);
     grid->AddGrowableCol(1, 1);
     wxTextCtrl *acceleration[3]{};
-    add_labeled(grid, &dialog, _L("Acceleration (m/s²)"),
+    add_labeled(grid, &dialog, _L("Acceleration in object axes (m/s²)"),
                 vector_editor(&dialog, acceleration, m_session->setup.gravity.acceleration_m_s2), 1);
     root->Add(grid, 1, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
+    auto *prepare_down = new wxButton(&dialog, wxID_ANY, _L("Use Prepare -Z gravity"));
+    const SA::StudyCoordinateFrame coordinates(m_session->instance_transform);
+    prepare_down->Enable(coordinates.valid && m_session->instance_index >= 0);
+    prepare_down->Bind(wxEVT_BUTTON, [coordinates, acceleration, enabled](wxCommandEvent &) {
+        const Vec3d value = coordinates.scene_vector_to_physical(Vec3d(0.0, 0.0, -9.80665));
+        for (int axis = 0; axis < 3; ++axis)
+            acceleration[axis]->ChangeValue(number(value[axis]));
+        enabled->SetValue(true);
+    });
+    root->Add(prepare_down, 0, wxLEFT | wxRIGHT | wxBOTTOM, gap);
     root->Add(new wxStaticText(&dialog, wxID_ANY,
-        _L("Earth gravity is normally (0, 0, -9.80665). The 3D arrow previews the selected direction.")),
+        _L("Values use object-aligned axes. The preset points down in the current Prepare orientation.\n"
+           "Saved gravity stays attached to the object; use the preset again after rotating it.")),
         0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
     root->Add(dialog.CreateStdDialogButtonSizer(wxOK | wxCANCEL), 0, wxEXPAND | wxALL, gap);
     dialog.SetSizerAndFit(root);
@@ -3335,12 +3745,22 @@ void StrengthLoadPanel::refresh_precheck_state()
 {
     // Use the same validation as Solve, without a dialog or any mutation of the study.
     // A partially typed number must not leave the last accepted setup looking ready.
-    set_precheck_state(m_numeric_inputs_valid && !m_session->mesh.empty() &&
-        SA::validate(m_session->mesh, m_session->setup).empty() ? 1 : -1);
+    const bool has_support = std::any_of(m_session->setup.loads.begin(), m_session->setup.loads.end(),
+        [](const SA::Load &load) { return load.active && load.type == SA::LoadType::Fixed; });
+    const bool has_load = m_session->setup.gravity.enabled ||
+        std::any_of(m_session->setup.loads.begin(), m_session->setup.loads.end(),
+            [](const SA::Load &load) { return load.active && load.type != SA::LoadType::Fixed; });
+    if (!m_numeric_inputs_valid)
+        set_precheck_state(-1);
+    else if (m_session->mesh.empty() || !has_support || !has_load)
+        set_precheck_state(0);
+    else
+        set_precheck_state(SA::validate(m_session->mesh, m_session->setup).empty() ? 1 : -1);
 }
 
 void StrengthLoadPanel::set_precheck_state(int state)
 {
+    m_precheck_state = state;
     if (m_precheck_button == nullptr)
         return;
     m_precheck_button->SetStyle(ButtonStyle::Regular, ButtonType::Compact);
@@ -3527,6 +3947,16 @@ bool StrengthLoadPanel::create_dense_modifier_from_preview(const SA::DenseRegion
     return true;
 }
 
+bool StrengthLoadPanel::has_dense_modifier() const
+{
+    const int index = m_session->object_index;
+    if (index < 0 || size_t(index) >= m_plater->model().objects.size())
+        return false;
+    const ModelObject *object = m_plater->model().objects[size_t(index)];
+    return object->id() == m_session->object_id &&
+        std::any_of(object->volumes.begin(), object->volumes.end(), is_strength_dense_modifier);
+}
+
 void StrengthLoadPanel::remove_dense_modifier()
 {
     const ObjectID object_id = m_session->object_id;
@@ -3649,6 +4079,9 @@ public:
         set_right_margin(parent->FromDIP(112));
     }
 
+    void toggle_section() { m_section = !m_section; Refresh(); }
+    bool section_enabled() const { return m_section; }
+
     void set_mode(int mode) { m_mode = mode; Refresh(); }
     void set_projection(int projection) { set_view(projection); }
     void set_deformation_scale(double scale) { m_deformation_scale = std::clamp(scale, 0.0, 10000.0); Refresh(); }
@@ -3743,37 +4176,55 @@ protected:
         for (size_t face = 0; face < mesh.indices.size(); ++face)
             if (valid_triangle(mesh.indices[face], m_projected.size()))
                 faces.push_back(face);
+        double low_z = mesh.vertices.front().z(), high_z = low_z;
+        for (const Vec3f &vertex : mesh.vertices) {
+            low_z = std::min(low_z, double(vertex.z()));
+            high_z = std::max(high_z, double(vertex.z()));
+        }
+        m_section_z = (low_z + high_z) * 0.5;
         DepthBitmap result_bitmap(GetClientSize());
+        struct CutVertex { Vec3d position; double z; double value; };
         for (size_t face : faces) {
             const Vec3i32 &triangle = mesh.indices[face];
-            std::array<double, 3> values{};
-            bool finite = true;
+            std::vector<CutVertex> polygon;
             for (int corner = 0; corner < 3; ++corner) {
                 const size_t vertex = size_t(triangle[corner]);
-                values[corner] = scalar(vertex);
-                finite = std::isfinite(values[corner]) && finite;
+                polygon.push_back({deformed[vertex], double(mesh.vertices[vertex].z()), scalar(vertex)});
             }
-            result_bitmap.triangle(m_projected[size_t(triangle[0])], m_projected[size_t(triangle[1])],
-                                   m_projected[size_t(triangle[2])],
-                [this, finite, values, minimum, maximum, range](double a, double b, double c) {
-                    return finite ? contour_colour(a * values[0] + b * values[1] + c * values[2],
-                                                   minimum, maximum, range) : wxColour(150, 150, 150);
-                });
+            if (m_section) {
+                std::vector<CutVertex> clipped;
+                for (size_t i = 0; i < polygon.size(); ++i) {
+                    const CutVertex &a = polygon[i], &b = polygon[(i + 1) % polygon.size()];
+                    const bool inside_a = a.z <= m_section_z, inside_b = b.z <= m_section_z;
+                    if (inside_a) clipped.push_back(a);
+                    if (inside_a != inside_b) {
+                        const double t = (m_section_z - a.z) / (b.z - a.z);
+                        clipped.push_back({a.position + t * (b.position - a.position), m_section_z,
+                                           a.value + t * (b.value - a.value)});
+                    }
+                }
+                polygon = std::move(clipped);
+            }
+            for (size_t i = 1; i + 1 < polygon.size(); ++i) {
+                const std::array<double, 3> values{polygon[0].value, polygon[i].value, polygon[i + 1].value};
+                result_bitmap.triangle(project(polygon[0].position, camera), project(polygon[i].position, camera),
+                                       project(polygon[i + 1].position, camera),
+                    [this, values, minimum, maximum, range](double a, double b, double c) {
+                        return contour_colour(a * values[0] + b * values[1] + c * values[2], minimum, maximum, range);
+                    });
+            }
+            if (m_show_wireframe && polygon.size() >= 3)
+                for (size_t i = 0; i < polygon.size(); ++i)
+                    result_bitmap.line(project(polygon[i].position, camera),
+                                       project(polygon[(i + 1) % polygon.size()].position, camera), wxColour(62, 67, 73));
         }
-        if (m_show_wireframe)
-            for (size_t face : faces) {
-                const Vec3i32 &triangle = mesh.indices[face];
-                for (int edge = 0; edge < 3; ++edge)
-                    result_bitmap.line(m_projected[size_t(triangle[edge])],
-                                       m_projected[size_t(triangle[(edge + 1) % 3])], wxColour(62, 67, 73));
-            }
         result_bitmap.draw(dc);
 
-        if (m_show_wireframe)
+        if (m_show_wireframe && !m_section)
             draw_reference_mesh(dc, camera, true);
         if (m_show_setup)
             draw_setup_glyphs(dc, camera);
-        if (m_show_dense_preview && m_dense_preview.available && !m_dense_preview.modifier_mesh.empty()) {
+        if (!m_section && m_show_dense_preview && m_dense_preview.available && !m_dense_preview.modifier_mesh.empty()) {
             const wxColour colour = m_dense_preview.overlaps_preserve ? wxColour(207, 67, 67) : wxColour(118, 49, 190);
             // X-ray the actual undeformed modifier mesh so interior reinforcement remains
             // visible through the contour surface. Depth-test the mask against itself.
@@ -3801,11 +4252,15 @@ protected:
                 m_dense_preview.estimated_volume_fraction * 100.0), center.point + wxPoint(10, 8));
         }
 
-        draw_extreme_marker(dc, minimum_vertex, _L("MIN"),
+        if (!m_section) draw_extreme_marker(dc, minimum_vertex, _L("MIN"),
                             m_mode == 0 ? wxColour(215, 52, 48) : wxColour(42, 92, 210));
-        draw_extreme_marker(dc, maximum_vertex, _L("MAX"),
+        if (!m_section) draw_extreme_marker(dc, maximum_vertex, _L("MAX"),
                             m_mode == 0 ? wxColour(42, 92, 210) : wxColour(215, 52, 48));
         draw_legend(dc, minimum, maximum);
+        if (m_section) {
+            dc.SetTextForeground(wxSystemSettings::GetColour(wxSYS_COLOUR_WINDOWTEXT));
+            dc.DrawText(_L("Section: lower half along object Z • surface cut (uncapped)"), FromDIP(12), FromDIP(54));
+        }
 
         dc.SetTextForeground(wxColour(48, 57, 68));
         dc.DrawText(_L("Drag to orbit • middle/right drag to pan • wheel to zoom • click the model to probe"),
@@ -3836,11 +4291,17 @@ protected:
             double weights[3];
             if (!barycentric(point, screen, weights))
                 continue;
+            if (m_section && weights[0] * mesh.vertices[indices[0]].z() +
+                weights[1] * mesh.vertices[indices[1]].z() + weights[2] * mesh.vertices[indices[2]].z() > m_section_z)
+                continue;
             const double depth = weights[0] * m_projected[indices[0]].depth +
                 weights[1] * m_projected[indices[1]].depth + weights[2] * m_projected[indices[2]].depth;
             if (depth <= nearest_depth)
                 continue;
             nearest_depth = depth;
+            if (m_section)
+                for (int i = 0; i < 3; ++i)
+                    if (mesh.vertices[indices[i]].z() > m_section_z) weights[i] = -1.0;
             picked_vertex = indices[std::distance(weights, std::max_element(weights, weights + 3))];
             found = true;
         }
@@ -3851,6 +4312,8 @@ protected:
 private:
     std::shared_ptr<StrengthAnalysisSession> m_session;
     std::function<void(size_t)> m_probe;
+    bool m_section{false};
+    double m_section_z{0.0};
     int m_mode{0};
     double m_deformation_scale{1.0};
     bool m_show_setup{true};
@@ -4093,20 +4556,35 @@ private:
 
 StrengthSimulationPanel::StrengthSimulationPanel(wxWindow *parent, std::shared_ptr<StrengthAnalysisSession> session,
                                                  std::function<void()> synchronize_session,
-                                                 std::function<bool(const SA::DenseRegionPreview &)> apply_dense_preview)
+                                                 std::function<bool(const SA::DenseRegionPreview &)> apply_dense_preview,
+                                                 std::function<bool()> has_dense_modifier,
+                                                 std::function<void()> remove_dense_modifier)
     : wxScrolledWindow(parent, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxVSCROLL | wxHSCROLL | wxTAB_TRAVERSAL)
     , m_session(std::move(session))
     , m_synchronize_session(std::move(synchronize_session))
     , m_apply_dense_preview(std::move(apply_dense_preview))
+    , m_has_dense_modifier(std::move(has_dense_modifier))
+    , m_remove_dense_modifier(std::move(remove_dense_modifier))
 {
-    SetBackgroundColour(*wxWHITE);
+    SetBackgroundColour(wxSystemSettings::GetColour(wxSYS_COLOUR_WINDOW));
     SetScrollRate(FromDIP(12), FromDIP(12));
     const int gap = FromDIP(8);
     auto *root = new wxBoxSizer(wxVERTICAL);
     root->Add(new wxStaticText(this, wxID_ANY, _L("Strength Analysis — 3D Results Workspace")), 0, wxALL, gap);
     m_status = new wxStaticText(this, wxID_ANY, _L("No analysis has been run."));
     root->Add(m_status, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
-    auto *controls = new wxBoxSizer(wxHORIZONTAL);
+    auto *toolbar = new StudyToolbar(this, "simulation");
+    root->Add(toolbar, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
+    const auto results_group = toolbar->group(_L("Results"));
+    toolbar->add(results_group, "animate", _L("Animate"), "strength_deformation", true,
+        [this] { show_animation(); }, [this] { return m_session->result.succeeded() && !m_session->stale; });
+    toolbar->add(results_group, "compare", _L("Compare"), "strength_results", true,
+        [this] { show_comparison(); }, [this] { return m_animation_runs.size() >= 2; });
+    const auto display_group = toolbar->group(_L("Display"));
+    const auto inspect_group = toolbar->group(_L("Inspect"));
+    const auto print_group = toolbar->group(_L("Print"));
+    const auto tools_group = toolbar->group(_L("Tools"));
+    auto *controls = new wxWrapSizer(wxHORIZONTAL);
     m_result_mode = new wxChoice(this, wxID_ANY, wxDefaultPosition, wxDefaultSize,
         {_L("Safety factor"), _L("Deformation (mm)"), _L("Von Mises stress (MPa)"), _L("Maximum shear (MPa)"),
          _L("Normal stress X (MPa)"), _L("Normal stress Y (MPa)"), _L("Normal stress Z (MPa)"),
@@ -4116,16 +4594,15 @@ StrengthSimulationPanel::StrengthSimulationPanel(wxWindow *parent, std::shared_p
                                 {_L("Isometric"), _L("Front"), _L("Top"), _L("Right")});
     m_projection->SetSelection(0);
     m_deformation_scale = number_input(this, 1.0, 78);
-    add_labeled(controls, this, _L("Result"), m_result_mode);
+    m_result_mode->Hide();
     controls->AddSpacer(gap);
-    add_labeled(controls, this, _L("View"), m_projection);
+    m_projection->Hide();
     controls->AddSpacer(gap);
     add_labeled(controls, this, _L("Deformation scale"), m_deformation_scale);
     auto *fit_view = new wxButton(this, wxID_ANY, _L("Fit"));
     controls->AddSpacer(gap);
-    controls->Add(fit_view, 0);
+    toolbar->command(tools_group, "fit", fit_view, _L("Fit"), "strength_fit");
     root->Add(controls, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
-    auto *display = new wxBoxSizer(wxHORIZONTAL);
     m_show_setup = new wxCheckBox(this, wxID_ANY, _L("Show loads and constraints"));
     m_show_wireframe = new wxCheckBox(this, wxID_ANY, _L("Undeformed wireframe"));
     m_banded_contours = new wxCheckBox(this, wxID_ANY, _L("Banded contours"));
@@ -4133,12 +4610,7 @@ StrengthSimulationPanel::StrengthSimulationPanel(wxWindow *parent, std::shared_p
     m_show_wireframe->SetValue(true);
     m_banded_contours->SetValue(false);
     for (wxCheckBox *checkbox : {m_show_setup, m_show_wireframe, m_banded_contours})
-        display->Add(checkbox, 0, wxRIGHT, FromDIP(16));
-    display->AddStretchSpacer();
-    display->Add(new wxStaticText(this, wxID_ANY,
-        _L("Rainbow contours map the legend range; safety factor is reversed and signed stresses are centered on zero.")),
-        0, wxALIGN_CENTER_VERTICAL);
-    root->Add(display, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
+        checkbox->Hide();
 
     auto *dense_preview = new wxStaticBoxSizer(wxVERTICAL, this, _L("Strengthened-region preview"));
     auto *dense_row = new wxBoxSizer(wxHORIZONTAL);
@@ -4147,24 +4619,16 @@ StrengthSimulationPanel::StrengthSimulationPanel(wxWindow *parent, std::shared_p
     m_dense_volume_slider = new wxSlider(this, wxID_ANY, 15, 0, 100, wxDefaultPosition,
                                          FromDIP(wxSize(300, -1)), wxSL_HORIZONTAL);
     m_dense_volume_value = new wxStaticText(this, wxID_ANY, _L("15% of model volume"));
-    m_apply_dense_button = new wxButton(this, wxID_ANY, _L("Create slicer modifier"));
+    m_apply_dense_button = new wxButton(this, wxID_ANY, _L("Create Slice Modifier"));
     dense_row->Add(m_show_dense_preview, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
     dense_row->Add(m_dense_volume_slider, 1, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
     dense_row->Add(m_dense_volume_value, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
     dense_row->Add(m_apply_dense_button, 0, wxALIGN_CENTER_VERTICAL);
     dense_preview->Add(dense_row, 0, wxEXPAND | wxALL, gap);
-    auto *target_row = new wxBoxSizer(wxHORIZONTAL);
     m_target_safety_factor = number_input(this, 2.0, 90);
+    m_target_safety_factor->Hide();
     m_size_to_safety_factor = new wxButton(this, wxID_ANY, _L("Size to target SF"));
     m_use_stress_threshold = new wxButton(this, wxID_ANY, _L("Use setup stress threshold"));
-    target_row->Add(new wxStaticText(this, wxID_ANY, _L("Target estimated safety factor")),
-                    0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
-    target_row->Add(m_target_safety_factor, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
-    target_row->Add(m_size_to_safety_factor, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
-    target_row->Add(m_use_stress_threshold, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
-    target_row->Add(new wxStaticText(this, wxID_ANY, _L("Estimate fitting in 1% volume steps; validate the design separately.")),
-                    0, wxALIGN_CENTER_VERTICAL);
-    dense_preview->Add(target_row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
     m_dense_preview_metrics = new wxStaticText(this, wxID_ANY,
         _L("Solve a study to preview strengthened volume, mass, deformation, and safety factor."));
     m_dense_preview_metrics->Wrap(FromDIP(920));
@@ -4185,6 +4649,48 @@ StrengthSimulationPanel::StrengthSimulationPanel(wxWindow *parent, std::shared_p
     root->Add(m_summary, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
     SetSizer(root);
 
+    for (unsigned i = 0; i < m_result_mode->GetCount(); ++i)
+        toolbar->add(results_group, "result-" + std::to_string(i), m_result_mode->GetString(i),
+                     i == 1 ? "strength_deformation" : "strength_results", i == 0,
+                     [this, i] { m_result_mode->SetSelection(i); m_canvas->set_mode(i); }, {},
+                     [this, i] { return m_result_mode->GetSelection() == int(i); });
+    for (unsigned i = 0; i < m_projection->GetCount(); ++i)
+        toolbar->add(tools_group, "view-" + std::to_string(i), m_projection->GetString(i), "strength_view", false,
+                     [this, i] { m_projection->SetSelection(i); m_canvas->set_projection(i); }, {},
+                     [this, i] { return m_projection->GetSelection() == int(i); });
+    const auto toggle = [toolbar, display_group](wxCheckBox *source, const std::string &key,
+                                               const wxString &label, const std::string &icon, bool pinned) {
+        toolbar->add(display_group, key, label, icon, pinned, [source] {
+            source->SetValue(!source->GetValue());
+            wxCommandEvent event(wxEVT_CHECKBOX, source->GetId());
+            event.SetEventObject(source);
+            event.SetInt(source->GetValue());
+            source->GetEventHandler()->ProcessEvent(event);
+        }, {}, [source] { return source->GetValue(); });
+    };
+    toggle(m_show_setup, "loads", _L("Loads"), "strength_force", true);
+    toggle(m_show_wireframe, "wireframe", _L("Wireframe"), "strength_faces", false);
+    toggle(m_banded_contours, "contours", _L("Contours"), "strength_results", true);
+    toolbar->add(inspect_group, "probe", _L("Point probe"), "strength_probe", true, [this] {
+        m_canvas->SetFocus();
+        m_probe->SetLabel(_L("Point probe: click the visible model surface to inspect its nearest vertex."));
+    }, [this] { return m_session->result.succeeded(); });
+    toolbar->add(inspect_group, "section", _L("Section"), "strength_section", true, [this] {
+        m_canvas->toggle_section();
+    }, [this] { return m_session->result.succeeded(); }, [this] { return m_canvas->section_enabled(); });
+    toolbar->add(print_group, "apply", _L("Create Slice Modifier"), "strength_dense", true, [this] {
+        wxCommandEvent event(wxEVT_BUTTON, m_apply_dense_button->GetId());
+        m_apply_dense_button->GetEventHandler()->ProcessEvent(event);
+    }, [this] { return m_apply_dense_button->IsEnabled(); });
+    toolbar->add(print_group, "remove", _L("Remove Slice Modifier"), "strength_delete", true, [this] {
+        if (m_remove_dense_modifier && m_has_dense_modifier && m_has_dense_modifier()) {
+            m_remove_dense_modifier();
+            refresh();
+        }
+    }, [this] { return bool(m_remove_dense_modifier) && m_has_dense_modifier && m_has_dense_modifier(); });
+    toolbar->command(print_group, "target", m_size_to_safety_factor, _L("Target SF"), "strength_objectives", false);
+    toolbar->command(print_group, "threshold", m_use_stress_threshold, _L("Stress threshold"), "strength_results", false);
+
     m_result_mode->Bind(wxEVT_CHOICE, [this](wxCommandEvent &) { m_canvas->set_mode(m_result_mode->GetSelection()); });
     m_projection->Bind(wxEVT_CHOICE, [this](wxCommandEvent &) { m_canvas->set_projection(m_projection->GetSelection()); });
     fit_view->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { m_canvas->fit_view(); });
@@ -4196,7 +4702,7 @@ StrengthSimulationPanel::StrengthSimulationPanel(wxWindow *parent, std::shared_p
         if (read_number(m_deformation_scale, value)) m_canvas->set_deformation_scale(value);
     });
     m_dense_volume_slider->Bind(wxEVT_SLIDER, [this](wxCommandEvent &) { update_dense_preview(); });
-    m_size_to_safety_factor->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { size_dense_preview_to_target(); });
+    m_size_to_safety_factor->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { show_target_safety_factor_popup(); });
     m_use_stress_threshold->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { size_dense_preview_to_threshold(); });
     m_show_dense_preview->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent &) { update_dense_preview(); });
     m_apply_dense_button->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) {
@@ -4216,6 +4722,418 @@ StrengthSimulationPanel::StrengthSimulationPanel(wxWindow *parent, std::shared_p
             Layout();
         }
     });
+}
+
+void StrengthSimulationPanel::show_animation()
+{
+    if (m_synchronize_session) m_synchronize_session();
+    if (m_session->stale || !m_session->result.succeeded() || m_session->solved_mesh.empty()) {
+        wxMessageBox(_L("Solve the current load case before animating."), _L("Animate"), wxOK | wxICON_INFORMATION, this);
+        return;
+    }
+    SA::TransientSettings options = m_session->print_settings;
+    const auto bounds = bounding_box(m_session->solved_mesh);
+    const Vec3d dimensions = bounds.size().cast<double>().cwiseProduct(m_session->solved_setup.geometry_scale);
+    options.cell_width_mm = std::max(0.5, std::sqrt(dimensions.prod() / (options.layer_height_mm * 2200.0)));
+    wxDialog dialog(this, wxID_ANY, _L("Animate load case"), wxDefaultPosition, wxDefaultSize,
+                    wxDEFAULT_DIALOG_STYLE | wxRESIZE_BORDER);
+    const int gap = FromDIP(8);
+    auto *root = new wxBoxSizer(wxVERTICAL);
+    auto *pages = new wxNotebook(&dialog, wxID_ANY);
+    auto *mechanical = new wxPanel(pages);
+    auto *thermal = new wxPanel(pages);
+    pages->AddPage(mechanical, _L("Mechanical"));
+    pages->AddPage(thermal, _L("Print temperatures"));
+    wxWindow *field_parent = mechanical;
+    auto *grid = new wxFlexGridSizer(2, gap, gap);
+    grid->AddGrowableCol(1);
+    std::vector<std::pair<wxTextCtrl *, double *>> fields;
+    const auto field = [&](const wxString &label, double &value) {
+        auto *input = number_input(field_parent, value, 100);
+        add_labeled(grid, field_parent, label, input);
+        fields.push_back({input, &value});
+    };
+    field(_L("Total loading / unloading duration (s)"), options.duration_s);
+    field(_L("Physical layer height (mm)"), options.layer_height_mm);
+    field(_L("First layer height (mm)"), options.first_layer_height_mm);
+    field(_L("In-plane cell width (mm)"), options.cell_width_mm);
+    field(_L("Extrusion width (mm)"), options.line_width_mm);
+    field(_L("Bond strength scale (0–1)"), options.bonding_scale);
+    field(_L("Plastic hardening ratio (0–1)"), options.hardening_ratio);
+    field(_L("Fracture plastic strain"), options.failure_plastic_strain);
+    mechanical->SetSizer(grid);
+    field_parent = thermal;
+    grid = new wxFlexGridSizer(2, gap, gap);
+    grid->AddGrowableCol(1);
+    field(_L("Nozzle temperature (°C)"), options.nozzle_temperature_c);
+    field(_L("Bed temperature (°C)"), options.bed_temperature_c);
+    field(_L("Chamber temperature (°C)"), options.chamber_temperature_c);
+    field(_L("Reference nozzle temperature (°C)"), options.reference_nozzle_temperature_c);
+    field(_L("Estimated time per printed layer (s)"), options.layer_time_s);
+    field(_L("Reference layer cooling time (s)"), options.cooling_time_s);
+    thermal->SetSizer(grid);
+    root->Add(pages, 0, wxEXPAND | wxALL, gap);
+    const auto toggle = [&](const wxString &label, bool &value) {
+        auto *check = new wxCheckBox(&dialog, wxID_ANY, label);
+        check->SetValue(value);
+        root->Add(check, 0, wxLEFT | wxRIGHT | wxBOTTOM, gap);
+        bool *destination = &value;
+        check->Bind(wxEVT_CHECKBOX, [check, destination](wxCommandEvent &) { *destination = check->GetValue(); });
+    };
+    toggle(_L("Resolve each printed layer and its interfaces"), options.layers);
+    toggle(_L("Plastic deformation and permanent set"), options.plasticity);
+    toggle(_L("Irreversible bond failure and detached loads"), options.fracture);
+    toggle(_L("Unload to zero during the second half"), options.unload);
+    toggle(_L("Estimate thermal influence on inter-layer bonds"), options.thermal_bonding);
+    auto *notice = new wxStaticText(&dialog, wxID_ANY, wxString::Format(
+        _L("Uses print orientation and %d walls from the current process. Infill and material come from the load study. "
+           "This cell-based, small-strain estimate resolves mechanical layers with homogenized infill. "
+           "Thermal bonding uses a cooling proxy; it does not reconstruct individual extrusion paths. "
+           "Hardening, failure strain and bonding parameters require material/process calibration. "
+           "Detached fragments retain their last position and stop receiving force; free flight is not simulated."), options.wall_loops));
+    notice->Wrap(FromDIP(620));
+    root->Add(notice, 0, wxEXPAND | wxALL, gap);
+    root->Add(dialog.CreateSeparatedButtonSizer(wxOK | wxCANCEL), 0, wxEXPAND | wxALL, gap);
+    dialog.SetSizerAndFit(root);
+    dialog.Bind(wxEVT_BUTTON, [&](wxCommandEvent &) {
+        for (const auto &[input, destination] : fields) {
+            double value;
+            if (!read_number(input, value) || !std::isfinite(value)) {
+                wxMessageBox(_L("Enter finite numeric values."), _L("Animate"), wxOK | wxICON_INFORMATION, &dialog);
+                input->SetFocus(); return;
+            }
+            *destination = value;
+        }
+        if (options.duration_s < 0.1 || options.duration_s > 86400.0) {
+            wxMessageBox(_L("Enter a duration from 0.1 to 86400 seconds."), _L("Animate"), wxOK | wxICON_INFORMATION, &dialog);
+            return;
+        }
+        dialog.EndModal(wxID_OK);
+    }, wxID_OK);
+    if (dialog.ShowModal() != wxID_OK) return;
+    AnimationRun run;
+    run.snapshot = std::make_shared<StrengthAnalysisSession>();
+    run.snapshot->solved_setup = m_session->solved_setup;
+    run.snapshot->solved_instance_transform = m_session->solved_instance_transform;
+    run.snapshot->stale = false;
+    std::atomic_bool cancelled{false};
+    std::atomic_int completion{0};
+    auto task = std::async(std::launch::async, [mesh = m_session->solved_mesh, setup = m_session->solved_setup,
+                                               options, &cancelled, &completion] {
+        return SA::analyze_transient(mesh, setup, options, [&] { return cancelled.load(); },
+                                    [&](int value) { completion.store(value); });
+    });
+    {
+        wxProgressDialog progress(_L("Computing load history"), _L("Resolving layers, yielding and bond failure…"), 100, this,
+                                  wxPD_APP_MODAL | wxPD_CAN_ABORT | wxPD_ELAPSED_TIME);
+        while (task.wait_for(std::chrono::milliseconds(30)) != std::future_status::ready) {
+            if (!progress.Update(completion.load())) cancelled.store(true);
+        }
+    }
+    auto history = std::make_shared<SA::TransientResult>(task.get());
+    if (cancelled.load() || history->status == SA::AnalysisStatus::Cancelled) return;
+    if (!history->succeeded()) {
+        wxMessageBox(wxString::FromUTF8(history->message), _L("Animation analysis"), wxOK | wxICON_INFORMATION, this);
+        return;
+    }
+    run.history = history;
+    run.snapshot->solved_mesh = history->display_mesh;
+    run.snapshot->result = SA::transient_display_frame(*history, 0);
+    run.ramp.duration_s = options.duration_s;
+    run.ramp.probes = history->probes;
+    run.name = wxString::Format(_L("Run %zu — %s — %.3g s"), m_animation_runs.size() + 1,
+                               wxString::FromUTF8(run.snapshot->solved_setup.material.name), options.duration_s);
+    show_animation_view({run}, true);
+}
+
+void StrengthSimulationPanel::show_comparison()
+{
+    if (m_animation_runs.size() < 2) return;
+    wxDialog dialog(this, wxID_ANY, _L("Compare saved animations"));
+    auto *root = new wxBoxSizer(wxVERTICAL);
+    wxArrayString names;
+    for (const auto &run : m_animation_runs) names.Add(run.name);
+    auto *left = new wxChoice(&dialog, wxID_ANY, wxDefaultPosition, wxDefaultSize, names);
+    auto *right = new wxChoice(&dialog, wxID_ANY, wxDefaultPosition, wxDefaultSize, names);
+    left->SetSelection(0);
+    right->SetSelection(int(names.size()) - 1);
+    root->Add(new wxStaticText(&dialog, wxID_ANY, _L("Choose two different runs. Saved runs last for this app session.")),
+              0, wxALL, FromDIP(10));
+    root->Add(left, 0, wxEXPAND | wxALL, FromDIP(10));
+    root->Add(right, 0, wxEXPAND | wxALL, FromDIP(10));
+    root->Add(dialog.CreateSeparatedButtonSizer(wxOK | wxCANCEL), 0, wxEXPAND | wxALL, FromDIP(10));
+    dialog.SetSizerAndFit(root);
+    dialog.Bind(wxEVT_BUTTON, [left, right, &dialog](wxCommandEvent &) {
+        if (left->GetSelection() == right->GetSelection()) {
+            wxMessageBox(_L("Choose two different runs."), _L("Compare"), wxOK | wxICON_INFORMATION, &dialog);
+            return;
+        }
+        dialog.EndModal(wxID_OK);
+    }, wxID_OK);
+    if (dialog.ShowModal() == wxID_OK)
+        show_animation_view({m_animation_runs[size_t(left->GetSelection())], m_animation_runs[size_t(right->GetSelection())]}, false);
+}
+
+void StrengthSimulationPanel::show_animation_view(const std::vector<AnimationRun> &runs, bool allow_save)
+{
+    wxDialog dialog(this, wxID_ANY, allow_save ? _L("Load animation") : _L("Compare animations"),
+                    wxDefaultPosition, wxDefaultSize, wxDEFAULT_DIALOG_STYLE | wxRESIZE_BORDER | wxMAXIMIZE_BOX);
+    const int gap = FromDIP(8);
+    auto *root = new wxBoxSizer(wxVERTICAL);
+    auto *controls = new wxWrapSizer(wxHORIZONTAL);
+    auto *play = new wxButton(&dialog, wxID_ANY, _L("Play"));
+    auto *mode = new wxChoice(&dialog, wxID_ANY, wxDefaultPosition, wxDefaultSize,
+                            {_L("Deformation"), _L("Von Mises stress"), _L("Maximum shear")});
+    mode->SetSelection(0);
+    auto *view = new wxChoice(&dialog, wxID_ANY, wxDefaultPosition, wxDefaultSize,
+                            {_L("Isometric"), _L("Front"), _L("Top"), _L("Right")});
+    view->SetSelection(0);
+    auto *axis = new wxChoice(&dialog, wxID_ANY, wxDefaultPosition, wxDefaultSize, {_L("Time (s)"), _L("Applied force (N)")});
+    axis->SetSelection(0);
+    auto *scale = number_input(&dialog, 1.0, 75);
+    auto *section = new wxButton(&dialog, wxID_ANY, _L("Toggle section"));
+    for (wxWindow *control : std::vector<wxWindow *>{play, mode, view, axis, section})
+        controls->Add(control, 0, wxALL | wxALIGN_CENTER_VERTICAL, gap);
+    add_labeled(controls, &dialog, _L("Deformation scale"), scale);
+    root->Add(controls, 0, wxEXPAND);
+    auto *scrub = new wxSlider(&dialog, wxID_ANY, 0, 0, 1000, wxDefaultPosition, wxDefaultSize, wxSL_HORIZONTAL);
+    scrub->SetName(_L("Load ramp progress"));
+    root->Add(scrub, 0, wxEXPAND | wxALL, gap);
+    auto *notice = new wxStaticText(&dialog, wxID_ANY,
+        _L("Synchronized by elapsed-time percentage. Graphs use true displacement; the scale changes only the shape display. "
+           "Solid curves show loading; dashed curves show unloading, including permanent set and detached loads."));
+    notice->Wrap(FromDIP(1000));
+    root->Add(notice, 0, wxEXPAND | wxALL, gap);
+    auto *scroller = new wxScrolledWindow(&dialog, wxID_ANY);
+    scroller->SetScrollRate(gap, gap);
+    scroller->SetMinSize(FromDIP(wxSize(runs.size() == 1 ? 520 : 1040, 520)));
+    auto *columns = new wxBoxSizer(wxHORIZONTAL);
+    struct Pane {
+        std::shared_ptr<StrengthAnalysisSession> session;
+        ResultCanvas *canvas;
+        wxStaticText *metrics;
+        wxChoice *probe;
+        wxPanel *graph;
+    };
+    std::vector<Pane> panes;
+    for (size_t i = 0; i < runs.size(); ++i) {
+        const AnimationRun &run = runs[i];
+        auto *column = new wxBoxSizer(wxVERTICAL);
+        auto *data = new wxButton(scroller, wxID_ANY, run.name + _L(" — Data"));
+        column->Add(data, 0, wxEXPAND | wxALL, gap / 2);
+        auto session = std::make_shared<StrengthAnalysisSession>(*run.snapshot);
+        auto *canvas = new ResultCanvas(scroller, session, [](size_t) {});
+        canvas->SetMinSize(FromDIP(wxSize(430, 200)));
+        canvas->set_mode(1);
+        column->Add(canvas, 1, wxEXPAND | wxALL, gap / 2);
+        auto *metrics = new wxStaticText(scroller, wxID_ANY, wxEmptyString);
+        column->Add(metrics, 0, wxEXPAND | wxALL, gap / 2);
+        const auto &setup = run.snapshot->solved_setup;
+        wxString details = wxString::Format(_L("Layer axis: %s; infill: %.3g%% %s"),
+            vector_text(setup.print_layer_axis), setup.infill.background_density * 100.0,
+            wxString::FromUTF8(SA::to_string(setup.infill.background_pattern)));
+        if (run.history) details += wxString::Format(_L("\n%zu layers; %.3g mm cells; nozzle %.3g°C; %d walls"),
+            run.history->layer_count, run.history->settings.cell_width_mm,
+            run.history->settings.nozzle_temperature_c, run.history->settings.wall_loops);
+        auto *settings = new wxStaticText(scroller, wxID_ANY, details);
+        settings->Wrap(FromDIP(450));
+        settings->Hide();
+        data->Bind(wxEVT_BUTTON, [scroller, run, details](wxCommandEvent &) {
+            wxString report = details;
+            if (run.history) {
+                const auto &h = *run.history;
+                report += wxString::Format(_L("\nFirst layer %.4g mm; layers %.4g mm; line width %.4g mm\n"
+                    "Bed %.4g°C; chamber %.4g°C; bonding %.4g; hardening %.4g; failure strain %.4g\n"),
+                    h.settings.first_layer_height_mm, h.settings.layer_height_mm, h.settings.line_width_mm,
+                    h.settings.bed_temperature_c, h.settings.chamber_temperature_c, h.settings.bonding_scale,
+                    h.settings.hardening_ratio, h.settings.failure_plastic_strain);
+                report += wxString::FromUTF8(h.message);
+            }
+            wxMessageBox(report, run.name, wxOK | wxICON_INFORMATION, scroller);
+        });
+        auto *probe = new wxChoice(scroller, wxID_ANY);
+        for (const auto &point : run.ramp.probes)
+            probe->Append(wxString::Format(_L("%s — application node %zu"), wxString::FromUTF8(point.name), point.vertex_index));
+        if (probe->GetCount()) probe->SetSelection(0);
+        column->Add(probe, 0, wxEXPAND | wxALL, gap / 2);
+        auto *graph = new wxPanel(scroller, wxID_ANY);
+        graph->SetMinSize(FromDIP(wxSize(430, 150)));
+        graph->SetBackgroundStyle(wxBG_STYLE_PAINT);
+        column->Add(graph, 0, wxEXPAND | wxALL, gap / 2);
+        graph->Bind(wxEVT_PAINT, [graph, probe, axis, scrub, run](wxPaintEvent &) {
+            wxAutoBufferedPaintDC dc(graph);
+            dc.SetBackground(wxBrush(wxSystemSettings::GetColour(wxSYS_COLOUR_WINDOW)));
+            dc.Clear();
+            const wxColour ink = wxSystemSettings::GetColour(wxSYS_COLOUR_WINDOWTEXT);
+            const wxColour accent = wxSystemSettings::GetColour(wxSYS_COLOUR_HIGHLIGHT);
+            dc.SetTextForeground(ink);
+            const int margin = graph->FromDIP(48), top = graph->FromDIP(40);
+            const int width = std::max(1, graph->GetClientSize().x - margin - graph->FromDIP(25));
+            const int height = std::max(1, graph->GetClientSize().y - top - margin);
+            dc.SetPen(wxPen(ink));
+            dc.DrawLine(margin, top, margin, top + height);
+            dc.DrawLine(margin, top + height, margin + width, top + height);
+            if (probe->GetSelection() == wxNOT_FOUND) {
+                dc.DrawText(_L("No applied-force probe (gravity-only study)."), margin, top);
+                return;
+            }
+            const size_t selected = size_t(probe->GetSelection());
+            std::vector<wxPoint2DDouble> samples;
+            double xmax = 0.0, ymax = 0.0;
+            if (run.history) {
+                for (const auto &frame : run.history->frames) {
+                    const double x = axis->GetSelection() == 0 ? frame.time_s : frame.applied_forces_n[selected];
+                    const double y = frame.probe_displacements_mm[selected];
+                    samples.emplace_back(x, y); xmax = std::max(xmax, x); ymax = std::max(ymax, y);
+                }
+            } else {
+                const auto &point = run.ramp.probes[selected];
+                xmax = axis->GetSelection() == 0 ? run.ramp.duration_s : point.force_n;
+                ymax = point.displacement_mm;
+                samples = {{0.0, 0.0}, {xmax, ymax}};
+            }
+            dc.DrawText(wxString::Format(_L("Deformation: 0–%.4g mm"), ymax), margin, graph->FromDIP(4));
+            dc.DrawText(wxString::Format(axis->GetSelection() == 0 ? _L("Time: 0–%.4g s") : _L("Force: 0–%.4g N"), xmax),
+                        margin, top + height + graph->FromDIP(8));
+            const auto position = [&](const wxPoint2DDouble &p) { return wxPoint(
+                margin + int(width * p.m_x / std::max(xmax, 1e-12)),
+                top + height - int(height * p.m_y / std::max(ymax, 1e-12))); };
+            for (size_t j = 1; j < samples.size(); ++j) {
+                const bool unloading = run.history && run.history->settings.unload &&
+                    run.history->frames[j].time_s > run.ramp.duration_s * 0.5;
+                dc.SetPen(wxPen(unloading ? ink : accent, graph->FromDIP(2),
+                                unloading ? wxPENSTYLE_SHORT_DASH : wxPENSTYLE_SOLID));
+                dc.DrawLine(position(samples[j-1]), position(samples[j]));
+            }
+            if (run.history && std::isfinite(run.history->first_yield_time_s)) {
+                dc.DrawText(wxString::Format(_L("First plastic yield: %.4g s"), run.history->first_yield_time_s),
+                            margin, graph->FromDIP(21));
+                const auto it = std::lower_bound(run.history->frames.begin(), run.history->frames.end(),
+                    run.history->first_yield_time_s, [](const SA::TransientFrame &f, double t) { return f.time_s < t; });
+                const size_t j = std::min(samples.size()-1, size_t(it - run.history->frames.begin()));
+                dc.SetPen(wxPen(ink, 1, wxPENSTYLE_DOT));
+                const int x = position(samples[j]).x;
+                dc.DrawLine(x, top, x, top + height);
+            } else dc.DrawText(_L("No plastic yield reached."), margin, graph->FromDIP(21));
+            const size_t index = size_t(std::round(scrub->GetValue() * (samples.size()-1) / 1000.0));
+            dc.SetPen(wxPen(ink)); dc.SetBrush(wxBrush(accent));
+            dc.DrawCircle(position(samples[index]), graph->FromDIP(4));
+        });
+        probe->Bind(wxEVT_CHOICE, [graph](wxCommandEvent &) { graph->Refresh(); });
+        columns->Add(column, 1, wxEXPAND | wxALL, gap);
+        panes.push_back({session, canvas, metrics, probe, graph});
+    }
+    scroller->SetSizer(columns);
+    root->Add(scroller, 1, wxEXPAND);
+    auto *footer = new wxBoxSizer(wxHORIZONTAL);
+    if (allow_save) {
+        auto *save = new wxButton(&dialog, wxID_ANY, _L("Add to compare"));
+        footer->Add(save, 0, wxALL, gap);
+        save->Bind(wxEVT_BUTTON, [this, save, runs](wxCommandEvent &) {
+            m_animation_runs.push_back(runs.front());
+            save->SetLabel(_L("Added to compare"));
+            save->Disable();
+        });
+    }
+    footer->AddStretchSpacer();
+    footer->Add(new wxButton(&dialog, wxID_CANCEL, _L("Close")), 0, wxALL, gap);
+    root->Add(footer, 0, wxEXPAND);
+    const auto update = [&] {
+        const double fraction = scrub->GetValue() / 1000.0;
+        for (size_t i = 0; i < panes.size(); ++i) {
+            auto &pane = panes[i];
+            const auto &run = runs[i];
+            const size_t frame_index = run.history ? size_t(std::round(fraction * (run.history->frames.size()-1))) : 0;
+            const SA::TransientFrame *frame = run.history ? &run.history->frames[frame_index] : nullptr;
+            const double load_fraction = frame ? frame->load_fraction : fraction;
+            pane.session->result = frame ? SA::transient_display_frame(*run.history, frame_index) :
+                SA::load_ramp_frame(run.snapshot->result, fraction);
+            pane.session->solved_setup = run.snapshot->solved_setup;
+            size_t force_index = 0;
+            for (auto &load : pane.session->solved_setup.loads) {
+                if (!load.active || load.type == SA::LoadType::Fixed) continue;
+                if (frame && force_index < frame->applied_forces_n.size()) {
+                    load.magnitude_n = frame->applied_forces_n[force_index++] /
+                        (load.type == SA::LoadType::ImpactForce ? load.impact_factor : 1.0);
+                    if (load.magnitude_n <= 1e-12) load.active = false;
+                } else load.magnitude_n *= load_fraction;
+            }
+            pane.session->solved_setup.gravity.acceleration_m_s2 *= load_fraction;
+            if (load_fraction == 0.0) pane.session->solved_setup.gravity.enabled = false;
+            wxString state = frame ? wxString::Format(_L("Failed bonds: %zu; detached cells: %zu; plastic strain: %.4g"),
+                frame->failed_bonds, frame->detached_cells, frame->maximum_plastic_strain) : _L("Elastic estimate");
+            pane.metrics->SetLabel(wxString::Format(_L("%.3g / %.3g s — %.1f%% requested load\nPeak displacement: %.4g mm; stress: %.4g MPa\n%s"),
+                frame ? frame->time_s : fraction * run.ramp.duration_s, run.ramp.duration_s, load_fraction * 100.0,
+                pane.session->result.maximum_displacement_m * 1000.0, pane.session->result.maximum_von_mises_pa / 1e6, state));
+            pane.metrics->Wrap(FromDIP(450));
+            pane.canvas->Refresh();
+            pane.graph->Refresh();
+        }
+        scroller->Layout();
+        scroller->FitInside();
+    };
+    double magnification = 1.0;
+    for (const auto &run : runs) {
+        double peak = 0.0;
+        if (run.history) for (const auto &frame : run.history->frames)
+            for (const auto &cell : frame.cells) peak = std::max(peak, cell.displacement_m.norm() * 1000.0);
+        else peak = run.snapshot->result.maximum_displacement_m * 1000.0;
+        const double span = bounding_box(run.snapshot->solved_mesh).size().cast<double>().norm();
+        if (peak > 1e-12) magnification = std::max(magnification, std::min(1000.0, span * 0.05 / peak));
+    }
+    scale->ChangeValue(number(magnification));
+    for (auto &pane : panes) pane.canvas->set_deformation_scale(magnification);
+    wxTimer timer(&dialog);
+    double start_fraction = 0.0;
+    auto started = std::chrono::steady_clock::now();
+    const auto pause = [&] { timer.Stop(); play->SetLabel(_L("Play")); };
+    play->Bind(wxEVT_BUTTON, [&](wxCommandEvent &) {
+        if (timer.IsRunning()) { pause(); return; }
+        if (scrub->GetValue() == 1000) scrub->SetValue(0);
+        start_fraction = scrub->GetValue() / 1000.0;
+        started = std::chrono::steady_clock::now();
+        play->SetLabel(_L("Pause"));
+        timer.Start(33);
+        update();
+    });
+    dialog.Bind(wxEVT_TIMER, [&](wxTimerEvent &) {
+        double duration = 0.0;
+        for (const auto &run : runs) duration = std::max(duration, run.ramp.duration_s);
+        const double fraction = std::min(1.0, start_fraction +
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count() / duration);
+        scrub->SetValue(int(std::round(fraction * 1000.0)));
+        if (fraction >= 1.0) pause();
+        update();
+    }, timer.GetId());
+    scrub->Bind(wxEVT_SLIDER, [&](wxCommandEvent &) { pause(); update(); });
+    mode->Bind(wxEVT_CHOICE, [&](wxCommandEvent &) {
+        for (auto &pane : panes) pane.canvas->set_mode(mode->GetSelection() + 1);
+    });
+    view->Bind(wxEVT_CHOICE, [&](wxCommandEvent &) {
+        for (auto &pane : panes) pane.canvas->set_projection(view->GetSelection());
+    });
+    axis->Bind(wxEVT_CHOICE, [&](wxCommandEvent &) { for (auto &pane : panes) pane.graph->Refresh(); });
+    section->Bind(wxEVT_BUTTON, [&](wxCommandEvent &) { for (auto &pane : panes) pane.canvas->toggle_section(); });
+    scale->Bind(wxEVT_TEXT, [&](wxCommandEvent &) {
+        double value = 1.0;
+        if (read_number(scale, value) && std::isfinite(value) && value >= 0.0)
+            for (auto &pane : panes) pane.canvas->set_deformation_scale(value);
+    });
+    dialog.SetSizer(root);
+    const wxRect screen = wxGetClientDisplayRect();
+    dialog.SetSize(wxSize(std::min(FromDIP(runs.size() == 1 ? 760 : 1240), screen.width),
+                          std::min(FromDIP(900), screen.height)));
+    root->SetSizeHints(&dialog);
+    dialog.CentreOnParent();
+    dialog.Layout();
+    scroller->Layout();
+    scroller->FitInside();
+    update();
+    play->SetLabel(_L("Pause"));
+    started = std::chrono::steady_clock::now();
+    timer.Start(33);
+    dialog.ShowModal();
+    timer.Stop();
 }
 
 void StrengthSimulationPanel::activate()
@@ -4284,8 +5202,60 @@ void StrengthSimulationPanel::refresh()
     update_dense_preview();
 }
 
+void StrengthSimulationPanel::show_target_safety_factor_popup()
+{
+    if (!m_size_to_safety_factor->IsEnabled()) return;
+    if (m_target_popup) m_target_popup->Destroy();
+    auto *popup = new wxPopupTransientWindow(this, wxBORDER_SIMPLE);
+    m_target_popup = popup;
+    auto *layout = new wxBoxSizer(wxVERTICAL);
+    const int gap = FromDIP(12);
+    layout->Add(new wxStaticText(popup, wxID_ANY, _L("Target estimated safety factor")), 0, wxALL, gap);
+    auto *value = new wxTextCtrl(popup, wxID_ANY, m_target_safety_factor->GetValue(), wxDefaultPosition,
+                                 FromDIP(wxSize(260, -1)), wxTE_PROCESS_ENTER);
+    layout->Add(value, 0, wxEXPAND | wxLEFT | wxRIGHT, gap);
+    auto *help = new wxStaticText(popup, wxID_ANY, _L("Find the smallest qualifying region in 1% volume steps."));
+    help->Wrap(FromDIP(260));
+    layout->Add(help, 0, wxALL, gap);
+    auto *apply = new wxButton(popup, wxID_ANY, _L("Size region"));
+    layout->Add(apply, 0, wxALIGN_RIGHT | wxLEFT | wxRIGHT | wxBOTTOM, gap);
+    popup->SetSizerAndFit(layout);
+    wxGetApp().UpdateDarkUI(popup);
+    const auto submit = [this, popup, value, help](wxCommandEvent &) {
+        double target = 0.0;
+        if (!read_number(value, target) || target <= 0.0) {
+            help->SetLabel(_L("Enter a positive safety factor."));
+            value->SetFocus();
+            return;
+        }
+        if (!m_size_to_safety_factor->IsEnabled()) { popup->Dismiss(); return; }
+        m_target_safety_factor->ChangeValue(value->GetValue());
+        size_dense_preview_to_target();
+        popup->Dismiss();
+    };
+    apply->Bind(wxEVT_BUTTON, submit);
+    value->Bind(wxEVT_TEXT_ENTER, submit);
+    popup->Bind(wxEVT_CHAR_HOOK, [popup](wxKeyEvent &event) {
+        if (event.GetKeyCode() == WXK_ESCAPE) popup->Dismiss();
+        else event.Skip();
+    });
+    wxPoint origin = ClientToScreen(wxPoint(FromDIP(20), FromDIP(110)));
+    if (wxWindow *focus = wxWindow::FindFocus(); focus && IsDescendant(focus) && focus->IsShownOnScreen()) {
+        const wxRect anchor = focus->GetScreenRect();
+        origin = wxPoint(anchor.x, anchor.GetBottom() + FromDIP(4));
+    }
+    popup->Position(origin, wxSize(0, 0));
+    popup->Popup(value);
+    value->SelectAll();
+}
+
 void StrengthSimulationPanel::update_dense_preview()
 {
+    const auto update_modifier_button = [this] {
+        m_apply_dense_button->SetLabel(_L("Create Slice Modifier"));
+        m_apply_dense_button->Enable(!m_session->stale && m_dense_preview.applicable() &&
+                                    m_dense_volume_slider->GetValue() > 0 && bool(m_apply_dense_preview));
+    };
     const bool solved = m_session->result.succeeded() && !m_session->solved_mesh.empty() &&
         m_session->result.vertices.size() == m_session->solved_mesh.vertices.size();
     if (!solved || m_probe_revision != m_session->solved_revision) {
@@ -4303,7 +5273,7 @@ void StrengthSimulationPanel::update_dense_preview()
         m_dense_preview = {};
         m_dense_preview_metrics->SetLabel(
             _L("Solve a study to preview strengthened volume, mass, deformation, and safety factor."));
-        m_apply_dense_button->Disable();
+        update_modifier_button();
         m_canvas->set_dense_preview(m_dense_preview, false);
         Layout();
         return;
@@ -4318,7 +5288,7 @@ void StrengthSimulationPanel::update_dense_preview()
         m_show_dense_preview->Disable();
         m_dense_preview_metrics->SetLabel(m_dense_profile ? wxString::FromUTF8(m_dense_profile->warning) :
             _L("Solve the study to prepare its stress-directed reinforcement preview."));
-        m_apply_dense_button->Disable();
+        update_modifier_button();
         m_canvas->set_dense_preview(m_dense_preview, false);
         Layout();
         return;
@@ -4357,7 +5327,7 @@ void StrengthSimulationPanel::update_dense_preview()
         metrics += _L("  Results are stale; solve again before creating a modifier.");
     m_dense_preview_metrics->SetLabel(metrics);
     m_dense_preview_metrics->Wrap(FromDIP(920));
-    m_apply_dense_button->Enable(!m_session->stale && m_dense_preview.applicable() && bool(m_apply_dense_preview));
+    update_modifier_button();
     m_canvas->set_dense_preview(m_dense_preview, m_show_dense_preview->GetValue());
     if (m_probe_vertex < result.vertices.size())
         update_probe(m_probe_vertex);

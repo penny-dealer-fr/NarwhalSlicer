@@ -10,9 +10,11 @@ body
 	overflow: auto;
 }
 
-#SlicerIcon
+#SlicerIcon img
 {
-
+	width: 154px;
+	height: 154px;
+	object-fit: contain;
 }
 
 #Title

@@ -598,6 +598,7 @@ wxMenu* MenuFactory::append_submenu_add_handy_model(wxMenu* menu, ModelVolumeTyp
         {L("OrcaSliced Combo"),    {"OrcaSliced.3mf", "OrcaCube_v2.drc", "OrcaPlug_v2.drc"},  true},
         {L("Orca Badge"),          {"OrcaBadge.3mf"}},
         {L("Orca Tolerance Test"), {"OrcaToleranceTest.drc"}},
+        {L("CNC Testhook"),        {"CNC_Testhook.stl"}},
         {L("3DBenchy"),            {"3DBenchy.drc"}},
         {L("Cali Cat"),            {"calicat.drc"}},
         {L("Autodesk FDM Test"),   {"ksr_fdmtest_v4.drc"}},

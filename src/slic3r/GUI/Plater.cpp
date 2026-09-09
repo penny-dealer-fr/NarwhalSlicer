@@ -19361,7 +19361,11 @@ void Plater::send_calibration_job_finished(wxCommandEvent & evt)
     p->main_frame->request_select_tab(TAB_ID_CALIBRATION);
     auto calibration_panel = p->main_frame->m_calibration;
     if (calibration_panel) {
-        auto curr_wizard = static_cast<CalibrationWizard*>(calibration_panel->get_tabpanel()->GetPage(evt.GetInt()));
+        const int page = evt.GetInt();
+        auto* tabs = calibration_panel->get_tabpanel();
+        auto* curr_wizard = page >= 0 && size_t(page) < tabs->GetPageCount() ?
+            dynamic_cast<CalibrationWizard*>(tabs->GetPage(page)) : nullptr;
+        if (!curr_wizard) { evt.Skip(); return; }
         wxCommandEvent event(EVT_CALIBRATION_JOB_FINISHED);
         event.SetString(evt.GetString());
         event.SetEventObject(curr_wizard);

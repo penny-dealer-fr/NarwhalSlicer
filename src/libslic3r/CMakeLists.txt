@@ -391,6 +391,8 @@ set(lisbslic3r_sources
     ShortEdgeCollapse.hpp
     ShortestPath.cpp
     ShortestPath.hpp
+    LoadCalibration.cpp
+    LoadCalibration.hpp
     StrengthAnalysis.cpp
     StrengthAnalysis.hpp
     StrengthTransient.cpp

@@ -1606,3 +1606,61 @@ TEST_CASE("Shear loading reports the applied interface traction without halving 
     CHECK_THAT(maximum_shear, WithinRel(10.0 / 16e-6,1e-6));
     CHECK_THAT(frame.maximum_von_mises_pa, WithinRel(std::sqrt(3.0) * 10.0 / 16e-6,1e-6));
 }
+
+TEST_CASE("Animation reinforcement uses the captured dense geometry without a slice modifier", "[StrengthAnalysis][Transient]")
+{
+    const auto mesh = its_make_cube(4,4,4);
+    auto setup = transient_cube_setup(10);
+    setup.infill.background_density = 0.2;
+    auto settings = small_transient_settings();
+    settings.increments = 4;
+    settings.unload = false;
+    const auto baseline = analyze_transient(mesh, setup, settings);
+    REQUIRE(baseline.succeeded());
+    settings.dense_region_mesh = mesh;
+    settings.dense_volume_fraction = 1.0;
+    const auto reinforced = analyze_transient(mesh, setup, settings);
+    INFO(reinforced.message);
+    REQUIRE(reinforced.succeeded());
+    CHECK(reinforced.dense_cell_count == reinforced.frames.front().cells.size());
+    CHECK(reinforced.frames.back().probe_displacements_mm[0] < baseline.frames.back().probe_displacements_mm[0]);
+    settings.dense_region_mesh = its_make_cube(2,4,4);
+    const auto partial = analyze_transient(mesh, setup, settings);
+    REQUIRE(partial.succeeded());
+    CHECK(partial.dense_cell_count * 2 == reinforced.dense_cell_count);
+    CHECK(partial.frames.back().probe_displacements_mm[0] > reinforced.frames.back().probe_displacements_mm[0]);
+    CHECK(partial.frames.back().probe_displacements_mm[0] < baseline.frames.back().probe_displacements_mm[0]);
+    settings.dense_region_mesh.indices.front()[0] = -1;
+    CHECK(analyze_transient(mesh, setup, settings).status == AnalysisStatus::InvalidInput);
+    settings.dense_region_mesh = {};
+    CHECK_FALSE(reinforced.settings.dense_region_mesh.empty());
+    CHECK(baseline.dense_cell_count == 0);
+    const auto &frame = reinforced.frames.back();
+    REQUIRE(frame.probe_von_mises_pa.size() == frame.applied_forces_n.size());
+    REQUIRE(frame.probe_maximum_shear_pa.size() == frame.applied_forces_n.size());
+    CHECK_THAT(frame.probe_von_mises_pa[0], WithinRel(10.0 / 16e-6,1e-6));
+}
+
+TEST_CASE("Fine animation grids and longer histories honor editable budgets and cancellation", "[StrengthAnalysis][Transient]")
+{
+    const auto mesh = its_make_cube(4,4,4);
+    const auto setup = transient_cube_setup(10);
+    auto settings = small_transient_settings();
+    settings.cell_width_mm = 0.5;
+    settings.increments = 240;
+    settings.plasticity = false;
+    settings.fracture = false;
+    const auto fine = analyze_transient(mesh, setup, settings);
+    INFO(fine.message);
+    REQUIRE(fine.succeeded());
+    CHECK(fine.frames.size() == 241);
+    CHECK(fine.frames.front().cells.size() == 256);
+    CHECK_THAT(fine.frames.back().probe_displacements_mm[0], WithinAbs(0.0,1e-8));
+    settings.maximum_history_mb = 1;
+    CHECK(analyze_transient(mesh, setup, settings).status == AnalysisStatus::InvalidInput);
+    settings.maximum_history_mb = 512;
+    bool cancel = false;
+    const auto cancelled = analyze_transient(mesh, setup, settings, [&] { return cancel; }, [&](int progress) { if (progress >= 10) cancel = true; });
+    CHECK(cancelled.status == AnalysisStatus::Cancelled);
+    CHECK(cancelled.frames.empty());
+}

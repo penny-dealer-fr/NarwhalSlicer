@@ -11,7 +11,7 @@
 namespace Slic3r::StrengthAnalysis {
 namespace {
 struct Cancelled {};
-struct Cell { Vec3d p; Vec3d size; Vec3d u{Vec3d::Zero()}; int layer; double solid; };
+struct Cell { Vec3d p; Vec3d size; Vec3d u{Vec3d::Zero()}; int layer; double solid; bool dense; };
 struct Bond {
     size_t a, b;
     Vec3d n;
@@ -87,7 +87,7 @@ TransientResult analyze_transient(const indexed_triangle_set &mesh, const Setup 
         if (!std::isfinite(value) || value <= 0.0) return fail("Time, dimensions and constitutive parameters must be finite and positive.");
     for (double value : {s.nozzle_temperature_c, s.bed_temperature_c, s.chamber_temperature_c, s.reference_nozzle_temperature_c})
         if (!std::isfinite(value)) return fail("Temperatures must be finite.");
-    if (s.increments < 4 || s.increments > 200 || s.maximum_cells < 8 || s.maximum_cells > 10000 || s.wall_loops < 0 ||
+    if (s.increments < 4 || s.increments > 100000 || s.maximum_cells < 8 || s.maximum_cells > 200000 || s.wall_loops < 0 || s.maximum_history_mb < 1 || s.maximum_history_mb > 8192 ||
         s.hardening_ratio > 1.0 || s.bonding_scale > 1.0 ||
         (s.thermal_bonding && (s.nozzle_temperature_c <= s.chamber_temperature_c ||
                               s.reference_nozzle_temperature_c <= s.chamber_temperature_c)))
@@ -116,14 +116,27 @@ TransientResult analyze_transient(const indexed_triangle_set &mesh, const Setup 
         }
         out.layer_count = heights.size();
         const auto slices = slice_mesh_ex(aligned, heights, check);
+        indexed_triangle_set dense_mesh = s.dense_region_mesh;
+        for (const Vec3f &v : dense_mesh.vertices)
+            if (!v.allFinite()) return fail("Dense preview contains a nonfinite vertex.");
+        for (const Vec3i32 &triangle : dense_mesh.indices)
+            for (int j = 0; j < 3; ++j)
+                if (triangle[j] < 0 || size_t(triangle[j]) >= dense_mesh.vertices.size())
+                    return fail("Dense preview contains an invalid triangle.");
+        for (Vec3f &v : dense_mesh.vertices)
+            v = (basis.transpose() * v.cast<double>().cwiseProduct(setup.geometry_scale)).cast<float>();
+        const auto dense_slices = dense_mesh.empty() ? std::vector<ExPolygons>(heights.size()) :
+            slice_mesh_ex(dense_mesh, heights, check);
         const auto inside = [&](int layer, double px, double py) {
             const Point p(scale_(px), scale_(py));
             for (const ExPolygon &poly : slices[size_t(layer)]) if (poly.contains(p)) return true;
             return false;
         };
+        if ((high - low).head<2>().maxCoeff() / s.cell_width_mm > 1000000.0)
+            return fail("Cell width is too small for this part's dimensions.");
         const int nx = std::max(1, int(std::ceil((high.x() - low.x()) / s.cell_width_mm)));
         const int ny = std::max(1, int(std::ceil((high.y() - low.y()) / s.cell_width_mm)));
-        if (double(nx) * ny * heights.size() > 2000000.0) return fail("Cell grid exceeds the work limit. Increase in-plane cell width.");
+        if (double(nx) * ny * heights.size() > 20000000.0) return fail("Cell grid exceeds the work limit. Increase in-plane cell width.");
         const double dx = (high.x() - low.x()) / nx, dy = (high.y() - low.y()) / ny;
         std::vector<Cell> cells;
         std::map<std::array<int, 3>, size_t> grid;
@@ -142,23 +155,29 @@ TransientResult analyze_transient(const indexed_triangle_set &mesh, const Setup 
             out.layer_bond_factors.push_back(std::clamp(s.bonding_scale * thermal, 0.01, 1.0));
             out.layer_interface_temperature_c.push_back(interface_t);
             for (int j = 0; j < ny; ++j) for (int i = 0; i < nx; ++i) {
+                if ((i & 127) == 0) check();
                 const double px = low.x() + (i + 0.5) * dx, py = low.y() + (j + 0.5) * dy;
                 if (!inside(k, px, py)) continue;
                 const double wall = s.wall_loops * s.line_width_mm;
                 const bool shell = wall > 0.0 && (!inside(k, px-wall, py) || !inside(k, px+wall, py) ||
                                                    !inside(k, px, py-wall) || !inside(k, px, py+wall));
-                const double solid = shell ? 1.0 : std::clamp(setup.infill.background_density, 0.01, 1.0);
+                bool dense = false;
+                for (const ExPolygon &poly : dense_slices[size_t(k)])
+                    if (poly.contains(Point(scale_(px), scale_(py)))) { dense = true; break; }
+                if (dense) ++out.dense_cell_count;
+                const double solid = shell ? 1.0 : std::clamp(dense ?
+                    std::max(setup.infill.background_density, setup.infill.dense_density) : setup.infill.background_density, 0.01, 1.0);
                 grid[{i,j,k}] = cells.size();
-                cells.push_back({Vec3d(px, py, heights[size_t(k)]), Vec3d(dx, dy, thickness[size_t(k)]), Vec3d::Zero(), k, solid});
-                if (cells.size() > s.maximum_cells || cells.size() * (s.increments + 1) > 400000)
-                    return fail("Layer grid exceeds the memory budget. Increase in-plane cell width; physical layers are never silently merged.");
+                cells.push_back({Vec3d(px, py, heights[size_t(k)]), Vec3d(dx, dy, thickness[size_t(k)]), Vec3d::Zero(), k, solid, dense});
+                if (cells.size() > s.maximum_cells || double(cells.size()) * (s.increments + 1) * sizeof(VertexResult) > double(s.maximum_history_mb) * 1024 * 1024)
+                    return fail("Layer grid exceeds the memory budget. Increase the cell/history budgets or use fewer frames or wider cells; physical layers are never silently merged.");
             }
         }
         if (cells.size() < 2) return fail("Grid does not resolve this part. Reduce in-plane cell width.");
         const Material material = setup.material.calibrated();
         const std::array<double,6> pattern_stiffness{{0.82,0.94,1.05,0.98,1.03,1.0}};
         const std::array<double,6> pattern_strength{{0.82,0.91,1.02,0.96,1.0,1.0}};
-        const size_t pattern = std::min(size_t(setup.infill.background_pattern), size_t(5));
+
         std::vector<Bond> bonds;
         std::vector<std::vector<size_t>> adjacency(cells.size());
         for (const auto &[index, a] : grid) {
@@ -173,6 +192,8 @@ TransientResult analyze_transient(const indexed_triangle_set &mesh, const Setup 
                 if (!inside(cells[a].layer, mid.x(), mid.y()) || !inside(cells[b].layer, mid.x(), mid.y())) continue;
                 const double factor = interlayer ? out.layer_bond_factors[size_t(cells[b].layer)] : 1.0;
                 const double density = std::min(cells[a].solid, cells[b].solid);
+                const size_t pattern = std::min(size_t(cells[a].dense && cells[b].dense ?
+                    setup.infill.dense_pattern : setup.infill.background_pattern), size_t(5));
                 const double stiffness_factor = density + (1.0-density)*pattern_stiffness[pattern];
                 const double strength_factor = density + (1.0-density)*pattern_strength[pattern];
                 const double area = (offset[0] ? dy * cells[a].size.z() : offset[1] ? dx * cells[a].size.z() : dx * dy) *
@@ -414,20 +435,26 @@ TransientResult analyze_transient(const indexed_triangle_set &mesh, const Setup 
             }
             for(size_t j=0;j<forces.size();++j) {
                 const auto &force=forces[j];
-                double applied=0.0,displacement=0.0;
+                double applied=0.0,displacement=0.0,stress=0.0,shear=0.0;
                 for(size_t i:force.cells) {
                     if(attached[i]) applied+=fraction*force.vector.norm()/force.cells.size();
                     displacement=std::max(displacement,u[i].norm()*1000.0);
+                    stress=std::max(stress,frame.cells[i].von_mises_pa);
+                    shear=std::max(shear,frame.cells[i].maximum_shear_pa);
                 }
                 frame.applied_forces_n.push_back(applied);frame.probe_displacements_mm.push_back(displacement);
+                frame.probe_von_mises_pa.push_back(stress);frame.probe_maximum_shear_pa.push_back(shear);
             }
             if(setup.gravity.enabled) {
-                double applied=0.0,displacement=0.0;
+                double applied=0.0,displacement=0.0,stress=0.0,shear=0.0;
                 for(size_t i=0;i<count;++i) if(!fixed[i]) {
                     if(attached[i]) applied+=fraction*setup.gravity.acceleration_m_s2.norm()*material.density_kg_m3*cells[i].size.prod()*1e-9*cells[i].solid;
                     displacement=std::max(displacement,u[i].norm()*1000.0);
+                    stress=std::max(stress,frame.cells[i].von_mises_pa);
+                    shear=std::max(shear,frame.cells[i].maximum_shear_pa);
                 }
                 frame.applied_forces_n.push_back(applied);frame.probe_displacements_mm.push_back(displacement);
+                frame.probe_von_mises_pa.push_back(stress);frame.probe_maximum_shear_pa.push_back(shear);
             }
             out.frames.push_back(std::move(frame));
             if(progress) progress(int(100*step/s.increments));

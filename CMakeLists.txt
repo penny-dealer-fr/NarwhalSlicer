@@ -655,7 +655,9 @@ message(STATUS "LIBDIR: ${LIBDIR}")
 message(STATUS "LIBDIR_BIN: ${LIBDIR_BIN}")
 
 # For the bundled boost libraries (boost::nowide)
-include_directories(SYSTEM ${LIBDIR})
+# These are our own headers. Marking them SYSTEM excludes them from compiler
+# dependency files (-MMD), leaving stale callers after structure/layout changes.
+include_directories(${LIBDIR})
 # For generated header files
 include_directories(SYSTEM ${LIBDIR_BIN}/dev-utils/platform)
 # For ligigl

@@ -1,4 +1,5 @@
 #include "StrengthAnalysisPanel.hpp"
+#include "LoadCalibrationPanel.hpp"
 
 #include "I18N.hpp"
 #include "Plater.hpp"
@@ -2048,7 +2049,7 @@ void StrengthLoadPanel::build_ui()
     auto *material = new wxStaticBoxSizer(wxVERTICAL, this, _L("Material and print direction"));
     auto *material_choice_row = new wxBoxSizer(wxHORIZONTAL);
     m_material_choice = new wxChoice(this, wxID_ANY);
-    for (const SA::Material &item : SA::builtin_materials())
+    for (const SA::Material &item : load_materials())
         m_material_choice->Append(wxString::FromUTF8(item.name));
     m_material_choice->Append(_L("Custom material"));
     add_labeled(material_choice_row, this, _L("Material"), m_material_choice, 1);
@@ -2216,8 +2217,8 @@ void StrengthLoadPanel::build_ui()
 
     m_material_choice->Bind(wxEVT_CHOICE, [this](wxCommandEvent &) {
         const int index = m_material_choice->GetSelection();
-        if (index >= 0 && size_t(index) < SA::builtin_materials().size()) {
-            m_session->setup.material = SA::builtin_materials()[size_t(index)];
+        if (index >= 0 && size_t(index) < load_materials().size()) {
+            m_session->setup.material = load_materials()[size_t(index)];
         } else {
             m_session->setup.material.key = "custom";
             m_session->setup.material.name = "Custom material";
@@ -2376,6 +2377,7 @@ void StrengthLoadPanel::build_ui()
 
 void StrengthLoadPanel::activate()
 {
+    populate_material_fields();
     load_selected_object();
 }
 
@@ -2453,8 +2455,23 @@ void StrengthLoadPanel::load_selected_object()
         settings.layer_height_mm = scalar("layer_height", 0.2);
         settings.first_layer_height_mm = scalar("initial_layer_print_height", settings.layer_height_mm);
         settings.wall_loops = int(scalar("wall_loops", 2));
-        settings.line_width_mm = scalar("line_width", 0.4);
-        if (settings.line_width_mm <= 0.0) settings.line_width_mm = 0.4;
+        double nozzle = 0.4;
+        if (const auto *v = process.option<ConfigOptionFloats>("nozzle_diameter"); v && !v->values.empty())
+            nozzle = v->get_at(size_t(filament));
+        settings.line_width_mm = scalar("line_width", nozzle);
+        if (settings.line_width_mm <= 0.0) settings.line_width_mm = nozzle;
+        if (const auto *v = process.option<ConfigOptionPercent>("sparse_infill_density"))
+            settings.background_density = v->value / 100.0;
+        settings.background_pattern = SA::InfillPattern::Gyroid;
+        settings.unsupported_print_pattern.clear();
+        if (const auto *v = process.option<ConfigOptionEnum<Slic3r::InfillPattern>>("sparse_infill_pattern")) {
+            settings.unsupported_print_pattern = v->serialize();
+            for (int i = 0; i < 6; ++i)
+                if (print_pattern(SA::InfillPattern(i)) == v->value) {
+                    settings.background_pattern = SA::InfillPattern(i);
+                    settings.unsupported_print_pattern.clear();
+                }
+        }
         settings.nozzle_temperature_c = temperature("nozzle_temperature", 210.0);
         settings.chamber_temperature_c = temperature("chamber_temperature", 25.0);
         if (const auto *bed = process.option<ConfigOptionEnum<BedType>>("curr_bed_type"))
@@ -2568,9 +2585,13 @@ void StrengthLoadPanel::load_selected_object()
 void StrengthLoadPanel::populate_material_fields()
 {
     const SA::Setup &setup = m_session->setup;
-    int material_index = int(SA::builtin_materials().size());
-    for (size_t index = 0; index < SA::builtin_materials().size(); ++index)
-        if (SA::builtin_materials()[index].key == setup.material.key) material_index = int(index);
+    m_material_choice->Clear();
+    for (const auto& material : load_materials())
+        m_material_choice->Append(wxString::FromUTF8(material.name));
+    m_material_choice->Append(_L("Custom material"));
+    int material_index = int(load_materials().size());
+    for (size_t index = 0; index < load_materials().size(); ++index)
+        if (load_materials()[index].key == setup.material.key) material_index = int(index);
     m_material_choice->SetSelection(material_index);
     const SA::Material &m = setup.material;
     const std::array<double, 12> values{m.density_kg_m3, m.elastic_modulus_xy_pa / 1e9, m.elastic_modulus_z_pa / 1e9,
@@ -2635,9 +2656,9 @@ bool StrengthLoadPanel::collect_setup(bool show_errors, bool validate_setup)
     setup.geometry_scale = m_session->instance_transform.linear().colwise().norm().transpose();
     SA::Material &m = setup.material;
     const int selected_material = m_material_choice->GetSelection();
-    if (selected_material >= 0 && size_t(selected_material) < SA::builtin_materials().size()) {
+    if (selected_material >= 0 && size_t(selected_material) < load_materials().size()) {
         const SA::MaterialCalibration calibration = m.calibration;
-        m = SA::builtin_materials()[size_t(selected_material)];
+        m = load_materials()[size_t(selected_material)];
         m.calibration = calibration;
     }
     const std::array<double *, 12> properties{&m.density_kg_m3, &m.elastic_modulus_xy_pa, &m.elastic_modulus_z_pa,
@@ -2655,13 +2676,13 @@ bool StrengthLoadPanel::collect_setup(bool show_errors, bool validate_setup)
         else
             numeric = false;
     }
-    if (selected_material >= 0 && size_t(selected_material) < SA::builtin_materials().size()) {
-        const SA::Material &builtin = SA::builtin_materials()[size_t(selected_material)];
+    if (selected_material >= 0 && size_t(selected_material) < load_materials().size()) {
+        const SA::Material &builtin = load_materials()[size_t(selected_material)];
         if (!material_properties_match(m, builtin)) {
             m.key = "custom";
             m.name = builtin.name + " (custom)";
             m.provenance = "User-edited values based on a bundled material estimate; verify against a filament datasheet and printed coupons.";
-            m_material_choice->SetSelection(int(SA::builtin_materials().size()));
+            m_material_choice->SetSelection(int(load_materials().size()));
         }
     }
     std::array<double, 5> scales{m.calibration.modulus_xy_scale, m.calibration.modulus_z_scale,
@@ -3502,12 +3523,12 @@ void StrengthLoadPanel::edit_material_dialog()
 
     auto *choice_row = new wxBoxSizer(wxHORIZONTAL);
     auto *material_choice = new wxChoice(content, wxID_ANY);
-    for (const SA::Material &material : SA::builtin_materials())
+    for (const SA::Material &material : load_materials())
         material_choice->Append(wxString::FromUTF8(material.name));
     material_choice->Append(_L("Custom material"));
-    int selected = int(SA::builtin_materials().size());
-    for (size_t index = 0; index < SA::builtin_materials().size(); ++index)
-        if (SA::builtin_materials()[index].key == m_session->setup.material.key) selected = int(index);
+    int selected = int(load_materials().size());
+    for (size_t index = 0; index < load_materials().size(); ++index)
+        if (load_materials()[index].key == m_session->setup.material.key) selected = int(index);
     material_choice->SetSelection(selected);
     add_labeled(choice_row, content, _L("Material"), material_choice, 1);
     content_sizer->Add(choice_row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
@@ -3562,9 +3583,9 @@ void StrengthLoadPanel::edit_material_dialog()
 
     material_choice->Bind(wxEVT_CHOICE, [material_choice, &fields](wxCommandEvent &) {
         const int index = material_choice->GetSelection();
-        if (index < 0 || size_t(index) >= SA::builtin_materials().size())
+        if (index < 0 || size_t(index) >= load_materials().size())
             return;
-        const SA::Material &material = SA::builtin_materials()[size_t(index)];
+        const SA::Material &material = load_materials()[size_t(index)];
         const std::array<double, 12> values{material.density_kg_m3, material.elastic_modulus_xy_pa / 1e9,
             material.elastic_modulus_z_pa / 1e9, material.poisson_xy, material.shear_modulus_xy_pa / 1e9,
             material.shear_modulus_xz_pa / 1e9, material.yield_strength_xy_pa / 1e6, material.yield_strength_z_pa / 1e6,
@@ -3576,8 +3597,8 @@ void StrengthLoadPanel::edit_material_dialog()
 
     while (dialog.ShowModal() == wxID_OK) {
         const int material_index = material_choice->GetSelection();
-        SA::Material candidate = material_index >= 0 && size_t(material_index) < SA::builtin_materials().size() ?
-            SA::builtin_materials()[size_t(material_index)] : m_session->setup.material;
+        SA::Material candidate = material_index >= 0 && size_t(material_index) < load_materials().size() ?
+            load_materials()[size_t(material_index)] : m_session->setup.material;
         std::array<double, 12> values{};
         bool numeric = true;
         for (size_t index = 0; index < fields.size(); ++index)
@@ -3605,13 +3626,13 @@ void StrengthLoadPanel::edit_material_dialog()
         candidate.calibration.source = source->GetValue().utf8_string();
         Vec3d axis = m_session->setup.print_layer_axis;
         numeric = read_vector_strict(layer_axis, axis) && numeric;
-        if (material_index < 0 || size_t(material_index) >= SA::builtin_materials().size()) {
+        if (material_index < 0 || size_t(material_index) >= load_materials().size()) {
             candidate.key = "custom";
             candidate.name = "Custom material";
             candidate.provenance = "User-entered material properties; verify against a filament datasheet and printed coupons.";
-        } else if (!material_properties_match(candidate, SA::builtin_materials()[size_t(material_index)])) {
+        } else if (!material_properties_match(candidate, load_materials()[size_t(material_index)])) {
             candidate.key = "custom";
-            candidate.name = SA::builtin_materials()[size_t(material_index)].name + " (custom)";
+            candidate.name = load_materials()[size_t(material_index)].name + " (custom)";
             candidate.provenance = "User-edited bundled estimate; verify against a filament datasheet and printed coupons.";
         }
         wxString error;
@@ -4884,7 +4905,14 @@ void StrengthSimulationPanel::show_animation()
         wxMessageBox(_L("Solve the current load case before animating."), _L("Animate"), wxOK | wxICON_INFORMATION, this);
         return;
     }
+    update_dense_preview();
     SA::TransientSettings options = m_session->print_settings;
+    if (m_dense_preview.available) {
+        options.dense_region_mesh = m_dense_preview.modifier_mesh;
+        options.dense_volume_fraction = m_dense_volume_slider->GetValue() / 100.0;
+    }
+    double cell_budget = double(options.maximum_cells), history_budget = double(options.maximum_history_mb);
+    double walls = options.wall_loops, infill_percent = options.background_density * 100.0;
     const auto bounds = bounding_box(m_session->solved_mesh);
     const Vec3d dimensions = bounds.size().cast<double>().cwiseProduct(m_session->solved_setup.geometry_scale);
     options.cell_width_mm = std::max(0.5, std::sqrt(dimensions.prod() / (options.layer_height_mm * 2200.0)));
@@ -4895,8 +4923,10 @@ void StrengthSimulationPanel::show_animation()
     auto *pages = new wxNotebook(&dialog, wxID_ANY);
     auto *mechanical = new wxPanel(pages);
     auto *thermal = new wxPanel(pages);
+    auto *sampling = new wxPanel(pages);
     pages->AddPage(mechanical, _L("Mechanical"));
     pages->AddPage(thermal, _L("Print temperatures"));
+    pages->AddPage(sampling, _L("Sampling and infill"));
     wxWindow *field_parent = mechanical;
     auto *grid = new wxFlexGridSizer(2, gap, gap);
     grid->AddGrowableCol(1);
@@ -4925,6 +4955,26 @@ void StrengthSimulationPanel::show_animation()
     field(_L("Estimated time per printed layer (s)"), options.layer_time_s);
     field(_L("Reference layer cooling time (s)"), options.cooling_time_s);
     thermal->SetSizer(grid);
+    field_parent = sampling;
+    grid = new wxFlexGridSizer(2, gap, gap);
+    grid->AddGrowableCol(1);
+    field(_L("Frames per second"), options.frames_per_second);
+    field(_L("Maximum cells"), cell_budget);
+    field(_L("History memory budget (MiB)"), history_budget);
+    field(_L("Wall loops"), walls);
+    field(_L("Background infill (%)"), infill_percent);
+    auto *pattern = new wxChoice(sampling, wxID_ANY, wxDefaultPosition, wxDefaultSize, infill_names());
+    pattern->SetSelection(int(options.background_pattern));
+    add_labeled(grid, sampling, _L("Background infill pattern"), pattern);
+    if (!options.unsupported_print_pattern.empty()) {
+        auto *hint = new wxStaticText(sampling, wxID_ANY, wxString::Format(
+            _L("Slice pattern '%s' has no calibrated model. Choose a supported approximation above (default: Gyroid)."),
+            wxString::FromUTF8(options.unsupported_print_pattern)));
+        hint->Wrap(FromDIP(400));
+        grid->Add(hint, 0, wxEXPAND);
+        grid->AddSpacer(1);
+    }
+    sampling->SetSizer(grid);
     root->Add(pages, 0, wxEXPAND | wxALL, gap);
     const auto toggle = [&](const wxString &label, bool &value) {
         auto *check = new wxCheckBox(&dialog, wxID_ANY, label);
@@ -4939,7 +4989,7 @@ void StrengthSimulationPanel::show_animation()
     toggle(_L("Unload to zero during the second half"), options.unload);
     toggle(_L("Estimate thermal influence on inter-layer bonds"), options.thermal_bonding);
     auto *notice = new wxStaticText(&dialog, wxID_ANY, wxString::Format(
-        _L("Uses print orientation and %d walls from the current process. Infill and material come from the load study. "
+        _L("Imports editable process defaults, including %d walls and background infill. The current dense-region slider is captured even before creating a Slice Modifier. Material and orientation come from the study. "
            "This cell-based, small-strain estimate resolves mechanical layers with homogenized infill. "
            "Thermal bonding uses a cooling proxy; it does not reconstruct individual extrusion paths. "
            "Hardening, failure strain and bonding parameters require material/process calibration. "
@@ -4961,17 +5011,36 @@ void StrengthSimulationPanel::show_animation()
             wxMessageBox(_L("Enter a duration from 0.1 to 86400 seconds."), _L("Animate"), wxOK | wxICON_INFORMATION, &dialog);
             return;
         }
+        if (options.frames_per_second < 1 || options.frames_per_second > 120 ||
+            options.duration_s * options.frames_per_second > 100000 || cell_budget < 8 || cell_budget > 200000 ||
+            history_budget < 1 || history_budget > 8192 || walls < 0 || walls > 1000 || infill_percent <= 0 || infill_percent > 100 ||
+            std::floor(cell_budget) != cell_budget || std::floor(history_budget) != history_budget || std::floor(walls) != walls) {
+            wxMessageBox(_L("Use 1–120 FPS (at most 100000 increments), 8–200000 cells, 1–8192 MiB, 0–1000 whole walls and infill above 0% and at most 100%."),
+                         _L("Animate"), wxOK | wxICON_INFORMATION, &dialog);
+            return;
+        }
+        options.increments = std::max(size_t(4), size_t(std::ceil(options.duration_s * options.frames_per_second)));
+        if (options.unload && options.increments % 2) ++options.increments;
+        options.maximum_cells = size_t(cell_budget);
+        options.maximum_history_mb = size_t(history_budget);
+        options.wall_loops = int(walls);
+        options.background_density = infill_percent / 100.0;
+        options.background_pattern = SA::InfillPattern(pattern->GetSelection());
         dialog.EndModal(wxID_OK);
     }, wxID_OK);
     if (dialog.ShowModal() != wxID_OK) return;
     AnimationRun run;
     run.snapshot = std::make_shared<StrengthAnalysisSession>();
     run.snapshot->solved_setup = m_session->solved_setup;
+    run.snapshot->solved_setup.infill.background_density = options.background_density;
+    run.snapshot->solved_setup.infill.background_pattern = options.background_pattern;
+    run.snapshot->solved_setup.infill.dense_density = std::max(options.background_density,
+        run.snapshot->solved_setup.infill.dense_density);
     run.snapshot->solved_instance_transform = m_session->solved_instance_transform;
     run.snapshot->stale = false;
     std::atomic_bool cancelled{false};
     std::atomic_int completion{0};
-    auto task = std::async(std::launch::async, [mesh = m_session->solved_mesh, setup = m_session->solved_setup,
+    auto task = std::async(std::launch::async, [mesh = m_session->solved_mesh, setup = run.snapshot->solved_setup,
                                                options, &cancelled, &completion] {
         return SA::analyze_transient(mesh, setup, options, [&] { return cancelled.load(); },
                                     [&](int value) { completion.store(value); });
@@ -4979,6 +5048,7 @@ void StrengthSimulationPanel::show_animation()
     {
         wxProgressDialog progress(_L("Computing load history"), _L("Resolving layers, yielding and bond failure…"), 100, this,
                                   wxPD_APP_MODAL | wxPD_CAN_ABORT | wxPD_ELAPSED_TIME);
+        if (wxWindow *abort = progress.FindWindow(wxID_CANCEL)) abort->SetLabel(_L("Cancel compute"));
         while (task.wait_for(std::chrono::milliseconds(30)) != std::future_status::ready) {
             if (!progress.Update(completion.load())) cancelled.store(true);
         }
@@ -5043,17 +5113,22 @@ void StrengthSimulationPanel::show_animation_view(const std::vector<AnimationRun
     view->SetSelection(0);
     auto *axis = new wxChoice(&dialog, wxID_ANY, wxDefaultPosition, wxDefaultSize, {_L("Time (s)"), _L("Applied force (N)")});
     axis->SetSelection(0);
+    auto *quantity = new wxChoice(&dialog, wxID_ANY, wxDefaultPosition, wxDefaultSize,
+        {_L("Graph: deformation"), _L("Graph: Von Mises stress"), _L("Graph: maximum shear")});
+    quantity->SetSelection(0);
     auto *scale = number_input(&dialog, 1.0, 75);
     auto *section = new wxButton(&dialog, wxID_ANY, _L("Toggle section"));
-    for (wxWindow *control : std::vector<wxWindow *>{play, mode, view, axis, section})
+    for (wxWindow *control : std::vector<wxWindow *>{play, mode, view, axis, quantity, section})
         controls->Add(control, 0, wxALL | wxALIGN_CENTER_VERTICAL, gap);
     add_labeled(controls, &dialog, _L("Deformation scale"), scale);
     root->Add(controls, 0, wxEXPAND);
-    auto *scrub = new wxSlider(&dialog, wxID_ANY, 0, 0, 1000, wxDefaultPosition, wxDefaultSize, wxSL_HORIZONTAL);
+    int scrub_steps = 1000;
+    for (const auto &run : runs) if (run.history) scrub_steps = std::max(scrub_steps, int(run.history->frames.size()-1));
+    auto *scrub = new wxSlider(&dialog, wxID_ANY, 0, 0, scrub_steps, wxDefaultPosition, wxDefaultSize, wxSL_HORIZONTAL);
     scrub->SetName(_L("Load ramp progress"));
     root->Add(scrub, 0, wxEXPAND | wxALL, gap);
     auto *notice = new wxStaticText(&dialog, wxID_ANY,
-        _L("Synchronized by elapsed-time percentage. Graphs use true displacement; the scale changes only the shape display. "
+        _L("Synchronized by elapsed-time percentage. Graphs use physical values; drag a curve to scrub both views and hover points for details. The scale changes only the shape display. "
            "Solid curves show loading; dashed curves show unloading, including permanent set and detached loads."));
     notice->Wrap(FromDIP(1000));
     root->Add(notice, 0, wxEXPAND | wxALL, gap);
@@ -5100,6 +5175,9 @@ void StrengthSimulationPanel::show_animation_view(const std::vector<AnimationRun
                     h.settings.first_layer_height_mm, h.settings.layer_height_mm, h.settings.line_width_mm,
                     h.settings.bed_temperature_c, h.settings.chamber_temperature_c, h.settings.bonding_scale,
                     h.settings.hardening_ratio, h.settings.failure_plastic_strain);
+                report += wxString::Format(_L("Dense slider: %.4g%%; reinforced cells: %zu; sampling: %.4g FPS (%zu increments)\nCell budget: %zu; history budget: %zu MiB\n"),
+                    h.settings.dense_volume_fraction * 100.0, h.dense_cell_count, h.settings.frames_per_second,
+                    h.settings.increments, h.settings.maximum_cells, h.settings.maximum_history_mb);
                 report += wxString::FromUTF8(h.message);
             }
             wxMessageBox(report, run.name, wxOK | wxICON_INFORMATION, scroller);
@@ -5114,7 +5192,35 @@ void StrengthSimulationPanel::show_animation_view(const std::vector<AnimationRun
         graph->SetMinSize(FromDIP(wxSize(430, 150)));
         graph->SetBackgroundStyle(wxBG_STYLE_PAINT);
         column->Add(graph, 0, wxEXPAND | wxALL, gap / 2);
-        graph->Bind(wxEVT_PAINT, [graph, probe, axis, scrub, run](wxPaintEvent &) {
+        // Paint and pointer interaction share exactly the same samples and transform.
+        const auto samples_for_graph = [probe, axis, quantity, run] {
+            std::vector<wxPoint2DDouble> samples;
+            if (probe->GetSelection() == wxNOT_FOUND) return samples;
+            const size_t selected = size_t(probe->GetSelection());
+            if (run.history) {
+                for (const auto &frame : run.history->frames) {
+                    const double x = axis->GetSelection() == 0 ? frame.time_s : frame.applied_forces_n[selected];
+                    const double y = quantity->GetSelection() == 1 ? frame.probe_von_mises_pa[selected] / 1e6 :
+                        quantity->GetSelection() == 2 ? frame.probe_maximum_shear_pa[selected] / 1e6 : frame.probe_displacements_mm[selected];
+                    samples.emplace_back(x, y);
+                }
+            } else {
+                const auto &point = run.ramp.probes[selected];
+                samples = {{0.0, 0.0}, {axis->GetSelection() == 0 ? run.ramp.duration_s : point.force_n, point.displacement_mm}};
+            }
+            return samples;
+        };
+        const auto graph_positions = [graph](const std::vector<wxPoint2DDouble> &samples) {
+            double xmax = 1e-12, ymax = 1e-12;
+            for (const auto &p : samples) { xmax = std::max(xmax, p.m_x); ymax = std::max(ymax, p.m_y); }
+            const int left = graph->FromDIP(48), top = graph->FromDIP(40);
+            const int width = std::max(1, graph->GetClientSize().x - left - graph->FromDIP(25));
+            const int height = std::max(1, graph->GetClientSize().y - top - left);
+            std::vector<wxPoint> positions;
+            for (const auto &p : samples) positions.emplace_back(left + int(width * p.m_x / xmax), top + height - int(height * p.m_y / ymax));
+            return positions;
+        };
+        graph->Bind(wxEVT_PAINT, [graph, axis, quantity, scrub, run, samples_for_graph, graph_positions](wxPaintEvent &) {
             wxAutoBufferedPaintDC dc(graph);
             dc.SetBackground(wxBrush(wxSystemSettings::GetColour(wxSYS_COLOUR_WINDOW)));
             dc.Clear();
@@ -5127,52 +5233,85 @@ void StrengthSimulationPanel::show_animation_view(const std::vector<AnimationRun
             dc.SetPen(wxPen(ink));
             dc.DrawLine(margin, top, margin, top + height);
             dc.DrawLine(margin, top + height, margin + width, top + height);
-            if (probe->GetSelection() == wxNOT_FOUND) {
-                dc.DrawText(_L("No applied-force probe (gravity-only study)."), margin, top);
-                return;
-            }
-            const size_t selected = size_t(probe->GetSelection());
-            std::vector<wxPoint2DDouble> samples;
-            double xmax = 0.0, ymax = 0.0;
-            if (run.history) {
-                for (const auto &frame : run.history->frames) {
-                    const double x = axis->GetSelection() == 0 ? frame.time_s : frame.applied_forces_n[selected];
-                    const double y = frame.probe_displacements_mm[selected];
-                    samples.emplace_back(x, y); xmax = std::max(xmax, x); ymax = std::max(ymax, y);
-                }
-            } else {
-                const auto &point = run.ramp.probes[selected];
-                xmax = axis->GetSelection() == 0 ? run.ramp.duration_s : point.force_n;
-                ymax = point.displacement_mm;
-                samples = {{0.0, 0.0}, {xmax, ymax}};
-            }
-            dc.DrawText(wxString::Format(_L("Deformation: 0–%.4g mm"), ymax), margin, graph->FromDIP(4));
+            const auto samples = samples_for_graph();
+            if (samples.empty()) return;
+            const auto positions = graph_positions(samples);
+            const size_t maximum = size_t(std::max_element(samples.begin(), samples.end(),
+                [](const auto &a, const auto &b) { return a.m_y < b.m_y; }) - samples.begin());
+            double xmax = 0.0;
+            for (const auto &p : samples) xmax = std::max(xmax, p.m_x);
+            const wxString unit = quantity->GetSelection() == 0 ? _L("mm") : _L("MPa");
+            const double peak_time = run.history ? run.history->frames[maximum].time_s : run.ramp.duration_s;
+            dc.DrawText(wxString::Format(_L("Maximum: %.4g %s at %.4g s"), samples[maximum].m_y, unit, peak_time), margin, graph->FromDIP(4));
             dc.DrawText(wxString::Format(axis->GetSelection() == 0 ? _L("Time: 0–%.4g s") : _L("Force: 0–%.4g N"), xmax),
                         margin, top + height + graph->FromDIP(8));
-            const auto position = [&](const wxPoint2DDouble &p) { return wxPoint(
-                margin + int(width * p.m_x / std::max(xmax, 1e-12)),
-                top + height - int(height * p.m_y / std::max(ymax, 1e-12))); };
             for (size_t j = 1; j < samples.size(); ++j) {
-                const bool unloading = run.history && run.history->settings.unload &&
-                    run.history->frames[j].time_s > run.ramp.duration_s * 0.5;
-                dc.SetPen(wxPen(unloading ? ink : accent, graph->FromDIP(2),
-                                unloading ? wxPENSTYLE_SHORT_DASH : wxPENSTYLE_SOLID));
-                dc.DrawLine(position(samples[j-1]), position(samples[j]));
+                const bool unloading = run.history && run.history->settings.unload && run.history->frames[j].time_s > run.ramp.duration_s * 0.5;
+                dc.SetPen(wxPen(unloading ? ink : accent, graph->FromDIP(2), unloading ? wxPENSTYLE_SHORT_DASH : wxPENSTYLE_SOLID));
+                dc.DrawLine(positions[j-1], positions[j]);
+            }
+            dc.SetPen(wxPen(ink)); dc.SetBrush(wxBrush(wxSystemSettings::GetColour(wxSYS_COLOUR_WINDOW)));
+            for (size_t j = 0; j < samples.size(); ++j) {
+                const bool turning = j > 0 && j + 1 < samples.size() &&
+                    ((samples[j].m_y > samples[j-1].m_y && samples[j].m_y >= samples[j+1].m_y) ||
+                     (samples[j].m_y < samples[j-1].m_y && samples[j].m_y <= samples[j+1].m_y));
+                if (turning || j == 0 || j + 1 == samples.size() || j == maximum)
+                    dc.DrawCircle(positions[j], graph->FromDIP(3));
             }
             if (run.history && std::isfinite(run.history->first_yield_time_s)) {
-                dc.DrawText(wxString::Format(_L("First plastic yield: %.4g s"), run.history->first_yield_time_s),
-                            margin, graph->FromDIP(21));
-                const auto it = std::lower_bound(run.history->frames.begin(), run.history->frames.end(),
-                    run.history->first_yield_time_s, [](const SA::TransientFrame &f, double t) { return f.time_s < t; });
+                dc.DrawText(wxString::Format(_L("First plastic yield: %.4g s"), run.history->first_yield_time_s), margin, graph->FromDIP(21));
+                const auto it = std::lower_bound(run.history->frames.begin(), run.history->frames.end(), run.history->first_yield_time_s,
+                    [](const SA::TransientFrame &f, double t) { return f.time_s < t; });
                 const size_t j = std::min(samples.size()-1, size_t(it - run.history->frames.begin()));
                 dc.SetPen(wxPen(ink, 1, wxPENSTYLE_DOT));
-                const int x = position(samples[j]).x;
-                dc.DrawLine(x, top, x, top + height);
+                dc.DrawLine(positions[j].x, top, positions[j].x, top + height);
+                dc.DrawCircle(positions[j], graph->FromDIP(4));
             } else dc.DrawText(_L("No plastic yield reached."), margin, graph->FromDIP(21));
-            const size_t index = size_t(std::round(scrub->GetValue() * (samples.size()-1) / 1000.0));
+            const size_t index = size_t(std::round(scrub->GetValue() * (samples.size()-1) / double(scrub->GetMax())));
             dc.SetPen(wxPen(ink)); dc.SetBrush(wxBrush(accent));
-            dc.DrawCircle(position(samples[index]), graph->FromDIP(4));
+            dc.DrawCircle(positions[index], graph->FromDIP(4));
         });
+        const auto point_interaction = [graph, scrub, probe, run, samples_for_graph, graph_positions](wxMouseEvent &event) {
+            const auto samples = samples_for_graph();
+            if (samples.empty()) return;
+            const auto positions = graph_positions(samples);
+            size_t nearest = 0;
+            double distance = std::numeric_limits<double>::infinity();
+            for (size_t j = 0; j < positions.size(); ++j) {
+                const double dx = positions[j].x - event.GetX(), dy = positions[j].y - event.GetY();
+                const double d = dx*dx + dy*dy;
+                if (d < distance) { distance = d; nearest = j; }
+            }
+            if (event.LeftDown() || (event.Dragging() && event.LeftIsDown())) {
+                if (event.LeftDown() && !graph->HasCapture()) graph->CaptureMouse();
+                scrub->SetValue(int(std::round(double(scrub->GetMax()) * nearest / std::max(size_t(1), samples.size()-1))));
+                wxCommandEvent changed(wxEVT_SLIDER, scrub->GetId());
+                changed.SetEventObject(scrub);
+                scrub->GetEventHandler()->ProcessEvent(changed);
+            }
+            if (distance > std::pow(graph->FromDIP(14), 2) || !run.history) { graph->UnsetToolTip(); return; }
+            const auto &frame = run.history->frames[nearest];
+            const size_t selected = size_t(probe->GetSelection());
+            wxString info = wxString::Format(_L("Time: %.6g s\nApplied force: %.6g N\nDeformation: %.6g mm\nVon Mises: %.6g MPa\nMaximum shear: %.6g MPa"),
+                frame.time_s, frame.applied_forces_n[selected], frame.probe_displacements_mm[selected],
+                frame.probe_von_mises_pa[selected]/1e6, frame.probe_maximum_shear_pa[selected]/1e6);
+            info += run.history->settings.unload && frame.time_s > run.ramp.duration_s*0.5 ? _L("\nUnloading") : _L("\nLoading");
+            const auto extrema = std::minmax_element(samples.begin(), samples.end(), [](const auto &a, const auto &b) { return a.m_y < b.m_y; });
+            if (samples[nearest].m_y == extrema.second->m_y) info += _L("\nGlobal maximum");
+            if (samples[nearest].m_y == extrema.first->m_y) info += _L("\nGlobal minimum");
+            if (nearest > 0 && nearest + 1 < samples.size() &&
+                (samples[nearest].m_y-samples[nearest-1].m_y)*(samples[nearest+1].m_y-samples[nearest].m_y) < 0)
+                info += _L("\nTurning point");
+            if (frame.time_s == run.history->first_yield_time_s) info += _L("\nFirst plastic yield in model");
+            if (frame.time_s == run.history->first_failure_time_s) info += _L("\nFirst bond failure");
+            if (!graph->GetToolTip() || graph->GetToolTipText() != info) graph->SetToolTip(info);
+        };
+        graph->Bind(wxEVT_LEFT_DOWN, point_interaction);
+        graph->Bind(wxEVT_MOTION, point_interaction);
+        graph->Bind(wxEVT_LEFT_UP, [graph](wxMouseEvent &) { if (graph->HasCapture()) graph->ReleaseMouse(); });
+        graph->Bind(wxEVT_MOUSE_CAPTURE_LOST, [](wxMouseCaptureLostEvent &) {});
+        graph->Bind(wxEVT_LEAVE_WINDOW, [graph](wxMouseEvent &) { graph->UnsetToolTip(); });
+        graph->Bind(wxEVT_SIZE, [graph](wxSizeEvent &event) { graph->Refresh(); event.Skip(); });
         probe->Bind(wxEVT_CHOICE, [graph](wxCommandEvent &) { graph->Refresh(); });
         columns->Add(column, 1, wxEXPAND | wxALL, gap);
         panes.push_back({session, canvas, metrics, probe, graph});
@@ -5183,8 +5322,22 @@ void StrengthSimulationPanel::show_animation_view(const std::vector<AnimationRun
     if (allow_save) {
         auto *save = new wxButton(&dialog, wxID_ANY, _L("Add to compare"));
         footer->Add(save, 0, wxALL, gap);
-        save->Bind(wxEVT_BUTTON, [this, save, runs](wxCommandEvent &) {
-            m_animation_runs.push_back(runs.front());
+        save->Bind(wxEVT_BUTTON, [this, save, runs, &dialog](wxCommandEvent &) {
+            wxDialog naming(&dialog, wxID_ANY, _L("Name animation"));
+            auto *layout = new wxBoxSizer(wxVERTICAL);
+            auto *name = new wxTextCtrl(&naming, wxID_ANY);
+            name->SetHint(runs.front().name);
+            name->SetName(_L("Animation name"));
+            layout->Add(new wxStaticText(&naming, wxID_ANY, _L("Animation name (leave blank to use the suggested name)")), 0, wxALL, FromDIP(8));
+            layout->Add(name, 0, wxEXPAND | wxALL, FromDIP(8));
+            layout->Add(naming.CreateSeparatedButtonSizer(wxOK | wxCANCEL), 0, wxEXPAND | wxALL, FromDIP(8));
+            naming.SetSizerAndFit(layout);
+            name->SetFocus();
+            if (naming.ShowModal() != wxID_OK) return;
+            AnimationRun saved = runs.front();
+            const wxString entered = name->GetValue().Trim(true).Trim(false);
+            if (!entered.empty()) saved.name = entered;
+            m_animation_runs.push_back(std::move(saved));
             save->SetLabel(_L("Added to compare"));
             save->Disable();
         });
@@ -5193,7 +5346,7 @@ void StrengthSimulationPanel::show_animation_view(const std::vector<AnimationRun
     footer->Add(new wxButton(&dialog, wxID_CANCEL, _L("Close")), 0, wxALL, gap);
     root->Add(footer, 0, wxEXPAND);
     const auto update = [&] {
-        const double fraction = scrub->GetValue() / 1000.0;
+        const double fraction = scrub->GetValue() / double(scrub->GetMax());
         for (size_t i = 0; i < panes.size(); ++i) {
             auto &pane = panes[i];
             const auto &run = runs[i];
@@ -5237,17 +5390,20 @@ void StrengthSimulationPanel::show_animation_view(const std::vector<AnimationRun
     }
     scale->ChangeValue(number(magnification));
     for (auto &pane : panes) pane.canvas->set_deformation_scale(magnification);
+    double playback_fps = 1.0;
+    for (const auto &run : runs) playback_fps = std::max(playback_fps, run.history ? run.history->settings.frames_per_second : 30.0);
+    const int timer_interval = std::max(1, int(std::round(1000.0 / playback_fps)));
     wxTimer timer(&dialog);
     double start_fraction = 0.0;
     auto started = std::chrono::steady_clock::now();
     const auto pause = [&] { timer.Stop(); play->SetLabel(_L("Play")); };
     play->Bind(wxEVT_BUTTON, [&](wxCommandEvent &) {
         if (timer.IsRunning()) { pause(); return; }
-        if (scrub->GetValue() == 1000) scrub->SetValue(0);
-        start_fraction = scrub->GetValue() / 1000.0;
+        if (scrub->GetValue() == scrub->GetMax()) scrub->SetValue(0);
+        start_fraction = scrub->GetValue() / double(scrub->GetMax());
         started = std::chrono::steady_clock::now();
         play->SetLabel(_L("Pause"));
-        timer.Start(33);
+        timer.Start(timer_interval);
         update();
     });
     dialog.Bind(wxEVT_TIMER, [&](wxTimerEvent &) {
@@ -5255,7 +5411,7 @@ void StrengthSimulationPanel::show_animation_view(const std::vector<AnimationRun
         for (const auto &run : runs) duration = std::max(duration, run.ramp.duration_s);
         const double fraction = std::min(1.0, start_fraction +
             std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count() / duration);
-        scrub->SetValue(int(std::round(fraction * 1000.0)));
+        scrub->SetValue(int(std::round(fraction * scrub->GetMax())));
         if (fraction >= 1.0) pause();
         update();
     }, timer.GetId());
@@ -5267,6 +5423,7 @@ void StrengthSimulationPanel::show_animation_view(const std::vector<AnimationRun
         for (auto &pane : panes) pane.canvas->set_projection(view->GetSelection());
     });
     axis->Bind(wxEVT_CHOICE, [&](wxCommandEvent &) { for (auto &pane : panes) pane.graph->Refresh(); });
+    quantity->Bind(wxEVT_CHOICE, [&](wxCommandEvent &) { for (auto &pane : panes) pane.graph->Refresh(); });
     section->Bind(wxEVT_BUTTON, [&](wxCommandEvent &) { for (auto &pane : panes) pane.canvas->toggle_section(); });
     scale->Bind(wxEVT_TEXT, [&](wxCommandEvent &) {
         double value = 1.0;
@@ -5290,7 +5447,7 @@ void StrengthSimulationPanel::show_animation_view(const std::vector<AnimationRun
     update();
     play->SetLabel(_L("Pause"));
     started = std::chrono::steady_clock::now();
-    timer.Start(33);
+    timer.Start(timer_interval);
     dialog.ShowModal();
     timer.Stop();
 }

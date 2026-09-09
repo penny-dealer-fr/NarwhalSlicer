@@ -25,8 +25,15 @@ struct TransientSettings {
     double bonding_scale{1.0};
     double hardening_ratio{0.05};
     double failure_plastic_strain{0.15};
+    double frames_per_second{30.0}; // GUI derives increments; headless callers may choose increments directly.
+    double background_density{0.15};
+    InfillPattern background_pattern{InfillPattern::Gyroid};
+    std::string unsupported_print_pattern;
+    indexed_triangle_set dense_region_mesh; // Immutable raw-object-space preview captured at run creation.
+    double dense_volume_fraction{0.0};
     size_t increments{40};
-    size_t maximum_cells{3500};
+    size_t maximum_cells{20000};
+    size_t maximum_history_mb{512};
 };
 struct TransientFrame {
     double time_s{0.0};
@@ -34,6 +41,8 @@ struct TransientFrame {
     std::vector<VertexResult> cells;
     std::vector<double> applied_forces_n;
     std::vector<double> probe_displacements_mm;
+    std::vector<double> probe_von_mises_pa;
+    std::vector<double> probe_maximum_shear_pa;
     size_t failed_bonds{0};
     size_t detached_cells{0};
     double maximum_plastic_strain{0.0};
@@ -50,6 +59,7 @@ struct TransientResult {
     std::vector<double> layer_bond_factors;
     std::vector<double> layer_interface_temperature_c;
     size_t layer_count{0};
+    size_t dense_cell_count{0};
     double first_yield_time_s{std::numeric_limits<double>::infinity()};
     double first_failure_time_s{std::numeric_limits<double>::infinity()};
     bool succeeded() const { return status == AnalysisStatus::Success; }

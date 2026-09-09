@@ -13,6 +13,7 @@ add_executable(${_TEST_NAME}_tests
 	test_model.cpp
 	test_multifilament.cpp
 	test_perimeters.cpp
+	test_load_calibration.cpp
 	test_print.cpp
 	test_printobject.cpp
 	test_mixed_filament.cpp

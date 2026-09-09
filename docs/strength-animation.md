@@ -1,6 +1,6 @@
 # Load animation and comparison
 
-Simulation → Animate opens mechanical and print-temperature options for a current,
+Simulation → Animate opens mechanical, print-temperature and sampling/infill options for a current,
 successfully solved load case. The animation is computed off the UI thread with
 progress and cancellation. Playback starts automatically. The model viewport and
 force-region graph have explicit sizes; the dialog is bounded by its parent's
@@ -10,14 +10,18 @@ Data so they cannot push the graph out of the initial viewport.
 The viewer provides play/pause/replay, scrubbing, deformation, Von Mises stress and
 maximum shear contours, isometric/front/top/right views, a section toggle and
 shape magnification. Initial magnification makes small displacements visible and
-is shown numerically. Graphs always use physical displacement in millimeters.
+is shown numerically. Graphs use physical displacement in millimeters or Von Mises / maximum shear stress in MPa.
 
 Each force has a selectable curve showing the maximum displacement within its
 original application region, including detached cells. This is a regional maximum,
 not a measurement at a single fixed node. The force axis reports the total force
 actually still applied to that region. Gravity has its own curve when enabled.
 The time axis shows the entire recorded history. A marker identifies the first
-computed plastic yield anywhere in the discretized part. Loading is solid and
+computed plastic yield anywhere in the discretized part. The graph annotates its
+maximum with its time, marks extrema and supports dragging to scrub both models.
+Hovering samples shows time, applied force, displacement, both stresses, branch,
+maxima/minima, first yield and first failure. These are sampled extrema and yield
+times; increasing FPS improves temporal resolution. Loading is solid and
 unloading is dashed, including hysteresis and nonzero displacement at zero force.
 
 ## Mechanical model
@@ -39,8 +43,15 @@ solution to invent a plastic curve.
 - Use calibrated XY/Z elastic and shear properties, effective infill density,
   normalized pattern factors, approximate wall coverage, and inter-layer bond
   scaling. Wall loops, layer heights, extrusion width and print temperatures are
-  initialized from the effective process/object settings. Material and infill
-  remain explicit properties of the load study. Multi-material extrusion paths,
+  initialized from the effective process/object settings, along with background
+  infill density and supported pattern. These defaults are editable per animation;
+  unsupported slicer patterns are explicitly identified and require a supported
+  approximation. Material remains a property of the load study.
+- Capture the current dense-region slider's generated geometry regardless of
+  preview visibility or whether a Slice Modifier exists. Slice that geometry in
+  the same print basis and apply its density/pattern locally when assembling the
+  lattice; retain its geometry, requested percentage and resolved cell count.
+  Empty space and holes are respected at the chosen cell-center resolution. Multi-material extrusion paths,
   adaptive layers and modifier-specific toolpaths are not reconstructed.
 - Integrate axial and shear plastic strain with implicit return mapping and
   isotropic hardening. Newton equilibrium uses consistent tangents and a residual
@@ -80,35 +91,42 @@ result. This is an explicitly approximate process-calibration model, not a trans
 heat-equation solve, polymer diffusion model or prediction of residual thermal
 stress. Coupons and process-specific calibration are needed for quantitative use.
 
-Work is bounded at 2000 physical layers, the configured cell budget (3500 by
-default), and 400000 cell-frame samples. Exceeding a limit fails explicitly instead
-of silently merging layers. Nonconvergence and cancellation are not saved as
+Work is bounded at 2000 physical layers and 20 million candidate cells. The
+maximum occupied-cell budget defaults to 20000 and is editable up to 200000.
+The history budget defaults to 512 MiB and is editable from 1 to 8192 MiB; this
+bounds retained cell results, not total solver/factorization memory. Smaller
+positive cell widths are accepted within those explicit budgets. The progress
+dialog offers Cancel compute during construction and analysis. FPS is editable
+from 1 to 120, with at most 100000 increments. Loading/unloading uses an even
+increment count to include the exact peak; the minimum is four increments, so
+short runs can have a higher effective sampling rate. Playback uses elapsed time
+and the requested refresh rate. Exceeding a limit fails explicitly instead of
+silently merging layers or dropping frames. Nonconvergence and cancellation are not saved as
 successful simulations. Inertia, creep, rate dependence and geometric nonlinearity
 are not modeled; duration is a quasi-static playback/loading coordinate.
 
 ## Comparison and persistence
 
-Add to compare retains an independent geometry, setup, print options and computed
-history. Compare selects two different retained runs and synchronizes by elapsed-
+Add to compare opens a naming popup with the generated name as placeholder;
+blank input accepts that suggestion and Cancel leaves the result unsaved. Saving
+retains independent geometry, setup, print options and computed history. Compare selects two different retained runs and synchronizes by elapsed-
 time percentage, displaying each run's own time, force and graph ranges. The longer
 run controls playback duration. Data opens the captured settings. Histories are
 session-only; they do not change 3MF schema, slicing settings or emitted G-code.
 
 ## Verification (2026-09-08)
 
-- Combined macOS arm64 Release `libslic3r_tests` and `OrcaSlicer` build succeeds.
-  Test executables are ad-hoc signed before Catch discovery so discovery no longer
-  fails before Xcode's later bundle-signing phase.
-- CTest StrengthAnalysis label: **51/51 tests pass**. Five transient cases cover
-  zero/peak/unloaded frames, elastic springback, plastic permanent set, irreversible
-  detachment and force removal, layer and thermal sensitivity, work limits,
-  cancellation, print-orientation stiffness, loading-only endpoints and axial
-  stress recovery against force divided by section area.
-- Native light-theme checks on an isolated 4 mm cube project: opened both option
-  pages; computed a history; scrubbed to peak load; captured a screenshot with the
-  model, deformation contour, graph and marker all visible. Saved an unloading
-  run and a loading-only run; selected both in Compare and captured both model
-  viewports and graphs side by side. Endpoints show zero versus full applied load.
-- A subsequent sizing adjustment bounds the initial dialog to its parent's monitor.
-  Dark-theme checks were explicitly deferred by the user. Broad localization and
-  physical coupon validation are not claimed.
+The initial enhancement build passed 55 StrengthAnalysis tests, including eight
+Transient cases for elastic springback, permanent set, irreversible detachment,
+thermal/layer sensitivity, orientation, shear traction, captured reinforcement,
+finer grids, extended histories, memory budgets and cancellation.
+
+A subsequent header-only change exposed stale callers: the root CMake file marked
+project `src` headers SYSTEM, excluding them from `-MMD` dependency files. The
+project include directory now uses normal includes so layout changes rebuild
+callers. Final rebuild, tests and updated native UI checks are in progress.
+
+Earlier native light-theme checks verified the model and deformation graphs,
+playback, scrubbing and two-run comparison on an isolated 4 mm cube fixture.
+Dark-theme checks are deferred at the user's request. Physical coupon validation
+is not claimed; this is a calibrated lattice estimate, not toolpath thermal FEA.

@@ -1,6 +1,7 @@
 #include "../libslic3r.h"
 #include "../Exception.hpp"
 #include "../Model.hpp"
+#include "../LoadCalibration.hpp"
 #include "../Preset.hpp"
 #include "../Utils.hpp"
 #include "../LocalesUtils.hpp"
@@ -4474,6 +4475,10 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
             {
                 std::istringstream(value) >> std::boolalpha >> m_curr_plater->locked;
             }
+            else if (key == "load_calibration_settings") {
+                try { m_curr_plater->config.apply(LoadCalibration::deserialize_plate_settings(value)); }
+                catch (const std::exception& e) { add_error(e.what()); return false; }
+            }
             else if (key == BED_TYPE_ATTR)
             {
                 BedType bed_type = BedType::btPC;
@@ -8052,6 +8057,10 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
                 stream << "    <" << METADATA_TAG << " " << KEY_ATTR << "=\"" << PLATERID_ATTR << "\" " << VALUE_ATTR << "=\"" << plate_data->plate_index + 1 << "\"/>\n";
                 stream << "    <" << METADATA_TAG << " " << KEY_ATTR << "=\"" << PLATER_NAME_ATTR << "\" " << VALUE_ATTR << "=\"" <<  xml_escape(plate_data->plate_name.c_str()) << "\"/>\n";
                 stream << "    <" << METADATA_TAG << " " << KEY_ATTR << "=\"" << LOCK_ATTR << "\" " << VALUE_ATTR << "=\"" << std::boolalpha<< plate_data->locked<< "\"/>\n";
+                const auto calibration = LoadCalibration::serialize_plate_settings(plate_data->config);
+                if (!calibration.empty())
+                    stream << "    <" << METADATA_TAG << " " << KEY_ATTR << "=\"load_calibration_settings\" "
+                           << VALUE_ATTR << "=\"" << xml_escape(calibration) << "\"/>\n";
                 ConfigOption* bed_type_opt = plate_data->config.option("curr_bed_type");
                 t_config_enum_names bed_type_names = ConfigOptionEnum<BedType>::get_enum_names();
                 if (bed_type_opt != nullptr && bed_type_names.size() > bed_type_opt->getInt())

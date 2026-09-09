@@ -4906,7 +4906,7 @@ void StrengthSimulationPanel::show_animation_view(const std::vector<AnimationRun
     root->Add(notice, 0, wxEXPAND | wxALL, gap);
     auto *scroller = new wxScrolledWindow(&dialog, wxID_ANY);
     scroller->SetScrollRate(gap, gap);
-    scroller->SetMinSize(FromDIP(wxSize(runs.size() == 1 ? 520 : 1040, 520)));
+    scroller->SetMinSize(FromDIP(wxSize(480, 460)));
     auto *columns = new wxBoxSizer(wxHORIZONTAL);
     struct Pane {
         std::shared_ptr<StrengthAnalysisSession> session;
@@ -4953,7 +4953,8 @@ void StrengthSimulationPanel::show_animation_view(const std::vector<AnimationRun
         });
         auto *probe = new wxChoice(scroller, wxID_ANY);
         for (const auto &point : run.ramp.probes)
-            probe->Append(wxString::Format(_L("%s — application node %zu"), wxString::FromUTF8(point.name), point.vertex_index));
+            probe->Append(run.history ? wxString::Format(_L("%s — application region maximum"), wxString::FromUTF8(point.name)) :
+                wxString::Format(_L("%s — application node %zu"), wxString::FromUTF8(point.name), point.vertex_index));
         if (probe->GetCount()) probe->SetSelection(0);
         column->Add(probe, 0, wxEXPAND | wxALL, gap / 2);
         auto *graph = new wxPanel(scroller, wxID_ANY);
@@ -5120,11 +5121,16 @@ void StrengthSimulationPanel::show_animation_view(const std::vector<AnimationRun
             for (auto &pane : panes) pane.canvas->set_deformation_scale(value);
     });
     dialog.SetSizer(root);
-    const wxRect screen = wxGetClientDisplayRect();
-    dialog.SetSize(wxSize(std::min(FromDIP(runs.size() == 1 ? 760 : 1240), screen.width),
-                          std::min(FromDIP(900), screen.height)));
+    const int display_index = wxDisplay::GetFromWindow(this);
+    const wxRect screen = wxDisplay(unsigned(display_index == wxNOT_FOUND ? 0 : display_index)).GetClientArea();
     root->SetSizeHints(&dialog);
-    dialog.CentreOnParent();
+    // Sizer minimums can exceed a laptop display (particularly two columns).
+    // Keep the actual dialog on the parent's monitor and scroll its content.
+    const wxSize desired(std::min(FromDIP(runs.size() == 1 ? 1020 : 1240), screen.width - 2 * gap),
+                         std::min(FromDIP(900), screen.height - 2 * gap));
+    dialog.SetMinSize(wxSize(std::min(FromDIP(520), desired.x), std::min(FromDIP(520), desired.y)));
+    dialog.SetSize(screen.x + (screen.width - desired.x) / 2,
+                   screen.y + (screen.height - desired.y) / 2, desired.x, desired.y);
     dialog.Layout();
     scroller->Layout();
     scroller->FitInside();

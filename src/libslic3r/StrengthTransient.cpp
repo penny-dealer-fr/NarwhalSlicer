@@ -316,7 +316,32 @@ TransientResult analyze_transient(const indexed_triangle_set &mesh, const Setup 
                     if(solver.info()!=Eigen::Success) break;
                     const Eigen::VectorXd delta=solver.solve(residual);
                     if(solver.info()!=Eigen::Success || !delta.allFinite()) break;
-                    for(size_t i=0;i<count;++i) if(dof[i]>=0) u[i]+=delta.segment<3>(dof[i]);
+                    // At load reversal the current tangent may still be plastic.
+                    // Backtracking prevents that soft tangent from overshooting into
+                    // reverse yield, which otherwise causes a Newton two-cycle.
+                    double alpha = 1.0;
+                    bool accepted = false;
+                    for (int search = 0; search < 16; ++search, alpha *= 0.5) {
+                        check();
+                        auto candidate = u;
+                        for (size_t i = 0; i < count; ++i)
+                            if (dof[i] >= 0) candidate[i] += alpha * delta.segment<3>(dof[i]);
+                        Eigen::VectorXd trial_residual = Eigen::VectorXd::Zero(free_count);
+                        for (size_t i = 0; i < count; ++i)
+                            if (dof[i] >= 0) trial_residual.segment<3>(dof[i]) = external[i];
+                        for (const Bond &bond : bonds) {
+                            if (bond.failed || !attached[bond.a] || !attached[bond.b]) continue;
+                            const Vec3d force = constitutive(bond, candidate[bond.b] - candidate[bond.a], s).force;
+                            if (dof[bond.a] >= 0) trial_residual.segment<3>(dof[bond.a]) += force;
+                            if (dof[bond.b] >= 0) trial_residual.segment<3>(dof[bond.b]) -= force;
+                        }
+                        if (trial_residual.norm() < residual.norm() * (1.0 - 1e-4 * alpha)) {
+                            u = std::move(candidate);
+                            accepted = true;
+                            break;
+                        }
+                    }
+                    if (!accepted) break;
                 }
                 if(!converged) {
                     out.status=AnalysisStatus::NumericalFailure;
@@ -348,8 +373,9 @@ TransientResult analyze_transient(const indexed_triangle_set &mesh, const Setup 
             if(!equilibrated) return fail("Damage iteration limit exceeded.");
             TransientFrame frame;
             frame.time_s=time;frame.load_fraction=fraction;frame.cells.resize(count);
-            std::vector<Matrix3d> stress(count,Matrix3d::Zero());
-            std::vector<double> weights(count,0.0);
+            std::vector<std::array<Matrix3d,3>> stress(count);
+            std::vector<std::array<double,3>> weights(count, {0.0,0.0,0.0});
+            for (auto &directions : stress) for (auto &tensor : directions) tensor.setZero();
             for(size_t j=0;j<bonds.size();++j) {
                 Bond &b=bonds[j];
                 frame.maximum_plastic_strain=std::max(frame.maximum_plastic_strain,
@@ -362,13 +388,24 @@ TransientResult analyze_transient(const indexed_triangle_set &mesh, const Setup 
                 if(plastic>1e-12) out.first_yield_time_s=std::min(out.first_yield_time_s,time);
                 frame.maximum_plastic_strain=std::max(frame.maximum_plastic_strain,plastic);
                 const Vec3d traction=t.force/b.area;
-                const Matrix3d tensor=0.5*(traction*b.n.transpose()+b.n*traction.transpose());
-                for(size_t i:{b.a,b.b}) {stress[i]+=tensor*b.area;weights[i]+=b.area;}
+                const Vec3d shear_traction = traction - traction.dot(b.n) * b.n;
+                const Matrix3d tensor = traction.dot(b.n) * (b.n * b.n.transpose()) +
+                    shear_traction * b.n.transpose() + b.n * shear_traction.transpose();
+                Eigen::Index direction = 0;
+                (basis.transpose()*b.n).cwiseAbs().maxCoeff(&direction);
+                for(size_t i:{b.a,b.b}) {
+                    stress[i][size_t(direction)]+=tensor*b.area;
+                    weights[i][size_t(direction)]+=b.area;
+                }
             }
             for(size_t i=0;i<count;++i) {
                 if(!attached[i]) ++frame.detached_cells;
                 VertexResult &v=frame.cells[i];v.position_mm=raw(cells[i].p);v.displacement_m=u[i];
-                const Matrix3d tensor=stress[i]/std::max(weights[i],1e-30);
+                // Average opposing faces within each direction, then sum the
+                // directional tensors. Averaging all six faces dilutes axial stress.
+                Matrix3d tensor = Matrix3d::Zero();
+                for (size_t direction=0; direction<3; ++direction)
+                    tensor += stress[i][direction]/std::max(weights[i][direction],1e-30);
                 v.normal_stress_pa=tensor.diagonal();v.shear_stress_pa=Vec3d(tensor(0,1),tensor(0,2),tensor(1,2));
                 const Matrix3d deviator=tensor-Matrix3d::Identity()*tensor.trace()/3.0;
                 v.von_mises_pa=std::sqrt(1.5*deviator.squaredNorm());

@@ -1508,6 +1508,7 @@ TEST_CASE("Layer-resolved elastic loading springs back after unloading", "[Stren
     const Result display = transient_display_frame(result,10);
     CHECK(display.vertices.size() == result.display_mesh.vertices.size());
     CHECK(display.maximum_displacement_m > 0);
+    CHECK_THAT(display.maximum_von_mises_pa, WithinRel(10.0 / (16.0e-6), 1e-6));
 }
 
 TEST_CASE("Plastic loading leaves permanent deformation after force removal", "[StrengthAnalysis][Transient]")
@@ -1568,4 +1569,40 @@ TEST_CASE("Layer geometry and thermal bonding respond to print inputs", "[Streng
     settings.maximum_cells = 8;
     CHECK(analyze_transient(mesh, setup, settings).status == AnalysisStatus::InvalidInput);
     CHECK(analyze_transient(mesh, setup, small_transient_settings(), [] { return true; }).status == AnalysisStatus::Cancelled);
+}
+
+TEST_CASE("Layer orientation changes stiffness and loading-only history retains full force", "[StrengthAnalysis][Transient]")
+{
+    const auto mesh = its_make_cube(4,4,4);
+    auto setup = transient_cube_setup(10);
+    auto settings = small_transient_settings();
+    settings.unload = false;
+    settings.increments = 4;
+    const auto in_plane = analyze_transient(mesh, setup, settings);
+    REQUIRE(in_plane.succeeded());
+    setup.print_layer_axis = Vec3d::UnitX();
+    const auto across_layers = analyze_transient(mesh, setup, settings);
+    INFO(across_layers.message);
+    REQUIRE(across_layers.succeeded());
+    CHECK_THAT(across_layers.frames.back().applied_forces_n[0], WithinRel(10.0,1e-10));
+    CHECK(across_layers.frames.back().probe_displacements_mm[0] > in_plane.frames.back().probe_displacements_mm[0]);
+    CHECK_THAT(across_layers.frames.back().probe_displacements_mm[0] / in_plane.frames.back().probe_displacements_mm[0],
+               WithinRel(setup.material.elastic_modulus_xy_pa / setup.material.elastic_modulus_z_pa, 1e-6));
+}
+
+TEST_CASE("Shear loading reports the applied interface traction without halving it", "[StrengthAnalysis][Transient]")
+{
+    auto setup = transient_cube_setup(10);
+    setup.loads.back().direction = Vec3d::UnitY();
+    auto settings = small_transient_settings();
+    settings.unload = false;
+    settings.increments = 4;
+    const auto history = analyze_transient(its_make_cube(4,4,4), setup, settings);
+    INFO(history.message);
+    REQUIRE(history.succeeded());
+    const Result frame = transient_display_frame(history, history.frames.size()-1);
+    double maximum_shear = 0.0;
+    for (const auto &vertex : frame.vertices) maximum_shear = std::max(maximum_shear, vertex.maximum_shear_pa);
+    CHECK_THAT(maximum_shear, WithinRel(10.0 / 16e-6,1e-6));
+    CHECK_THAT(frame.maximum_von_mises_pa, WithinRel(std::sqrt(3.0) * 10.0 / 16e-6,1e-6));
 }

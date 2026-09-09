@@ -68,6 +68,8 @@ class StudyToolbar final : public wxPanel
         bool hidden;
         Button *button;
         std::function<std::string()> state_icon;
+        std::function<wxString()> state_label;
+        std::string rendered_icon_state;
     };
     struct Group {
         wxPanel *panel;
@@ -83,6 +85,28 @@ class StudyToolbar final : public wxPanel
     wxTimer m_hover_timer{this};
     wxTimer m_state_timer{this};
     size_t m_hover_group{0}, m_hover_tool{0};
+
+    wxString hover_label(const Tool &tool) const
+    {
+        return tool.state_label ? tool.state_label() : tool.label;
+    }
+
+    std::string visible_icon(const Tool &tool, bool enabled) const
+    {
+        if ((tool.key == "undo" || tool.key == "redo") && !enabled)
+            return "strength_" + tool.key + "_disabled";
+        return tool.state_icon ? tool.state_icon() : tool.icon;
+    }
+
+    void refresh_icon(Tool &tool, bool enabled)
+    {
+        const std::string icon = visible_icon(tool, enabled);
+        const std::string state = icon + (enabled ? ":enabled" : ":disabled");
+        if (tool.rendered_icon_state == state)
+            return;
+        tool.button->SetIcon(ScalableBitmap(tool.button, icon, 24, !enabled).bmp());
+        tool.rendered_icon_state = state;
+    }
 
     wxString explanation(const Tool &tool) const
     {
@@ -120,7 +144,8 @@ class StudyToolbar final : public wxPanel
         if (key == "loads") return _L("Show or hide the study's loads and constraints over the result model.");
         if (key == "wireframe") return _L("Show or hide mesh edges and the undeformed reference wireframe.");
         if (key == "contours") return _L("Switch between smooth and discrete color bands in the result contours.");
-        if (key.find("result-") == 0) return _L("Display this result field on the model. Read its units and value range in the viewport legend.");
+        if (key == "result-view" || key.find("result-") == 0)
+            return _L("Display this result field on the model. Read its units and value range in the viewport legend.");
         if (key.find("view-") == 0) return _L("Set the camera to this standard view without changing the model's print orientation.");
         return _L("Choose how geometry is selected: an individual triangle, a coplanar solid face, or a connected component.");
     }
@@ -144,7 +169,7 @@ class StudyToolbar final : public wxPanel
             wxGetApp().UpdateDarkUI(m_hover);
             wxGetApp().UpdateDarkUI(m_hover_text);
         }
-        m_hover_text->SetLabel(tool.label + (details ? "\n\n" + explanation(tool) : wxString()));
+        m_hover_text->SetLabel(hover_label(tool) + (details ? "\n\n" + explanation(tool) : wxString()));
         if (details) m_hover_text->Wrap(FromDIP(280));
         m_hover->Fit();
         const wxRect anchor = tool.button->GetScreenRect();
@@ -152,7 +177,7 @@ class StudyToolbar final : public wxPanel
         m_hover->Show();
         m_hover_group = group;
         m_hover_tool = index;
-        if (!details) m_hover_timer.StartOnce(2200);
+        if (!details) m_hover_timer.StartOnce(1100);
     }
 
 
@@ -206,6 +231,27 @@ class StudyToolbar final : public wxPanel
         event.Skip();
     }
 
+    void on_group_motion(size_t group, wxMouseEvent &event)
+    {
+        if (group >= m_groups.size()) {
+            event.Skip();
+            return;
+        }
+        const wxPoint screen = m_groups[group].panel->ClientToScreen(event.GetPosition());
+        for (size_t i = 0; i < m_groups[group].tools.size(); ++i) {
+            const Tool &tool = m_groups[group].tools[i];
+            if (tool.button->IsShownOnScreen() && !tool.button->IsEnabled() && tool.button->GetScreenRect().Contains(screen)) {
+                if (!m_hover || !m_hover->IsShown() || m_hover_group != group || m_hover_tool != i)
+                    show_hover(group, i, false);
+                event.Skip();
+                return;
+            }
+        }
+        if (m_hover && m_hover->IsShown() && m_hover_group == group)
+            hide_hover();
+        event.Skip();
+    }
+
     void menu(size_t index)
     {
         hide_hover();
@@ -214,11 +260,12 @@ class StudyToolbar final : public wxPanel
         auto *pins = new wxMenu;
         for (size_t i = 0; i < group.tools.size(); ++i) {
             const Tool &tool = group.tools[i];
+            const bool enabled = !tool.enabled || tool.enabled();
             const int id = wxWindow::NewControlId();
             auto *item = menu.Append(id, tool.label, wxEmptyString, tool.checked ? wxITEM_CHECK : wxITEM_NORMAL);
             if (tool.checked) item->Check(tool.checked());
-            item->SetBitmap(ScalableBitmap(this, tool.state_icon ? tool.state_icon() : tool.icon, 16).bmp());
-            item->Enable(!tool.enabled || tool.enabled());
+            item->SetBitmap(ScalableBitmap(this, visible_icon(tool, enabled), 16, !enabled).bmp());
+            item->Enable(enabled);
             menu.Bind(wxEVT_MENU, [this, index, i](wxCommandEvent &) {
                 const Tool &tool = m_groups[index].tools[i];
                 if (!tool.enabled || tool.enabled()) tool.run();
@@ -288,12 +335,14 @@ public:
         const size_t index = m_groups.size();
         m_groups.push_back({panel, icons, label, {}});
         label->Bind(wxEVT_BUTTON, [this, index](wxCommandEvent &) { menu(index); });
+        panel->Bind(wxEVT_MOTION, [this, index](wxMouseEvent &event) { on_group_motion(index, event); });
+        panel->Bind(wxEVT_LEAVE_WINDOW, [this](wxMouseEvent &event) { hide_hover(); event.Skip(); });
         return index;
     }
 
-    void add(size_t group, const std::string &key, const wxString &label, const std::string &icon,
-             bool pinned, std::function<void()> run, std::function<bool()> enabled = {}, std::function<bool()> checked = {},
-             std::function<std::string()> state_icon = {})
+    size_t add(size_t group, const std::string &key, const wxString &label, const std::string &icon,
+               bool pinned, std::function<void()> run, std::function<bool()> enabled = {}, std::function<bool()> checked = {},
+               std::function<std::string()> state_icon = {})
     {
         const std::string preference = m_scope + "." + key;
         const bool customized = wxGetApp().app_config->has("strength_toolbar", preference);
@@ -311,7 +360,8 @@ public:
         button->SetBorderColor(StateColor(g.panel->GetBackgroundColour()));
         g.icons->Add(button, 0, wxRIGHT, FromDIP(4));
         const size_t index = g.tools.size();
-        g.tools.push_back({key, label, icon, std::move(run), std::move(enabled), std::move(checked), pinned, customized && !pinned, button, std::move(state_icon)});
+        g.tools.push_back({key, label, icon, std::move(run), std::move(enabled), std::move(checked), pinned,
+                           customized && !pinned, button, std::move(state_icon), {}, {}});
         button->Bind(wxEVT_BUTTON, [this, group, index](wxCommandEvent &) {
             hide_hover();
             const Tool &tool = m_groups[group].tools[index];
@@ -320,17 +370,7 @@ public:
         button->Bind(wxEVT_UPDATE_UI, [this, group, index](wxUpdateUIEvent &event) {
             Tool &tool = m_groups[group].tools[index];
             const bool enabled = !tool.enabled || tool.enabled();
-            if (tool.key == "undo" || tool.key == "redo") {
-                const std::string icon = "strength_" + tool.key + (enabled ? "" : "_disabled");
-                if (icon != tool.icon) { tool.icon = icon; tool.button->SetIcon(wxString::FromUTF8(icon)); }
-            }
-            if (tool.state_icon) {
-                const std::string icon = tool.state_icon();
-                if (icon != tool.icon) {
-                    tool.icon = icon;
-                    tool.button->SetIcon(wxString::FromUTF8(icon));
-                }
-            }
+            refresh_icon(tool, enabled);
             event.Enable(enabled);
             tool.button->SetValue(tool.checked && tool.checked());
             tool.button->SetForegroundColour(tool.checked && tool.checked() ? wxGetApp().get_label_clr_modified() :
@@ -340,7 +380,43 @@ public:
         button->Bind(wxEVT_ENTER_WINDOW, [this, group, index](wxMouseEvent &event) { show_hover(group, index, false); event.Skip(); });
         button->Bind(wxEVT_LEAVE_WINDOW, [this](wxMouseEvent &event) { hide_hover(); event.Skip(); });
         button->Bind(wxEVT_KILL_FOCUS, [this](wxFocusEvent &event) { hide_hover(); event.Skip(); });
+        button->UpdateWindowUI();
         resize_tools();
+        return index;
+    }
+
+    void add_choice(size_t group, const std::string &key, const wxString &label, const std::vector<wxString> &choices,
+                    const std::vector<std::string> &icons, bool pinned, std::function<int()> selection,
+                    std::function<void(int)> select, std::function<bool()> enabled = {})
+    {
+        if (choices.empty() || choices.size() != icons.size())
+            return;
+        const auto selected_index = [selection, count = choices.size()] {
+            return size_t(std::clamp(selection(), 0, int(count) - 1));
+        };
+        const size_t index = add(group, key, label, icons.front(), pinned, [] {}, std::move(enabled), {},
+            [icons, selected_index] { return icons[selected_index()]; });
+        Tool &tool = m_groups[group].tools[index];
+        tool.state_label = [choices, selected_index] { return choices[selected_index()]; };
+        tool.run = [this, group, index, choices, icons, selected_index, select] {
+            wxMenu menu;
+            const size_t current = selected_index();
+            for (size_t i = 0; i < choices.size(); ++i) {
+                const int id = wxWindow::NewControlId();
+                auto *item = menu.AppendRadioItem(id, choices[i]);
+                item->SetBitmap(ScalableBitmap(this, icons[i], 16).bmp());
+                item->Check(i == current);
+                menu.Bind(wxEVT_MENU, [this, group, index, select, i](wxCommandEvent &) {
+                    select(int(i));
+                    m_groups[group].tools[index].button->UpdateWindowUI();
+                }, id);
+            }
+            Tool &choice_tool = m_groups[group].tools[index];
+            const wxPoint origin = choice_tool.button->IsShownOnScreen() ?
+                choice_tool.button->ClientToScreen(wxPoint(0, choice_tool.button->GetSize().y)) :
+                wxPoint(m_groups[group].menu->GetScreenRect().x, m_groups[group].menu->GetScreenRect().GetBottom());
+            PopupMenu(&menu, ScreenToClient(origin));
+        };
     }
 
     void command(size_t group, const std::string &key, wxButton *source, const wxString &label,
@@ -4072,15 +4148,64 @@ void StrengthLoadPanel::apply_optimized_settings()
 class StrengthSimulationPanel::ResultCanvas final : public SoftwareViewport3D
 {
 public:
+    using ProbeRows = std::vector<std::pair<wxString, wxString>>;
+
     ResultCanvas(wxWindow *parent, std::shared_ptr<StrengthAnalysisSession> session, std::function<void(size_t)> probe)
         : SoftwareViewport3D(parent, parent->FromDIP(wxSize(560, 560)))
         , m_session(std::move(session)), m_probe(std::move(probe))
     {
         set_right_margin(parent->FromDIP(112));
+        m_probe_card = new wxScrolledWindow(this, wxID_ANY, wxDefaultPosition, wxDefaultSize,
+                                             wxVSCROLL | wxBORDER_SIMPLE);
+        m_probe_card->SetBackgroundColour(wxSystemSettings::GetColour(wxSYS_COLOUR_WINDOW));
+        m_probe_card->SetScrollRate(0, FromDIP(8));
+        auto *layout = new wxBoxSizer(wxVERTICAL);
+        m_probe_card_title = new wxStaticText(m_probe_card, wxID_ANY, wxEmptyString);
+        wxFont title_font = m_probe_card_title->GetFont();
+        title_font.SetWeight(wxFONTWEIGHT_BOLD);
+        m_probe_card_title->SetFont(title_font);
+        auto *header = new wxBoxSizer(wxHORIZONTAL);
+        header->Add(m_probe_card_title, 1, wxALIGN_CENTER_VERTICAL);
+        auto *close = new wxButton(m_probe_card, wxID_ANY, wxString::FromUTF8("\xC3\x97"),
+                                   wxDefaultPosition, FromDIP(wxSize(24, 24)), wxBU_EXACTFIT | wxBORDER_NONE);
+        close->SetToolTip(_L("Close point probe"));
+        close->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { clear_probe_card(); });
+        header->Add(close, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, FromDIP(8));
+        layout->Add(header, 0, wxEXPAND | wxALL, FromDIP(10));
+        m_probe_card_grid = new wxFlexGridSizer(2, FromDIP(4), FromDIP(12));
+        m_probe_card_grid->AddGrowableCol(1);
+        layout->Add(m_probe_card_grid, 1, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, FromDIP(10));
+        m_probe_card->SetSizer(layout);
+        m_probe_card->Hide();
+        wxGetApp().UpdateDarkUI(m_probe_card);
+        Bind(wxEVT_SIZE, [this](wxSizeEvent &event) { position_probe_card(); event.Skip(); });
     }
 
     void toggle_section() { m_section = !m_section; Refresh(); }
     bool section_enabled() const { return m_section; }
+
+    void show_probe_card(const wxString &title, const ProbeRows &rows)
+    {
+        m_probe_card_title->SetLabel(title);
+        m_probe_card_grid->Clear(true);
+        for (const auto &[name, value] : rows) {
+            m_probe_card_grid->Add(new wxStaticText(m_probe_card, wxID_ANY, name), 0,
+                                   wxALIGN_LEFT | wxALIGN_CENTER_VERTICAL);
+            m_probe_card_grid->Add(new wxStaticText(m_probe_card, wxID_ANY, value), 0,
+                                   wxALIGN_RIGHT | wxALIGN_CENTER_VERTICAL);
+        }
+        wxGetApp().UpdateDarkUI(m_probe_card);
+        m_probe_card->Scroll(0, 0);
+        m_probe_card->Show();
+        position_probe_card();
+        m_probe_card->Raise();
+    }
+
+    void clear_probe_card()
+    {
+        if (m_probe_card)
+            m_probe_card->Hide();
+    }
 
     void set_mode(int mode) { m_mode = mode; Refresh(); }
     void set_projection(int projection) { set_view(projection); }
@@ -4312,6 +4437,9 @@ protected:
 private:
     std::shared_ptr<StrengthAnalysisSession> m_session;
     std::function<void(size_t)> m_probe;
+    wxScrolledWindow *m_probe_card{nullptr};
+    wxStaticText *m_probe_card_title{nullptr};
+    wxFlexGridSizer *m_probe_card_grid{nullptr};
     bool m_section{false};
     double m_section_z{0.0};
     int m_mode{0};
@@ -4322,6 +4450,25 @@ private:
     bool m_show_dense_preview{true};
     SA::DenseRegionPreview m_dense_preview;
     std::vector<ScreenVertex> m_projected;
+
+    void position_probe_card()
+    {
+        if (!m_probe_card || !m_probe_card->IsShown())
+            return;
+        const wxSize client = GetClientSize();
+        const int margin = FromDIP(12);
+        const int available_width = std::max(FromDIP(120), client.x - 2 * margin);
+        const int width = std::min(FromDIP(360), available_width);
+        m_probe_card->GetSizer()->Layout();
+        const int content_height = m_probe_card->GetSizer()->GetMinSize().y;
+        const int available_height = std::max(FromDIP(90), client.y - FromDIP(58));
+        const int height = std::min(std::max(FromDIP(110), content_height), std::min(FromDIP(300), available_height));
+        const int x = margin;
+        const int y = std::max(margin, client.y - height - FromDIP(34));
+        m_probe_card->SetSize(x, y, width, height);
+        m_probe_card->Layout();
+        m_probe_card->FitInside();
+    }
 
     const indexed_triangle_set &display_mesh() const
     {
@@ -4649,11 +4796,17 @@ StrengthSimulationPanel::StrengthSimulationPanel(wxWindow *parent, std::shared_p
     root->Add(m_summary, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
     SetSizer(root);
 
-    for (unsigned i = 0; i < m_result_mode->GetCount(); ++i)
-        toolbar->add(results_group, "result-" + std::to_string(i), m_result_mode->GetString(i),
-                     i == 1 ? "strength_deformation" : "strength_results", i == 0,
-                     [this, i] { m_result_mode->SetSelection(i); m_canvas->set_mode(i); }, {},
-                     [this, i] { return m_result_mode->GetSelection() == int(i); });
+    std::vector<wxString> result_labels;
+    std::vector<std::string> result_icons;
+    result_labels.reserve(m_result_mode->GetCount());
+    result_icons.reserve(m_result_mode->GetCount());
+    for (unsigned i = 0; i < m_result_mode->GetCount(); ++i) {
+        result_labels.push_back(m_result_mode->GetString(i));
+        result_icons.push_back(i == 1 ? "strength_deformation" : "strength_results");
+    }
+    toolbar->add_choice(results_group, "result-view", _L("Result view"), result_labels, result_icons, true,
+        [this] { return m_result_mode->GetSelection(); },
+        [this](int i) { m_result_mode->SetSelection(i); m_canvas->set_mode(i); });
     for (unsigned i = 0; i < m_projection->GetCount(); ++i)
         toolbar->add(tools_group, "view-" + std::to_string(i), m_projection->GetString(i), "strength_view", false,
                      [this, i] { m_projection->SetSelection(i); m_canvas->set_projection(i); }, {},
@@ -5267,6 +5420,7 @@ void StrengthSimulationPanel::update_dense_preview()
     if (!solved || m_probe_revision != m_session->solved_revision) {
         m_probe_vertex = size_t(-1);
         m_probe->SetLabel(_L("Point probe: click near a mesh vertex."));
+        m_canvas->clear_probe_card();
     }
     m_dense_volume_slider->Enable(solved && !m_session->stale);
     m_target_safety_factor->Enable(solved && !m_session->stale);
@@ -5419,6 +5573,16 @@ void StrengthSimulationPanel::update_probe(size_t vertex_index)
         vertex_index, vector_text(value.position_mm), vector_text(value.displacement_m * 1000.0), value.displacement_m.norm() * 1000.0,
         vector_text(value.normal_stress_pa / 1e6), vector_text(value.shear_stress_pa / 1e6), value.von_mises_pa / 1e6,
         value.maximum_shear_pa / 1e6, value.safety_factor);
+    ResultCanvas::ProbeRows rows{
+        {_L("Position XYZ (mm)"), vector_text(value.position_mm)},
+        {_L("Displacement XYZ (mm)"), vector_text(value.displacement_m * 1000.0)},
+        {_L("Displacement magnitude (mm)"), wxString::Format("%.6g", value.displacement_m.norm() * 1000.0)},
+        {_L("Normal stress XYZ (MPa)"), vector_text(value.normal_stress_pa / 1e6)},
+        {_L("Shear stress XY/XZ/YZ (MPa)"), vector_text(value.shear_stress_pa / 1e6)},
+        {_L("Von Mises (MPa)"), wxString::Format("%.6g", value.von_mises_pa / 1e6)},
+        {_L("Maximum shear (MPa)"), wxString::Format("%.6g", value.maximum_shear_pa / 1e6)},
+        {_L("Safety factor"), wxString::Format("%.6g", value.safety_factor)},
+    };
     if (m_show_dense_preview->GetValue() && m_dense_preview.applicable() && m_dense_preview.response_estimate_available) {
         const bool strengthened = std::binary_search(m_dense_preview.affected_vertices.begin(),
                                                      m_dense_preview.affected_vertices.end(), vertex_index);
@@ -5426,13 +5590,18 @@ void StrengthSimulationPanel::update_probe(size_t vertex_index)
         const double stiffness = strengthened ? std::max(1e-12, m_dense_preview.local_stiffness_multiplier) : 1.0;
         const double load = m_session->solved_setup.gravity.enabled && m_session->result.estimated_mass_kg > 1e-12 ?
             std::max(1.0, m_dense_preview.estimated_total_mass_kg / m_session->result.estimated_mass_kg) : 1.0;
+        const double preview_safety_factor = value.safety_factor * strength / load;
+        const double preview_displacement_mm = value.displacement_m.norm() * 1000.0 * load / stiffness;
         label += wxString::Format(_L(" — dense preview: safety factor %.6g, displacement %.6g mm"),
-            value.safety_factor * strength / load,
-            value.displacement_m.norm() * 1000.0 * load / stiffness);
+            preview_safety_factor, preview_displacement_mm);
+        rows.push_back({_L("Dense-preview safety factor"), wxString::Format("%.6g", preview_safety_factor)});
+        rows.push_back({_L("Dense-preview displacement (mm)"), wxString::Format("%.6g", preview_displacement_mm)});
     } else if (m_show_dense_preview->GetValue() && m_dense_preview.available && !m_dense_preview.response_estimate_available) {
         label += _L(" — Dense-preview response unavailable; baseline response shown.");
+        rows.push_back({_L("Dense preview"), _L("Baseline response shown")});
     }
     m_probe->SetLabel(label);
+    m_canvas->show_probe_card(wxString::Format(_L("Point probe #%zu"), vertex_index), rows);
     Layout();
 }
 

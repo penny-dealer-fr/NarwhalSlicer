@@ -1,4 +1,5 @@
 #include "StrengthAnalysis.hpp"
+#include "MaterialExperiments.hpp"
 
 #include "AABBTreeIndirect.hpp"
 #include "KDTreeIndirect.hpp"
@@ -889,8 +890,10 @@ std::vector<InfillComparison> compare_infill_patterns(double solid_volume_m3, co
     for (InfillPattern pattern : patterns) {
         const PatternFactors factors = pattern_factors(pattern);
         output.push_back({pattern, density, factors.stiffness, factors.strength * factors.directional, mass,
-                          std::max(0.0, reference_safety_factor) * factors.strength,
-                          "Bundled normalized engineering-estimate model; calibrate with printed coupons."});
+                          std::max(0.0, reference_safety_factor) * MaterialExperiments::strength_multiplier(setup,
+                              {{"sparse_infill_pattern", to_string(pattern)}}, {{"sparse_infill_pattern", factors.strength}}),
+                          setup.material.experimental_data.empty() ? "Bundled normalized engineering-estimate model; calibrate with printed coupons." :
+                          "Experimental factors where supported; unmeasured effects retain engineering estimates."});
     }
     return output;
 }
@@ -926,8 +929,9 @@ std::vector<MassStrengthPoint> estimate_mass_strength_curve(double solid_volume_
             if (!(density > 0.0 && density <= 1.0)) continue;
             for (InfillPattern pattern : patterns) {
                 const PatternFactors factors = pattern_factors(pattern);
-                const double predicted = std::max(0.0, reference_safety_factor) * factors.strength *
-                                         effective_solid_fraction(density) / baseline_fraction;
+                const double predicted = std::max(0.0, reference_safety_factor) * MaterialExperiments::strength_multiplier(setup,
+                    {{"sparse_infill_pattern", to_string(pattern)}, {"sparse_infill_density", std::to_string(density * 100)}},
+                    {{"sparse_infill_pattern", factors.strength}, {"sparse_infill_density", effective_solid_fraction(density) / baseline_fraction}});
                 const double mass = std::max(0.0, solid_volume_m3) * effective_solid_fraction(density) * setup.material.density_kg_m3;
                 if (predicted + 1e-9 >= target && mass < best.estimated_mass_kg) {
                     best.feasible = true;
@@ -1007,8 +1011,11 @@ std::vector<PrintSettingsCandidate> recommend_print_settings(double solid_volume
                     const double wall_factor = 1.0 + 0.12 * (wall_count - 2);
                     const double layer_factor = std::clamp(1.0 + (0.20 - layer_height) * 0.6, 0.85, 1.10);
                     const double density_factor = effective_solid_fraction(density) / baseline_fraction;
-                    const double predicted = std::max(0.0, reference_safety_factor) * factors.strength * wall_factor * layer_factor *
-                                             density_factor;
+                    const double predicted = std::max(0.0, reference_safety_factor) * MaterialExperiments::strength_multiplier(setup,
+                        {{"sparse_infill_pattern", to_string(pattern)}, {"sparse_infill_density", std::to_string(density * 100)},
+                         {"wall_loops", std::to_string(wall_count)}, {"layer_height", std::to_string(layer_height)}},
+                        {{"sparse_infill_pattern", factors.strength}, {"sparse_infill_density", density_factor},
+                         {"wall_loops", wall_factor}, {"layer_height", layer_factor}});
                     const double stiffness_multiplier = factors.stiffness * wall_factor * layer_factor * density_factor;
                     const double predicted_displacement = std::max(0.0, reference_displacement_mm) /
                                                           std::max(stiffness_multiplier, NUMERIC_EPSILON);
@@ -1038,7 +1045,7 @@ std::vector<PrintSettingsCandidate> recommend_print_settings(double solid_volume
 
 Result analyze(const indexed_triangle_set &mesh, const Setup &input_setup, const CancelPredicate &cancel)
 {
-    Setup setup = input_setup;
+    Setup setup = MaterialExperiments::evaluate_setup(input_setup);
     Result result;
     const std::vector<std::string> errors = validate(mesh, setup);
     if (!errors.empty()) {
@@ -1994,6 +2001,10 @@ std::string serialize_setup(const Setup &setup)
                          {"strength_xy_scale", m.calibration.strength_xy_scale}, {"strength_z_scale", m.calibration.strength_z_scale},
                          {"shear_scale", m.calibration.shear_scale}, {"source", m.calibration.source}}}
     };
+    if (!m.experimental_data.empty()) {
+        j["material"]["experimental_data"] = m.experimental_data;
+        j["material"]["experimental_context"] = m.experimental_context;
+    }
     j["print_layer_axis"] = vec_to_array(setup.print_layer_axis);
     j["follow_prepare_orientation"] = setup.follow_prepare_orientation;
     j["geometry_scale"] = vec_to_array(setup.geometry_scale);
@@ -2036,6 +2047,9 @@ bool deserialize_setup(const std::string &json_text, Setup &setup, std::string *
             const auto &m = j["material"];
             parsed.material.key = m.value("key", parsed.material.key); parsed.material.name = m.value("name", parsed.material.name);
             parsed.material.provenance = m.value("provenance", parsed.material.provenance);
+            parsed.material.experimental_data = m.value("experimental_data", std::string());
+            if (m.contains("experimental_context")) parsed.material.experimental_context = m.at("experimental_context").get<std::map<std::string,std::string>>();
+            if (!parsed.material.experimental_data.empty()) MaterialExperiments::validate(nlohmann::json::parse(parsed.material.experimental_data));
             parsed.material.density_kg_m3 = m.value("density_kg_m3", parsed.material.density_kg_m3);
             parsed.material.elastic_modulus_xy_pa = m.value("elastic_modulus_xy_pa", parsed.material.elastic_modulus_xy_pa);
             parsed.material.elastic_modulus_z_pa = m.value("elastic_modulus_z_pa", parsed.material.elastic_modulus_z_pa);

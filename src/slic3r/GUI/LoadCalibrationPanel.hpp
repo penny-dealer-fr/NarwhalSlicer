@@ -17,5 +17,17 @@ private:
     struct Impl;
     std::unique_ptr<Impl> m;
 };
+class CalibratedMaterialsPanel : public wxScrolledWindow
+{
+public:
+    explicit CalibratedMaterialsPanel(wxWindow* parent);
+    ~CalibratedMaterialsPanel() override;
+    bool Show(bool show) override;
+    void update_colors();
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> m;
+};
 } // namespace Slic3r::GUI
 #endif

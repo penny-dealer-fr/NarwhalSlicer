@@ -1,5 +1,6 @@
 #include "StrengthAnalysisPanel.hpp"
 #include "LoadCalibrationPanel.hpp"
+#include "libslic3r/MaterialExperiments.hpp"
 
 #include "I18N.hpp"
 #include "Plater.hpp"
@@ -2714,6 +2715,13 @@ bool StrengthLoadPanel::collect_setup(bool show_errors, bool validate_setup)
     numeric = read_number(m_objective_weights[2], setup.criteria.support_weight) && numeric;
     numeric = read_number(m_objective_weights[3], setup.criteria.print_time_weight) && numeric;
 
+    if (!setup.material.experimental_data.empty()) {
+        DynamicPrintConfig print_context=wxGetApp().preset_bundle->full_config();
+        const int index=m_session->object_index;
+        if(index>=0&&size_t(index)<m_plater->model().objects.size())
+            print_context.apply(m_plater->model().objects[size_t(index)]->config.get());
+        setup.material.experimental_context=MaterialExperiments::context_from_config(print_context);
+    }
     m_numeric_inputs_valid = numeric;
     const std::vector<std::string> errors = validate_setup ? SA::validate(m_session->mesh, setup) : std::vector<std::string>();
     if (!numeric || !errors.empty()) {

@@ -391,6 +391,8 @@ set(lisbslic3r_sources
     ShortEdgeCollapse.hpp
     ShortestPath.cpp
     ShortestPath.hpp
+    MaterialExperiments.cpp
+    MaterialExperiments.hpp
     LoadCalibration.cpp
     LoadCalibration.hpp
     StrengthAnalysis.cpp

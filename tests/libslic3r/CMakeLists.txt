@@ -9,6 +9,7 @@ add_executable(${_TEST_NAME}_tests
     test_arrange.cpp
     test_bambu_networking.cpp
     test_load_calibration.cpp
+    test_material_experiments.cpp
     test_calib.cpp
     test_clipper_offset.cpp
     test_clipper_utils.cpp

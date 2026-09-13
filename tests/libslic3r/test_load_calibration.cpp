@@ -116,6 +116,8 @@ TEST_CASE("CNC hook projects preserve orientation identity and settings through 
     REQUIRE(flat.objects.front()->instances.size() == 1);
     REQUIRE_THAT(flat.objects.front()->bounding_box_exact().size().z(), WithinAbs(9, 0.01));
     REQUIRE_THAT(upright.objects.front()->bounding_box_exact().size().z(), WithinAbs(70, 0.01));
+    REQUIRE_THAT(flat.objects.front()->bounding_box_exact().min.z(), WithinAbs(0, 0.001));
+    REQUIRE_THAT(upright.objects.front()->bounding_box_exact().min.z(), WithinAbs(0, 0.001));
     ScopedTemporaryFile file(".3mf");
     REQUIRE_NOTHROW(LC::store_project(file.string(), upright, config));
     ScopedSlic3rTemporaryDir temporary;
@@ -136,8 +138,65 @@ TEST_CASE("CNC hook projects preserve orientation identity and settings through 
     REQUIRE(restored.has("wall_loops"));
     REQUIRE(restored.opt_int("wall_loops") == 4);
     REQUIRE_THAT(loaded.objects.front()->bounding_box_exact().size().z(), WithinAbs(70, 0.01));
+    REQUIRE_THAT(loaded.objects.front()->bounding_box_exact().min.z(), WithinAbs(0, 0.001));
     config.set_deserialize_strict("printable_height", "20");
     REQUIRE_THROWS(LC::hook_model(stl, samples[1], config));
     config.set_deserialize_strict("printable_area", "0x0,20x0,20x20,0x20");
     REQUIRE_THROWS(LC::hook_model(stl, samples[0], config));
+}
+TEST_CASE("Selected hooks share plates without overlap and remain on the bed after reload", "[LoadCalibration]")
+{
+    const auto stl = (boost::filesystem::path(TEST_DATA_DIR).parent_path().parent_path() / "resources/handy_models/CNC_Testhook.stl")
+                         .string();
+    auto config = DynamicPrintConfig::full_print_config();
+    config.set_deserialize_strict("printable_area", "0x0,160x0,160x160,0x160");
+    config.set_deserialize_strict("printable_height", "200");
+    config.set_deserialize_strict("bed_exclude_area", "");
+    const auto samples = LC::make_samples({"2", "4"}, 3);
+    auto project       = LC::arrange_hooks(stl, samples, config, "wall_loops");
+    REQUIRE(project.model.objects.size() == samples.size());
+    REQUIRE(project.plates.size() > 1);
+    REQUIRE(project.plates.size() < samples.size());
+    for (const auto& plate : project.plates) {
+        for (size_t i = 0; i < plate.objects.size(); ++i) {
+            const auto box = project.model.objects[plate.objects[i]]->bounding_box_exact();
+            REQUIRE_THAT(box.min.z(), WithinAbs(0, .001));
+            REQUIRE(box.min.x() >= plate.origin.x());
+            REQUIRE(box.max.x() <= plate.origin.x() + 160);
+            REQUIRE(box.min.y() >= plate.origin.y());
+            REQUIRE(box.max.y() <= plate.origin.y() + 160);
+            for (size_t j = i + 1; j < plate.objects.size(); ++j) {
+                const auto other  = project.model.objects[plate.objects[j]]->bounding_box_exact();
+                const bool spaced = box.max.x() + 23 <= other.min.x() || other.max.x() + 23 <= box.min.x() ||
+                                    box.max.y() + 23 <= other.min.y() || other.max.y() + 23 <= box.min.y();
+                REQUIRE(spaced);
+            }
+        }
+    }
+    ScopedTemporaryFile file(".3mf");
+    LC::store_project(file.string(), project);
+    ScopedSlic3rTemporaryDir temporary;
+    Model loaded;
+    DynamicPrintConfig restored;
+    ConfigSubstitutionContext substitutions(ForwardCompatibilitySubstitutionRule::Enable);
+    PlateDataPtrs plates;
+    std::vector<Preset*> presets;
+    bool bbl = false, orca = false;
+    Semver version;
+    REQUIRE(load_bbs_3mf(file.string().c_str(), &restored, &substitutions, &loaded, &plates, &presets, &bbl, &orca, &version, nullptr,
+                         LoadStrategy::LoadModel | LoadStrategy::LoadConfig));
+    REQUIRE(plates.size() == project.plates.size());
+    REQUIRE(loaded.objects.size() == samples.size());
+    for (size_t i = 0; i < samples.size(); ++i) {
+        const auto box      = loaded.objects[i]->bounding_box_exact();
+        const auto original = project.model.objects[i]->bounding_box_exact();
+        REQUIRE_THAT((box.min - original.min).norm(), WithinAbs(0, .001));
+        REQUIRE_THAT(box.size().z(), WithinAbs(samples[i].orientation == "XY" ? 9 : 70, .01));
+        REQUIRE(loaded.objects[i]->config.opt_int("wall_loops") == std::stoi(samples[i].value));
+    }
+    release_PlateData_list(plates);
+    for (auto* preset : presets)
+        delete preset;
+    auto isolated = LC::arrange_hooks(stl, LC::make_samples({"5", "10"}, 1), config, "slow_down_layer_time");
+    REQUIRE(isolated.plates.size() == 4);
 }

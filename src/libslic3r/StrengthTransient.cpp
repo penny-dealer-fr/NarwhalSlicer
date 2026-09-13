@@ -1,4 +1,5 @@
 #include "StrengthTransient.hpp"
+#include "MaterialExperiments.hpp"
 #include "TriangleMeshSlicer.hpp"
 #include <Eigen/SparseCholesky>
 #include <Eigen/Eigenvalues>
@@ -174,7 +175,7 @@ TransientResult analyze_transient(const indexed_triangle_set &mesh, const Setup 
             }
         }
         if (cells.size() < 2) return fail("Grid does not resolve this part. Reduce in-plane cell width.");
-        const Material material = setup.material.calibrated();
+        const Material material = MaterialExperiments::evaluate_setup(setup).material.calibrated();
         const std::array<double,6> pattern_stiffness{{0.82,0.94,1.05,0.98,1.03,1.0}};
         const std::array<double,6> pattern_strength{{0.82,0.91,1.02,0.96,1.0,1.0}};
 

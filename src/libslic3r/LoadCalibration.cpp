@@ -186,8 +186,10 @@ Model hook_model(const std::string& stl, const Sample& sample, const DynamicPrin
                                 Point::new_scale(x + box.size().x() + 12, y + box.size().y() + 12),
                                 Point::new_scale(x - 12, y + box.size().y() + 12)};
             if (diff(Polygons{footprint}, usable).empty()) {
-                object->instances.front()->set_offset(Vec3d(x - box.min.x(), y - box.min.y(), 0));
-                object->ensure_on_bed();
+                object->instances.front()->set_offset(Vec3d(x - box.min.x(), y - box.min.y(), object->instances.front()->get_offset().z()));
+                object->invalidate_bounding_box();
+                object->ensure_on_bed(false);
+                object->invalidate_bounding_box();
                 return model;
             }
         }

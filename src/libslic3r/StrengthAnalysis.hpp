@@ -94,6 +94,8 @@ struct Material {
     double shear_strength_xy_pa{32.0e6};
     double shear_strength_xz_pa{18.0e6};
     MaterialCalibration calibration;
+    std::string experimental_data;
+    std::map<std::string, std::string> experimental_context;
 
     std::vector<std::string> validate() const;
     Material calibrated() const;

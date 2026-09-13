@@ -500,6 +500,7 @@ void CalibrationPanel::init_tabpanel() {
     //m_tabpanel->GetBtnsListCtrl()->SetPaddingSize({ FromDIP(15), padding_size.y });
 
     m_tabpanel->AddPage(new LoadCalibrationPanel(m_tabpanel), _L("Load"), false);
+    m_tabpanel->AddPage(new CalibratedMaterialsPanel(m_tabpanel), _L("Materials"), false);
 
     m_initialized = true;
 }
@@ -696,6 +697,7 @@ void CalibrationPanel::msw_rescale()
 void CalibrationPanel::on_sys_color_changed()
 {
     if (auto* load = dynamic_cast<LoadCalibrationPanel*>(m_tabpanel->GetPage(CALI_MODE_COUNT))) load->update_colors();
+    if (auto* materials = dynamic_cast<CalibratedMaterialsPanel*>(m_tabpanel->GetPage(CALI_MODE_COUNT + 1))) materials->update_colors();
     for (int i = 0; i < (int)CALI_MODE_COUNT; i++) {
         m_cali_panels[i]->on_sys_color_changed();
     }

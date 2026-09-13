@@ -4,6 +4,7 @@
 #include "Plater.hpp"
 #include "MainFrame.hpp"
 #include "libslic3r/LoadCalibration.hpp"
+#include "libslic3r/MaterialExperiments.hpp"
 #include "libslic3r/PresetBundle.hpp"
 #include "libslic3r/Print.hpp"
 
@@ -22,6 +23,11 @@
 #include <wx/textctrl.h>
 #include <wx/timer.h>
 #include <wx/filename.h>
+#include <wx/filedlg.h>
+#include <wx/dcbuffer.h>
+#include <wx/checkbox.h>
+#include <wx/textdlg.h>
+#include <wx/statbox.h>
 #include <atomic>
 #include <mutex>
 #include <thread>
@@ -33,6 +39,7 @@
 namespace Slic3r::GUI {
 namespace LC = LoadCalibration;
 namespace SA = StrengthAnalysis;
+namespace ME = MaterialExperiments;
 using Json   = nlohmann::json;
 namespace {
 boost::filesystem::path root_path() { return boost::filesystem::path(data_dir()) / "load_calibration"; }
@@ -108,7 +115,7 @@ const std::vector<SA::Material>& load_materials()
 struct LoadCalibrationPanel::Impl
 {
     LoadCalibrationPanel* panel;
-    wxChoice *setting{}, *study_choice{}, *unit{}, *base{}, *target{}, *group{};
+    wxChoice *setting{}, *study_choice{}, *unit{}, *base{}, *target{}, *group{}, *calculation{};
     wxTextCtrl *values{}, *start{}, *end{}, *step{}, *material{}, *type{}, *xy{}, *z{}, *summary{};
     wxSpinCtrl* repeats{};
     wxColourPickerCtrl* color{};
@@ -136,20 +143,24 @@ struct LoadCalibrationPanel::Impl
         if (worker.joinable())
             worker.join();
     }
-    std::string color_value() const {
+    std::string color_value() const
+    {
         return legacy_color.empty() ? std::string(color->GetColour().GetAsString(wxC2S_HTML_SYNTAX).ToUTF8().data()) : legacy_color;
     }
-    void set_color(const std::string& saved) {
+    void set_color(const std::string& saved)
+    {
         wxColour parsed(wxString::FromUTF8(saved));
         legacy_color = parsed.IsOk() ? std::string() : saved;
         color->SetColour(parsed.IsOk() ? parsed : *wxWHITE);
-        color->SetToolTip(legacy_color.empty() ? _L("Choose material color") :
-            wxString::Format(_L("Saved color: %s. Choose a swatch to replace it."),wxString::FromUTF8(saved)));
+        color->SetToolTip(legacy_color.empty() ?
+                              _L("Choose material color") :
+                              wxString::Format(_L("Saved color: %s. Choose a swatch to replace it."), wxString::FromUTF8(saved)));
     }
-    DynamicPrintConfig baseline_config() const {
+    DynamicPrintConfig baseline_config() const
+    {
         DynamicPrintConfig baseline;
-        for (auto it=study.at("baseline").begin();it!=study.at("baseline").end();++it)
-            baseline.set_deserialize_strict(it.key(),it.value().get<std::string>());
+        for (auto it = study.at("baseline").begin(); it != study.at("baseline").end(); ++it)
+            baseline.set_deserialize_strict(it.key(), it.value().get<std::string>());
         return baseline;
     }
     void stop()
@@ -430,45 +441,54 @@ struct LoadCalibrationPanel::Impl
                         throw CanceledException();
                     message("Slicing " + planned[i].id + " (" + std::to_string(i + 1) + "/" + std::to_string(planned.size()) + ")");
                     const auto stem = path / planned[i].id;
-                    if (boost::filesystem::exists(stem.string() + ".complete.json") && boost::filesystem::exists(stem.string() + ".gcode"))
+                    if (boost::filesystem::exists(stem.string() + ".complete.json") &&
+                        boost::filesystem::exists(stem.string() + ".gcode") &&
+                        read_json(stem.string() + ".complete.json").value("geometry_version", 0) == 2)
                         continue;
                     try {
-                    auto model = LC::hook_model(stl, planned[i], configs[i]);
-                    LC::store_project(stem.string() + ".3mf", model, configs[i]);
-                    auto print = std::make_shared<Print>();
+                        auto model = LC::hook_model(stl, planned[i], configs[i]);
+                        LC::store_project(stem.string() + ".3mf", model, configs[i]);
+                        auto print = std::make_shared<Print>();
+                        {
+                            std::lock_guard<std::mutex> lock(mutex);
+                            active_print = print;
+                        }
+                        print->set_status_silent();
+                        print->auto_assign_extruders(model.objects.front());
+                        LC::prepare_print(*print, model, configs[i]);
+                        if (cancel) {
+                            print->cancel();
+                            throw CanceledException();
+                        }
+                        auto error = print->validate();
+                        if (!error.string.empty())
+                            throw std::runtime_error(error.string);
+                        print->process();
+                        print->export_gcode(stem.string() + ".gcode", nullptr);
+                        if (cancel)
+                            throw CanceledException();
+                        write_json(stem.string() + ".complete.json", {{"id", planned[i].id},
+                                                                      {"value", planned[i].value},
+                                                                      {"orientation", planned[i].orientation},
+                                                                      {"geometry_version", 2}});
+                        boost::system::error_code ignored;
+                        boost::filesystem::remove(stem.string() + ".error.json", ignored);
+                    } catch (const CanceledException&) {
+                        throw;
+                    } catch (const std::exception& e) {
+                        if (cancel)
+                            throw CanceledException();
+                        ++failed;
+                        write_json(stem.string() + ".error.json", {{"id", planned[i].id}, {"error", e.what()}});
+                    }
                     {
                         std::lock_guard<std::mutex> lock(mutex);
-                        active_print = print;
+                        active_print.reset();
                     }
-                    print->set_status_silent();
-                    print->auto_assign_extruders(model.objects.front());
-                    LC::prepare_print(*print, model, configs[i]);
-                    if (cancel) {
-                        print->cancel();
-                        throw CanceledException();
-                    }
-                    auto error = print->validate();
-                    if (!error.string.empty())
-                        throw std::runtime_error(error.string);
-                    print->process();
-                    print->export_gcode(stem.string() + ".gcode", nullptr);
-                    if (cancel)
-                        throw CanceledException();
-                    write_json(stem.string() + ".complete.json",
-                                           {{"id", planned[i].id}, {"value", planned[i].value}, {"orientation", planned[i].orientation}});
-                    boost::system::error_code ignored;
-                    boost::filesystem::remove(stem.string()+".error.json",ignored);
-                    } catch(const CanceledException&) { throw; }
-                    catch(const std::exception& e) {
-                        if(cancel) throw CanceledException();
-                        ++failed;
-                        write_json(stem.string()+".error.json",{{"id",planned[i].id},{"error",e.what()}});
-                    }
-                    { std::lock_guard<std::mutex> lock(mutex); active_print.reset(); }
-
                 }
-                message(failed ? std::to_string(failed)+" hook(s) could not be sliced. See per-hook .error.json files in "+path.string()
-                               : "All hooks sliced. Projects and G-code: " + path.string());
+                message(failed ?
+                                        std::to_string(failed) + " hook(s) could not be sliced. See per-hook .error.json files in " + path.string() :
+                                        "All hooks sliced. Projects and G-code: " + path.string());
             } catch (const std::exception& e) {
                 message(std::string("Slicing stopped: ") + e.what() + ". Completed files remain in " + path.string());
             }
@@ -499,18 +519,48 @@ struct LoadCalibrationPanel::Impl
         if (base->GetSelection() < 0 || group->GetSelection() < 0)
             throw std::invalid_argument("Select a base material and setting value.");
         const std::string value = group->GetStringSelection().ToUTF8().data();
-        auto calibrated = LC::calibrate(load_materials().at(base->GetSelection()), utf8(material), samples, value, number(xy), number(z));
-        const auto path = root_path() / "materials.json";
-        Json library    = boost::filesystem::exists(path) ? read_json(path) : Json{{"version", 1}, {"materials", Json::array()}};
+        const auto mode         = calculation->GetSelection() == 1 ? "simple" : "regressed";
+        const auto path         = root_path() / "materials.json";
+        Json library            = boost::filesystem::exists(path) ? read_json(path) : Json{{"version", 1}, {"materials", Json::array()}};
         if (library.at("version") != 1)
             throw std::runtime_error("Unsupported material library version.");
+        auto calibrated    = load_materials().at(base->GetSelection());
         const int selected = target->GetSelection();
         if (selected > 0)
-            calibrated.key = load_materials().at(SA::builtin_materials().size() + selected - 1).key;
+            calibrated = load_materials().at(SA::builtin_materials().size() + selected - 1);
         else
             calibrated.key = "calibrated_" + boost::filesystem::unique_path("%%%%-%%%%-%%%%").string();
-        calibrated.provenance += "; type: " + utf8(type) + "; color: " + color_value() + "; study: " + current_path.filename().string() +
-                                 "; parameter: " + study.at("setting").get<std::string>();
+        auto record = calibrated.experimental_data.empty() ? ME::create(load_materials().at(base->GetSelection())) :
+                                                             Json::parse(calibrated.experimental_data);
+        // Recover available observations from the earlier single-setting library format before appending new tests.
+        if (selected > 0 && calibrated.experimental_data.empty()) {
+            for (const auto& old : library["materials"]) {
+                SA::Setup existing;
+                if (!SA::deserialize_setup(old.at("setup").dump(), existing) || existing.material.key != calibrated.key)
+                    continue;
+                const auto old_source = old.value("study", "");
+                const auto old_path   = root_path() / boost::filesystem::path(old_source).filename() / "study.json";
+                if (!old_source.empty() && boost::filesystem::exists(old_path)) {
+                    const auto previous = read_json(old_path);
+                    DynamicPrintConfig config;
+                    for (auto it = previous.at("baseline").begin(); it != previous.at("baseline").end(); ++it)
+                        config.set_deserialize_strict(it.key(), it.value().get<std::string>());
+                    ME::append_study(record, old_source, previous.at("setting"), ME::context_from_config(config),
+                                     LC::deserialize_samples(previous.at("samples").dump()), old.value("xy_mpa_per_n", number(xy)),
+                                     old.value("z_mpa_per_n", number(z)), "simple");
+                }
+            }
+        }
+        ME::append_study(record, current_path.filename().string(), study.at("setting"), ME::context_from_config(baseline_config()), samples,
+                         number(xy), number(z), mode);
+        calibrated.experimental_context                                         = ME::context_from_config(baseline_config());
+        calibrated.experimental_context[study.at("setting").get<std::string>()] = value;
+        calibrated.experimental_data                                            = record.dump();
+        calibrated                                                              = ME::evaluate(calibrated, calibrated.experimental_context);
+        calibrated.name                                                         = utf8(material) + " -- CALIBRATED";
+        calibrated.provenance         = "Accumulated experimental data; type: " + utf8(type) + "; color: " + color_value();
+        calibrated.calibration        = {};
+        calibrated.calibration.source = "Experimental material library: inspect Materials for measured and inherited properties.";
         SA::Setup setup;
         setup.material = calibrated;
         Json row       = {{"setup", Json::parse(SA::serialize_setup(setup))},
@@ -570,10 +620,10 @@ LoadCalibrationPanel::LoadCalibrationPanel(wxWindow* parent) : wxScrolledWindow(
     field(_L("Saved study"), m->study_choice);
     m->material = text(_L("Material name"), "");
     m->type     = text(_L("Material type (PLA, PETG, …)"), "");
-    m->color = new wxColourPickerCtrl(this,wxID_ANY,*wxWHITE);
-    field(_L("Color"),m->color);
-    m->color->Bind(wxEVT_COLOURPICKER_CHANGED,[this](wxColourPickerEvent&){m->legacy_color.clear();});
-    m->setting  = new wxChoice(this, wxID_ANY);
+    m->color    = new wxColourPickerCtrl(this, wxID_ANY, *wxWHITE);
+    field(_L("Color"), m->color);
+    m->color->Bind(wxEVT_COLOURPICKER_CHANGED, [this](wxColourPickerEvent&) { m->legacy_color.clear(); });
+    m->setting = new wxChoice(this, wxID_ANY);
     for (const auto& s : LC::settings()) {
         const auto* d = print_config_def.get(s.key);
         m->setting->Append(d ? _(d->label) : _L("Bed temperature"));
@@ -627,10 +677,9 @@ LoadCalibrationPanel::LoadCalibrationPanel(wxWindow* parent) : wxScrolledWindow(
     result_buttons->Add(open_hook, 0, wxRIGHT, gap);
     m->summary = new wxTextCtrl(this, wxID_ANY, "", wxDefaultPosition, FromDIP(wxSize(900, 170)), wxTE_MULTILINE | wxTE_READONLY);
     root->Add(m->summary, 0, wxEXPAND | wxALL, gap);
-    add_text(_L("Calibrate one setting group at a time. Supply validated peak tensile stress per unit force (MPa/N) for the hook and "
-                "fixture in each orientation. Failure load alone cannot identify material stress. At least two failures in XY and Z are "
-                "required; survived samples cannot be treated as failures. The minimum failure estimates tensile limits; elastic and shear "
-                "properties remain inherited from the base material."));
+    add_text(_L("Save observations to a new or existing material. Regressed mode combines old and new data; simple mode uses minima at "
+                "tested settings. Supply validated XY/Z peak tensile stress per force (MPa/N). Survived and untested hooks remain recorded "
+                "but are excluded from failure fits. See Materials for curves, modes, and inherited properties."));
     auto* calibration = new wxFlexGridSizer(2, gap, gap);
     calibration->AddGrowableCol(1, 1);
     root->Add(calibration, 0, wxEXPAND | wxALL, gap);
@@ -639,8 +688,13 @@ LoadCalibrationPanel::LoadCalibrationPanel(wxWindow* parent) : wxScrolledWindow(
     field(_L("Base mechanical material"), m->base);
     m->target = new wxChoice(this, wxID_ANY);
     field(_L("Save to"), m->target);
+    m->calculation = new wxChoice(this, wxID_ANY);
+    m->calculation->Append(_L("Regressed (default)"));
+    m->calculation->Append(_L("Simple (minimum at tested value)"));
+    m->calculation->SetSelection(0);
+    field(_L("Calculation"), m->calculation);
     m->group = new wxChoice(this, wxID_ANY);
-    field(_L("Setting value to calibrate"), m->group);
+    field(_L("Reference value (all study data is saved)"), m->group);
     m->xy               = text(_L("XY peak tensile stress / force (MPa/N)"), "");
     m->z                = text(_L("Z peak tensile stress / force (MPa/N)"), "");
     m->calibrate_button = new wxButton(this, wxID_ANY, _L("Save calibrated material"));
@@ -649,21 +703,24 @@ LoadCalibrationPanel::LoadCalibrationPanel(wxWindow* parent) : wxScrolledWindow(
         m->guarded([&] {
             m->persist();
             std::vector<LC::Sample> selected;
-            for(int row=0;row<m->grid->GetNumberRows();++row) {
-                bool included=false;
-                for(int column=0;column<m->grid->GetNumberCols();++column)
-                    included=included || m->grid->IsInSelection(row,column);
-                if(included) selected.push_back(m->samples.at(size_t(row)));
+            for (int row = 0; row < m->grid->GetNumberRows(); ++row) {
+                bool included = false;
+                for (int column = 0; column < m->grid->GetNumberCols(); ++column)
+                    included = included || m->grid->IsInSelection(row, column);
+                if (included)
+                    selected.push_back(m->samples.at(size_t(row)));
             }
-            if(selected.empty()) {
-                const int row=m->grid->GetGridCursorRow();
-                if(row>=0 && size_t(row)<m->samples.size()) selected.push_back(m->samples[size_t(row)]);
+            if (selected.empty()) {
+                const int row = m->grid->GetGridCursorRow();
+                if (row >= 0 && size_t(row) < m->samples.size())
+                    selected.push_back(m->samples[size_t(row)]);
             }
-            if(selected.empty()) throw std::invalid_argument("Select one or more hooks in the results table.");
-            auto project=LC::arrange_hooks((m->current_path/"CNC_Testhook.stl").string(),selected,m->baseline_config(),
-                m->study.at("setting").get<std::string>());
-            const auto path=m->current_path/boost::filesystem::unique_path("selected-hooks-%%%%-%%%%.3mf");
-            LC::store_project(path.string(),project);
+            if (selected.empty())
+                throw std::invalid_argument("Select one or more hooks in the results table.");
+            auto project    = LC::arrange_hooks((m->current_path / "CNC_Testhook.stl").string(), selected, m->baseline_config(),
+                                                m->study.at("setting").get<std::string>());
+            const auto path = m->current_path / boost::filesystem::unique_path("selected-hooks-%%%%-%%%%.3mf");
+            LC::store_project(path.string(), project);
             auto* plater = wxGetApp().plater();
             if (plater->new_project(false, false, _L("CNC Testhook")) == wxID_CANCEL)
                 return;
@@ -762,4 +819,554 @@ void LoadCalibrationPanel::update_colors()
     m->grid->ForceRefresh();
 }
 LoadCalibrationPanel::~LoadCalibrationPanel() = default;
+
+namespace {
+class MaterialCurve : public wxPanel
+{
+public:
+    std::vector<wxRealPoint> line, points;
+    wxString caption;
+    bool show_points{true};
+    explicit MaterialCurve(wxWindow* parent) : wxPanel(parent, wxID_ANY, wxDefaultPosition, parent->FromDIP(wxSize(800, 280)))
+    {
+        SetBackgroundStyle(wxBG_STYLE_PAINT);
+        Bind(wxEVT_PAINT, [this](wxPaintEvent&) {
+            wxAutoBufferedPaintDC dc(this);
+            dc.SetBackground(wxBrush(GetBackgroundColour()));
+            dc.Clear();
+            dc.SetTextForeground(GetForegroundColour());
+            dc.DrawText(caption, FromDIP(10), FromDIP(8));
+            if (line.empty() && points.empty())
+                return;
+            double xmin = std::numeric_limits<double>::infinity(), xmax = -xmin, ymin = xmin, ymax = -xmin;
+            auto include = [&](const auto& values) {
+                for (const auto& p : values) {
+                    xmin = std::min(xmin, p.x);
+                    xmax = std::max(xmax, p.x);
+                    ymin = std::min(ymin, p.y);
+                    ymax = std::max(ymax, p.y);
+                }
+            };
+            include(line);
+            include(points);
+            if (xmax <= xmin)
+                xmax = xmin + 1;
+            if (ymax <= ymin)
+                ymax = ymin + 1;
+            const double margin = (ymax - ymin) * .1;
+            ymin                = std::max(0., ymin - margin);
+            ymax += margin;
+            const int left = FromDIP(100), top = FromDIP(40), width = std::max(1, GetClientSize().x - left - FromDIP(30)),
+                      height = std::max(1, GetClientSize().y - top - FromDIP(40));
+            auto map         = [&](const wxRealPoint& p) {
+                return wxPoint(left + int((p.x - xmin) / (xmax - xmin) * width), top + height - int((p.y - ymin) / (ymax - ymin) * height));
+            };
+            dc.SetPen(wxPen(GetForegroundColour()));
+            dc.DrawLine(left, top, left, top + height);
+            dc.DrawLine(left, top + height, left + width, top + height);
+            dc.DrawText(wxString::Format("%.4g", ymax), FromDIP(8), top);
+            dc.DrawText(wxString::Format("%.4g", ymin), FromDIP(8), top + height - FromDIP(14));
+            dc.DrawText(wxString::Format("%.4g", xmin), left, top + height + FromDIP(5));
+            dc.DrawText(wxString::Format("%.4g", xmax), left + width - FromDIP(45), top + height + FromDIP(5));
+            dc.SetPen(wxPen(wxSystemSettings::GetColour(wxSYS_COLOUR_HOTLIGHT), FromDIP(2)));
+            for (size_t i = 1; i < line.size(); ++i)
+                dc.DrawLine(map(line[i - 1]), map(line[i]));
+            if (show_points) {
+                dc.SetPen(wxPen(GetForegroundColour()));
+                dc.SetBrush(wxBrush(GetForegroundColour()));
+                for (const auto& p : points)
+                    dc.DrawCircle(map(p), FromDIP(3));
+            }
+        });
+    }
+};
+} // namespace
+struct CalibratedMaterialsPanel::Impl
+{
+    CalibratedMaterialsPanel* panel;
+    wxChoice *materials{}, *parameter{}, *property{}, *mode{};
+    wxTextCtrl *name{}, *type{}, *query{}, *low{}, *high{}, *details{};
+    wxColourPickerCtrl* color{};
+    wxGrid *sheet{}, *data{};
+    MaterialCurve* graph{};
+    Json library, record;
+    std::string key;
+    SA::Material material;
+    ME::Context context;
+    std::vector<size_t> data_indices;
+    explicit Impl(CalibratedMaterialsPanel* p) : panel(p) {}
+    template<class F> void guarded(F action)
+    {
+        try {
+            action();
+        } catch (const std::exception& e) {
+            wxMessageBox(wxString::FromUTF8(e.what()), _L("Calibrated materials"), wxOK | wxICON_ERROR, panel);
+        }
+    }
+    void refresh()
+    {
+        library = boost::filesystem::exists(root_path() / "materials.json") ? read_json(root_path() / "materials.json") :
+                                                                              Json{{"version", 1}, {"materials", Json::array()}};
+        if (library.at("version") != 1)
+            throw std::runtime_error("Unsupported material library version.");
+        materials->Clear();
+        int selected = 0;
+        for (size_t i = 0; i < library["materials"].size(); ++i) {
+            SA::Setup setup;
+            std::string error;
+            if (!SA::deserialize_setup(library["materials"][i].at("setup").dump(), setup, &error))
+                throw std::runtime_error(error);
+            materials->Append(wxString::FromUTF8(setup.material.name));
+            if (setup.material.key == key)
+                selected = int(i);
+        }
+        if (materials->GetCount()) {
+            materials->SetSelection(selected);
+            select();
+        } else {
+            key.clear();
+            sheet->ClearGrid();
+            details->ChangeValue(_L("No calibrated materials yet. Save experimental data from Calibration → Load."));
+            if (data->GetNumberRows())
+                data->DeleteRows(0, data->GetNumberRows());
+            graph->line.clear();
+            graph->points.clear();
+            graph->Refresh();
+        }
+    }
+    void select()
+    {
+        const int index = materials->GetSelection();
+        if (index < 0)
+            return;
+        const auto& row = library["materials"][size_t(index)];
+        SA::Setup setup;
+        if (!SA::deserialize_setup(row.at("setup").dump(), setup))
+            throw std::runtime_error("Invalid material.");
+        material = setup.material;
+        key      = material.key;
+        record   = material.experimental_data.empty() ? ME::create(material) : Json::parse(material.experimental_data);
+        ME::validate(record);
+        context = record.at("reference").get<ME::Context>();
+        for (const auto& [k, v] : material.experimental_context)
+            context[k] = v;
+        name->ChangeValue(wxString::FromUTF8(material.name));
+        type->ChangeValue(wxString::FromUTF8(row.value("type", "")));
+        wxColour chosen(wxString::FromUTF8(row.value("color", "#FFFFFF")));
+        color->SetColour(chosen.IsOk() ? chosen : *wxWHITE);
+        const auto previous_parameter = parameter->GetStringSelection();
+        parameter->Clear();
+        for (auto it = record["modes"].begin(); it != record["modes"].end(); ++it)
+            parameter->Append(wxString::FromUTF8(it.key()));
+        if (parameter->FindString("direct") == wxNOT_FOUND)
+            parameter->Append("direct");
+        for (const auto& setting : LC::settings())
+            if (parameter->FindString(wxString::FromUTF8(setting.key)) == wxNOT_FOUND)
+                parameter->Append(wxString::FromUTF8(setting.key));
+        parameter->SetSelection(0);
+        if (parameter->FindString(previous_parameter) != wxNOT_FOUND)
+            parameter->SetStringSelection(previous_parameter);
+        if (property->GetSelection() < 0)
+            property->SetSelection(0);
+        update_controls();
+        render();
+    }
+    std::string parameter_key() const { return parameter->GetStringSelection().ToUTF8().data(); }
+    std::string property_key() const { return ME::properties().at(property->GetSelection()).key; }
+    void update_controls()
+    {
+        if (key.empty())
+            return;
+        const auto p = parameter_key();
+        mode->SetSelection(record["modes"].value(p, "regressed") == "simple" ? 1 : 0);
+        query->ChangeValue(wxString::FromUTF8(context.count(p) ? context[p] : ""));
+        const auto prop = property_key();
+        low->Clear();
+        high->Clear();
+        if (record["ranges"].contains(prop)) {
+            low->ChangeValue(wxString::Format("%.9g", record["ranges"][prop][0].get<double>()));
+            high->ChangeValue(wxString::Format("%.9g", record["ranges"][prop][1].get<double>()));
+        }
+    }
+    void render()
+    {
+        if (key.empty())
+            return;
+        std::map<std::string, ME::Prediction> predictions;
+        material.experimental_data = record.dump();
+        const auto evaluated       = ME::evaluate(material, context, &predictions);
+        for (size_t i = 0; i < ME::properties().size(); ++i) {
+            const auto& prop   = ME::properties()[i];
+            const auto& fit    = predictions.at(prop.key);
+            const double value = evaluated.*(prop.member), base = record["base"][prop.key];
+            sheet->SetCellValue(int(i), 0, _(prop.label));
+            sheet->SetCellValue(int(i), 1, wxString::Format("%.6g", value));
+            sheet->SetCellValue(int(i), 2, fit.experimental ? _L("Calculated") : _L("Inherited"));
+            sheet->SetCellValue(int(i), 3, wxString::Format("%u", unsigned(fit.points)));
+            sheet->SetCellValue(int(i), 4, wxString::Format("%.6g", base));
+            sheet->SetCellValue(int(i), 5, wxString::Format("%.1f%%", 100 * value / base));
+            wxString range = _L("Not supplied");
+            if (record["ranges"].contains(prop.key)) {
+                double lo = record["ranges"][prop.key][0], hi = record["ranges"][prop.key][1];
+                range = wxString::Format("%.4g–%.4g (%.1f%%)", lo, hi, 100 * (value - lo) / (hi - lo));
+            }
+            sheet->SetCellValue(int(i), 6, range);
+            if (!fit.experimental && std::string(prop.key).find("yield_strength") == 0 && value < base)
+                sheet->SetCellValue(int(i), 2, _L("Capped estimate"));
+        }
+        if (data->GetNumberRows())
+            data->DeleteRows(0, data->GetNumberRows());
+        data_indices.clear();
+        const auto prop  = property_key();
+        const auto param = parameter_key();
+        for (size_t i = 0; i < record["observations"].size(); ++i) {
+            const auto& o = record["observations"][i];
+            if (o["property"] != prop)
+                continue;
+            data_indices.push_back(i);
+            const int row = data->GetNumberRows();
+            data->AppendRows(1);
+            data->SetCellValue(row, 0, wxString::FromUTF8(o.at("id").get<std::string>()));
+            data->SetCellValue(row, 1, wxString::FromUTF8(o.at("parameter").get<std::string>()));
+            data->SetCellValue(row, 2, wxString::FromUTF8(o.at("value").get<std::string>()));
+            data->SetCellValue(row, 3, o["measured"].is_null() ? wxString() : wxString::Format("%.6g", o["measured"].get<double>()));
+            data->SetCellValue(row, 4,
+                               o.value("excluded", false) ? _L("Excluded") :
+                               o["outcome"] == 1          ? _L("Failure / measured") :
+                               o["outcome"] == 2          ? _L("Survived (lower bound)") :
+                                                            _L("Not tested"));
+            data->SetCellValue(row, 5, wxString::FromUTF8(o.value("source", "")));
+            data->SetCellValue(row, 6, wxString::FromUTF8(o.value("notes", "")));
+        }
+        const auto fit = predictions.at(prop);
+        details->ChangeValue(
+            wxString::Format(_L("%s\n%u usable measurements across %u configurations. RMSE: %.4g (property units). %s\nBase: %s. Ranges "
+                                "are supplied by the user; no manufacturer range is inferred from a generic estimate.\nFits exclude "
+                                "survived, untested, and excluded points. Inherited properties are not measurements."),
+                             wxString::FromUTF8(fit.model), unsigned(fit.points), unsigned(fit.configurations), fit.rmse,
+                             fit.extrapolated ? _L("Extrapolation outside measured settings.") :
+                                                _L("Within measured settings or inherited."),
+                             wxString::FromUTF8(record.value("base_name", ""))));
+        graph->line.clear();
+        graph->points.clear();
+        double xmin = std::numeric_limits<double>::infinity(), xmax = -xmin;
+        for (const auto& o : record["observations"]) {
+            if (o["property"] != prop || o.value("excluded", false) || o["outcome"] != 1 || o["measured"].is_null())
+                continue;
+            const auto inputs = o.at("context").get<ME::Context>();
+            if (!inputs.count(param))
+                continue;
+            double x;
+            if (!wxString::FromUTF8(inputs.at(param)).ToDouble(&x))
+                continue;
+            graph->points.emplace_back(x, o["measured"].get<double>());
+            xmin = std::min(xmin, x);
+            xmax = std::max(xmax, x);
+        }
+        double q;
+        if (query->GetValue().ToDouble(&q) && std::isfinite(q)) {
+            xmin = std::min(xmin, q);
+            xmax = std::max(xmax, q);
+        }
+        if (std::isfinite(xmin) && xmax > xmin) {
+            for (int i = 0; i <= 40; ++i) {
+                double x      = xmin + (xmax - xmin) * i / 40;
+                auto inputs   = context;
+                inputs[param] = wxString::Format("%.12g", x).ToUTF8().data();
+                const auto p  = ME::predict(record, prop, inputs);
+                if (p.experimental)
+                    graph->line.emplace_back(x, p.value);
+            }
+        }
+        if (record["modes"].value(param, "regressed") == "simple")
+            graph->line.clear();
+        graph->caption = wxString::FromUTF8(prop + " by " + param);
+        graph->Refresh();
+        panel->FitInside();
+    }
+    void commit()
+    {
+        if (key.empty())
+            throw std::invalid_argument("Select a material.");
+        ME::validate(record);
+        material.experimental_data    = record.dump();
+        material.experimental_context = context;
+        material                      = ME::evaluate(material, context);
+        auto current                  = read_json(root_path() / "materials.json");
+        bool found                    = false;
+        for (auto& row : current["materials"]) {
+            SA::Setup setup;
+            if (!SA::deserialize_setup(row.at("setup").dump(), setup) || setup.material.key != key)
+                continue;
+            material.name = utf8(name);
+            if (material.name.find(" -- CALIBRATED") == std::string::npos)
+                material.name += " -- CALIBRATED";
+            setup.material = material;
+            row["setup"]   = Json::parse(SA::serialize_setup(setup));
+            row["type"]    = utf8(type);
+            row["color"]   = color->GetColour().GetAsString(wxC2S_HTML_SYNTAX).ToUTF8().data();
+            found          = true;
+            break;
+        }
+        if (!found)
+            throw std::runtime_error("Material was removed. Refresh the library.");
+        write_json(root_path() / "materials.previous.json", read_json(root_path() / "materials.json"));
+        write_json(root_path() / "materials.json", current);
+        refresh_catalog();
+        refresh();
+    }
+    void settings()
+    {
+        if (key.empty())
+            throw std::invalid_argument("Select a material.");
+        record["modes"][parameter_key()] = mode->GetSelection() == 1 ? "simple" : "regressed";
+        if (!query->GetValue().empty())
+            context[parameter_key()] = utf8(query);
+        const auto prop = property_key();
+        if (low->GetValue().empty() && high->GetValue().empty())
+            record["ranges"].erase(prop);
+        else
+            record["ranges"][prop] = {number(low), number(high)};
+        commit();
+    }
+    void exclude()
+    {
+        if (key.empty())
+            return;
+        std::vector<int> selected;
+        for (int i = 0; i < data->GetNumberRows(); ++i) {
+            bool chosen = false;
+            for (int c = 0; c < data->GetNumberCols(); ++c)
+                chosen |= data->IsInSelection(i, c);
+            if (chosen)
+                selected.push_back(i);
+        }
+        if (selected.empty() && data->GetGridCursorRow() >= 0)
+            selected.push_back(data->GetGridCursorRow());
+        for (int row : selected) {
+            auto& o       = record["observations"][data_indices.at(size_t(row))];
+            o["excluded"] = !o.value("excluded", false);
+        }
+        commit();
+    }
+    void add_measurement()
+    {
+        if (key.empty())
+            throw std::invalid_argument("Select a material first.");
+        wxTextEntryDialog dialog(panel,
+                                 _L("Enter the measured property value in the units shown in the data sheet. This records a direct "
+                                    "measurement at the current settings."),
+                                 _L("Add measurement"));
+        if (dialog.ShowModal() != wxID_OK)
+            return;
+        double value;
+        if (!dialog.GetValue().ToDouble(&value) || !std::isfinite(value) || value <= 0)
+            throw std::invalid_argument("Enter a positive finite measurement.");
+        auto inputs  = context;
+        const auto p = parameter_key();
+        if (!query->GetValue().empty())
+            inputs[p] = utf8(query);
+        record["observations"].push_back({{"id", "manual/" + boost::filesystem::unique_path("%%%%-%%%%-%%%%").string()},
+                                          {"property", property_key()},
+                                          {"parameter", p},
+                                          {"value", inputs.count(p) ? inputs[p] : "direct"},
+                                          {"context", inputs},
+                                          {"measured", value},
+                                          {"outcome", 1},
+                                          {"excluded", false},
+                                          {"source", "Manual measured property"},
+                                          {"notes", ""}});
+        record["modes"][p] = mode->GetSelection() == 1 ? "simple" : "regressed";
+        commit();
+    }
+    void remove()
+    {
+        if (key.empty())
+            return;
+        auto current = read_json(root_path() / "materials.json");
+        auto& rows   = current["materials"];
+        rows.erase(std::remove_if(rows.begin(), rows.end(),
+                                  [&](const Json& row) {
+                                      SA::Setup setup;
+                                      return SA::deserialize_setup(row.at("setup").dump(), setup) && setup.material.key == key;
+                                  }),
+                   rows.end());
+        write_json(root_path() / "materials.previous.json", read_json(root_path() / "materials.json"));
+        write_json(root_path() / "materials.json", current);
+        refresh_catalog();
+        key.clear();
+        refresh();
+    }
+    void export_material()
+    {
+        if (key.empty())
+            return;
+        wxFileDialog file(panel, _L("Export calibrated material"), "", "calibrated-material.json", _L("JSON files (*.json)|*.json"),
+                          wxFD_SAVE | wxFD_OVERWRITE_PROMPT);
+        if (file.ShowModal() != wxID_OK)
+            return;
+        write_json(file.GetPath().ToUTF8().data(),
+                   Json{{"version", 1}, {"materials", Json::array({library["materials"][materials->GetSelection()]})}});
+    }
+    void import_material()
+    {
+        wxFileDialog file(panel, _L("Import calibrated materials"), "", "", _L("JSON files (*.json)|*.json"),
+                          wxFD_OPEN | wxFD_FILE_MUST_EXIST);
+        if (file.ShowModal() != wxID_OK)
+            return;
+        const boost::filesystem::path path(file.GetPath().ToUTF8().data());
+        if (boost::filesystem::file_size(path) > 20 * 1024 * 1024)
+            throw std::invalid_argument("Material import is limited to 20 MB.");
+        auto incoming = read_json(path);
+        if (incoming.at("version") != 1 || !incoming.at("materials").is_array() || incoming["materials"].size() > 100)
+            throw std::invalid_argument("Invalid material library.");
+        auto current = boost::filesystem::exists(root_path() / "materials.json") ? read_json(root_path() / "materials.json") :
+                                                                                   Json{{"version", 1}, {"materials", Json::array()}};
+        for (auto row : incoming["materials"]) {
+            SA::Setup setup;
+            std::string error;
+            if (!SA::deserialize_setup(row.at("setup").dump(), setup, &error) || !setup.material.validate().empty())
+                throw std::invalid_argument("Invalid imported material: " + error);
+            setup.material.key = "calibrated_" + boost::filesystem::unique_path("%%%%-%%%%-%%%%").string();
+            row["setup"]       = Json::parse(SA::serialize_setup(setup));
+            current["materials"].push_back(row);
+            key = setup.material.key;
+        }
+        if (boost::filesystem::exists(root_path() / "materials.json"))
+            write_json(root_path() / "materials.previous.json", read_json(root_path() / "materials.json"));
+        write_json(root_path() / "materials.json", current);
+        refresh_catalog();
+        refresh();
+    }
+};
+CalibratedMaterialsPanel::CalibratedMaterialsPanel(wxWindow* parent) : wxScrolledWindow(parent, wxID_ANY), m(std::make_unique<Impl>(this))
+{
+    SetScrollRate(FromDIP(10), FromDIP(10));
+    const int gap = FromDIP(8);
+    auto* root    = new wxBoxSizer(wxVERTICAL);
+    SetSizer(root);
+    auto text = [&](const wxString& value) {
+        auto* label = new wxStaticText(this, wxID_ANY, value);
+        label->Wrap(FromDIP(1000));
+        root->Add(label, 0, wxEXPAND | wxALL, gap);
+    };
+    text(_L("Calibrated materials — data, models, and inherited properties"));
+    auto* toolbar = new wxBoxSizer(wxHORIZONTAL);
+    root->Add(toolbar, 0, wxEXPAND | wxALL, gap);
+    m->materials = new wxChoice(this, wxID_ANY);
+    toolbar->Add(m->materials, 1, wxRIGHT, gap);
+    auto button = [&](const wxString& label, auto action) {
+        auto* b = new wxButton(this, wxID_ANY, label);
+        toolbar->Add(b, 0, wxRIGHT, gap);
+        b->Bind(wxEVT_BUTTON, [this, action](wxCommandEvent&) { m->guarded(action); });
+    };
+    button(_L("Refresh"), [this] { m->refresh(); });
+    button(_L("Import"), [this] { m->import_material(); });
+    button(_L("Export"), [this] { m->export_material(); });
+    button(_L("Delete material"), [this] { m->remove(); });
+    auto* form = new wxFlexGridSizer(2, gap, gap);
+    form->AddGrowableCol(1, 1);
+    root->Add(form, 0, wxEXPAND | wxALL, gap);
+    auto field = [&](const wxString& label, wxWindow* control) {
+        form->Add(new wxStaticText(this, wxID_ANY, label), 0, wxALIGN_CENTER_VERTICAL);
+        form->Add(control, 1, wxEXPAND);
+    };
+    m->name = new wxTextCtrl(this, wxID_ANY);
+    field(_L("Name"), m->name);
+    m->type = new wxTextCtrl(this, wxID_ANY);
+    field(_L("Material type"), m->type);
+    m->color = new wxColourPickerCtrl(this, wxID_ANY, *wxWHITE);
+    field(_L("Color"), m->color);
+    m->sheet = new wxGrid(this, wxID_ANY, wxDefaultPosition, FromDIP(wxSize(1000, 280)));
+    m->sheet->CreateGrid(int(ME::properties().size()), 7);
+    m->sheet->EnableEditing(false);
+    const wxString cols[] =
+        {_L("Property / units"),         _L("Value"), _L("Source"), _L("Data points"), _L("Base estimate"), _L("% of base"),
+         _L("Expected range / position")};
+    for (int i = 0; i < 7; ++i) {
+        m->sheet->SetColLabelValue(i, cols[i]);
+        m->sheet->SetColSize(i, FromDIP(i == 0 || i == 6 ? 230 : 130));
+    }
+    root->Add(m->sheet, 0, wxEXPAND | wxALL, gap);
+    form = new wxFlexGridSizer(2, gap, gap);
+    form->AddGrowableCol(1, 1);
+    root->Add(form, 0, wxEXPAND | wxALL, gap);
+    m->parameter = new wxChoice(this, wxID_ANY);
+    field(_L("Parameter"), m->parameter);
+    m->property = new wxChoice(this, wxID_ANY);
+    for (const auto& p : ME::properties())
+        m->property->Append(_(p.label));
+    m->property->SetSelection(8);
+    field(_L("Property"), m->property);
+    m->mode = new wxChoice(this, wxID_ANY);
+    m->mode->Append(_L("Regressed (default)"));
+    m->mode->Append(_L("Simple"));
+    m->mode->SetSelection(0);
+    field(_L("Per-parameter calculation"), m->mode);
+    m->query = new wxTextCtrl(this, wxID_ANY);
+    field(_L("Evaluate / graph through value"), m->query);
+    m->low = new wxTextCtrl(this, wxID_ANY);
+    field(_L("Expected base range minimum (property units)"), m->low);
+    m->high = new wxTextCtrl(this, wxID_ANY);
+    field(_L("Expected base range maximum (property units)"), m->high);
+    toolbar = new wxBoxSizer(wxHORIZONTAL);
+    root->Add(toolbar, 0, wxALL, gap);
+    button(_L("Save settings and recalculate"), [this] { m->settings(); });
+    button(_L("Add measured property"), [this] { m->add_measurement(); });
+    auto* show = new wxCheckBox(this, wxID_ANY, _L("Show experimental data points"));
+    show->SetValue(true);
+    root->Add(show, 0, wxALL, gap);
+    m->graph = new MaterialCurve(this);
+    root->Add(m->graph, 0, wxEXPAND | wxALL, gap);
+    m->details = new wxTextCtrl(this, wxID_ANY, "", wxDefaultPosition, FromDIP(wxSize(1000, 100)), wxTE_MULTILINE | wxTE_READONLY);
+    root->Add(m->details, 0, wxEXPAND | wxALL, gap);
+    text(_L("Data for the selected property. Exclude faulty measurements to remove them from fits; toggle again to restore them. Library "
+            "edits keep a materials.previous.json recovery copy."));
+    m->data = new wxGrid(this, wxID_ANY, wxDefaultPosition, FromDIP(wxSize(1000, 260)));
+    m->data->CreateGrid(0, 7);
+    m->data->EnableEditing(false);
+    const wxString data_cols[] = {_L("Data point ID"), _L("Parameter"),    _L("Setting"), _L("Measurement"),
+                                  _L("Status"),        _L("Source study"), _L("Notes")};
+    for (int i = 0; i < 7; ++i) {
+        m->data->SetColLabelValue(i, data_cols[i]);
+        m->data->SetColSize(i, FromDIP(i == 0 ? 280 : i == 4 ? 200 : 150));
+    }
+    root->Add(m->data, 0, wxEXPAND | wxALL, gap);
+    toolbar = new wxBoxSizer(wxHORIZONTAL);
+    root->Add(toolbar, 0, wxALL, gap);
+    button(_L("Exclude / restore selected data"), [this] { m->exclude(); });
+    m->materials->Bind(wxEVT_CHOICE, [this](wxCommandEvent&) { m->guarded([&] { m->select(); }); });
+    for (auto* choice : {m->parameter, m->property})
+        choice->Bind(wxEVT_CHOICE, [this](wxCommandEvent&) {
+            m->guarded([&] {
+                m->update_controls();
+                m->render();
+            });
+        });
+    show->Bind(wxEVT_CHECKBOX, [this, show](wxCommandEvent&) {
+        m->graph->show_points = show->GetValue();
+        m->graph->Refresh();
+    });
+    m->guarded([&] { m->refresh(); });
+    update_colors();
+    FitInside();
+}
+CalibratedMaterialsPanel::~CalibratedMaterialsPanel() = default;
+bool CalibratedMaterialsPanel::Show(bool show)
+{
+    if (show)
+        m->guarded([&] { m->refresh(); });
+    return wxScrolledWindow::Show(show);
+}
+void CalibratedMaterialsPanel::update_colors()
+{
+    wxGetApp().UpdateDarkUIWin(this);
+    for (auto* grid : {m->sheet, m->data}) {
+        grid->SetDefaultCellBackgroundColour(GetBackgroundColour());
+        grid->SetDefaultCellTextColour(GetForegroundColour());
+        grid->SetLabelBackgroundColour(GetBackgroundColour());
+        grid->SetLabelTextColour(GetForegroundColour());
+        grid->ForceRefresh();
+    }
+}
 } // namespace Slic3r::GUI

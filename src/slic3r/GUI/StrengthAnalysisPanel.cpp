@@ -30,6 +30,7 @@
 #include <wx/settings.h>
 #include <wx/sizer.h>
 #include <wx/slider.h>
+#include <wx/spinctrl.h>
 #include <wx/statbox.h>
 #include <wx/stattext.h>
 #include <wx/textctrl.h>
@@ -130,6 +131,8 @@ class StudyToolbar final : public wxPanel
         if (key == "structure") return _L("Edit the background and dense infill patterns, densities, and stress threshold.");
         if (key == "dense" || key == "print-dense") return _L("Open the stress-directed dense-region preview before applying a slicer modifier.");
         if (key == "orientation") return _L("Apply the best estimated print orientation to the selected instance. Solve again after applying.");
+        if (key == "model") return _L("Show or hide the model surface and wireframe.");
+        if (key == "modifiers") return _L("Show or hide density modifier regions.");
         if (key == "settings") return _L("Apply the feasible optimized print settings to the selected object. Solve again after applying.");
         if (key == "undo") return _L("Undo the previous study setup edit. Use Cmd/Ctrl+Z from the Load workspace.");
         if (key == "redo") return _L("Restore an undone study setup edit. Use Cmd/Ctrl+Shift+Z from the Load workspace.");
@@ -2197,8 +2200,8 @@ void StrengthLoadPanel::build_ui()
     m_remove_dense_button = new wxButton(this, wxID_ANY, _L("Remove dense modifier"));
     m_orientation_button = new wxButton(this, wxID_ANY, _L("Apply best orientation"));
     m_settings_button = new wxButton(this, wxID_ANY, _L("Apply optimized settings"));
-    toolbar->command(study_group, "dense", m_dense_button, _L("Dense region"), "strength_dense");
-    toolbar->command(print_group, "print-dense", m_dense_button, _L("Dense region"), "strength_dense", false);
+    toolbar->command(study_group, "dense", m_dense_button, _L("Show Dense Region"), "strength_dense");
+    toolbar->command(print_group, "print-dense", m_dense_button, _L("Show Dense Region"), "strength_dense", false);
     toolbar->command(print_group, "orientation", m_orientation_button, _L("Orientation"), "strength_orientation");
     toolbar->command(print_group, "settings", m_settings_button, _L("Settings"), "strength_settings", false);
     toolbar->command(print_group, "remove-dense", m_remove_dense_button, _L("Remove dense modifier"), "strength_delete", false);
@@ -2537,6 +2540,21 @@ void StrengthLoadPanel::load_selected_object()
         m_setup_history_index = 0;
         update_setup_history_buttons();
         m_status_label->SetLabel(_L("Strength setup changed through the main Undo/Redo history; results require a new solve."));
+    }
+    const auto &process = m_session->print_settings;
+    if (m_plater->config() && (std::abs(m_session->setup.infill.background_density - process.background_density) > 1e-10 ||
+        (process.unsupported_print_pattern.empty() && m_session->setup.infill.background_pattern != process.background_pattern))) {
+        m_session->setup.infill.background_density = process.background_density;
+        if (process.unsupported_print_pattern.empty()) m_session->setup.infill.background_pattern = process.background_pattern;
+        m_session->setup.infill.dense_density = std::max(m_session->setup.infill.dense_density, process.background_density);
+        auto &densities = m_session->setup.infill.intermediate_densities;
+        densities.erase(std::remove_if(densities.begin(), densities.end(), [&](double density) {
+            return density <= process.background_density;
+        }), densities.end());
+        m_session->stale = true;
+        ++m_session->revision;
+        populate_from_setup();
+        if (stored_setup_readable) persist_setup(false);
     }
     if (changed_instance || new_object || changed_persisted_setup) {
         m_session->setup.geometry_scale = instance_transform.linear().colwise().norm().transpose();
@@ -3663,6 +3681,11 @@ void StrengthLoadPanel::edit_material_dialog()
 
 void StrengthLoadPanel::edit_infill_dialog()
 {
+    load_selected_object();
+    if (m_session->object_index < 0 || size_t(m_session->object_index) >= m_plater->model().objects.size()) {
+        m_status_label->SetLabel(_L("Select a part before editing its print structure."));
+        return;
+    }
     wxDialog dialog(this, wxID_ANY, _L("Print structure and dense-region strategy"), wxDefaultPosition, wxDefaultSize,
                     wxDEFAULT_DIALOG_STYLE | wxRESIZE_BORDER);
     const int gap = FromDIP(8);
@@ -3678,11 +3701,46 @@ void StrengthLoadPanel::edit_infill_dialog()
     dense_pattern->SetSelection(int(m_session->setup.infill.dense_pattern));
     auto *background_density = number_input(&dialog, m_session->setup.infill.background_density * 100.0);
     auto *dense_density = number_input(&dialog, m_session->setup.infill.dense_density * 100.0);
+    auto *polygonal = new wxCheckBox(&dialog, wxID_ANY, _L("Polygonal contours"));
+    polygonal->SetValue(m_session->setup.infill.polygonal_contours);
+    auto *count = new wxSpinCtrl(&dialog, wxID_ANY);
+    count->SetRange(1, 16);
+    count->SetValue(int(m_session->setup.infill.intermediate_densities.size() + 1));
+    auto *regions = new wxPanel(&dialog);
+    auto *region_grid = new wxFlexGridSizer(2, gap, gap);
+    region_grid->AddGrowableCol(1, 1);
+    regions->SetSizer(region_grid);
+    std::vector<wxTextCtrl *> region_inputs;
+    const auto rebuild_regions = [&] {
+        std::vector<double> saved;
+        for (wxTextCtrl *input : region_inputs) { double value = 0.0; read_number(input, value); saved.push_back(value); }
+        region_grid->Clear(true);
+        region_inputs.clear();
+        double highest = 65.0, background = 20.0;
+        read_number(dense_density, highest);
+        read_number(background_density, background);
+        for (int i = 1; i < count->GetValue(); ++i) {
+            const double value = size_t(i - 1) < saved.size() ? saved[i - 1] :
+                size_t(i - 1) < m_session->setup.infill.intermediate_densities.size() ?
+                m_session->setup.infill.intermediate_densities[i - 1] * 100.0 :
+                background + (highest - background) * (count->GetValue() - i) / count->GetValue();
+            auto *input = number_input(regions, value);
+            region_inputs.push_back(input);
+            add_labeled(region_grid, regions, wxString::Format(_L("Region %d density (%%)"), i + 1), input, 1);
+        }
+        regions->Layout();
+        if (dialog.GetSizer()) dialog.GetSizer()->Fit(&dialog);
+    };
+    count->Bind(wxEVT_SPINCTRL, [&](wxSpinEvent &) { rebuild_regions(); });
+    rebuild_regions();
     auto *threshold = number_input(&dialog, m_session->setup.infill.dense_stress_threshold * 100.0);
     add_labeled(grid, &dialog, _L("Background pattern"), background_pattern, 1);
     add_labeled(grid, &dialog, _L("Background density (%)"), background_density, 1);
     add_labeled(grid, &dialog, _L("Dense-region pattern"), dense_pattern, 1);
-    add_labeled(grid, &dialog, _L("Dense-region density (%)"), dense_density, 1);
+    add_labeled(grid, &dialog, _L("Number of dense regions"), count, 1);
+    add_labeled(grid, &dialog, _L("Region 1 density (%) — densest"), dense_density, 1);
+    add_labeled(grid, &dialog, _L("Additional densities (descending)"), regions, 1);
+    add_labeled(grid, &dialog, _L("Modifier shape"), polygonal, 1);
     add_labeled(grid, &dialog, _L("Stress threshold (% of peak)"), threshold, 1);
     root->Add(grid, 1, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
     root->Add(dialog.CreateStdDialogButtonSizer(wxOK | wxCANCEL), 0, wxEXPAND | wxALL, gap);
@@ -3705,6 +3763,21 @@ void StrengthLoadPanel::edit_infill_dialog()
         candidate.infill.background_density = background / 100.0;
         candidate.infill.dense_density = dense / 100.0;
         candidate.infill.dense_stress_threshold = stress / 100.0;
+        candidate.infill.polygonal_contours = polygonal->GetValue();
+        candidate.infill.intermediate_densities.clear();
+        double previous = dense;
+        bool regions_valid = true;
+        for (wxTextCtrl *input : region_inputs) {
+            double value = 0.0;
+            if (!read_number(input, value) || value >= previous || value <= background) regions_valid = false;
+            candidate.infill.intermediate_densities.push_back(value / 100.0);
+            previous = value;
+        }
+        if (!regions_valid) {
+            wxMessageBox(_L("Region densities must be strictly descending and above the background density."),
+                         _L("Invalid print structure"), wxOK | wxICON_WARNING, &dialog);
+            continue;
+        }
         const std::vector<std::string> validation = SA::validate(m_session->mesh, candidate);
         const auto weaker = std::find_if(validation.begin(), validation.end(), [](const std::string &message) {
             return message.find("must not be weaker or less stiff") != std::string::npos;
@@ -3714,8 +3787,16 @@ void StrengthLoadPanel::edit_infill_dialog()
                          wxOK | wxICON_WARNING, &dialog);
             continue;
         }
+        m_plater->take_snapshot("Change strength print structure");
         m_session->setup.infill = candidate.infill;
+        ModelObject *object = m_plater->model().objects[size_t(m_session->object_index)];
+        object->config.set_key_value("sparse_infill_density", new ConfigOptionPercent(background));
+        object->config.set_key_value("sparse_infill_pattern",
+            new ConfigOptionEnum<Slic3r::InfillPattern>(print_pattern(candidate.infill.background_pattern)));
         populate_from_setup();
+        persist_setup(false);
+        m_plater->changed_object(m_session->object_index);
+        m_plater->set_plater_dirty(true);
         mark_stale();
         return;
     }
@@ -3734,6 +3815,11 @@ void StrengthLoadPanel::edit_criteria_dialog()
     grid->AddGrowableCol(1, 1);
     auto *minimum_sf = number_input(&dialog, m_session->setup.criteria.minimum_safety_factor);
     auto *maximum_displacement = number_input(&dialog, m_session->setup.criteria.maximum_displacement_mm);
+    auto *subdivisions = new wxSpinCtrl(&dialog, wxID_ANY);
+    subdivisions->SetRange(4, 64);
+    subdivisions->SetValue(int(m_session->setup.solver.subdivisions));
+    subdivisions->SetToolTip(_L("Longest-axis subdivisions for the study's reinforcement grid. Higher values resolve smaller regions and take longer."));
+    add_labeled(grid, &dialog, _L("Study subdivisions"), subdivisions, 1);
     std::array<wxTextCtrl *, 4> weights{
         number_input(&dialog, m_session->setup.criteria.mass_weight),
         number_input(&dialog, m_session->setup.criteria.stiffness_weight),
@@ -3763,6 +3849,7 @@ void StrengthLoadPanel::edit_criteria_dialog()
                          _L("Invalid optimization objectives"), wxOK | wxICON_WARNING, &dialog);
             continue;
         }
+        m_session->setup.solver.subdivisions = size_t(subdivisions->GetValue());
         m_session->setup.criteria.minimum_safety_factor = sf;
         m_session->setup.criteria.maximum_displacement_mm = displacement;
         m_session->setup.criteria.mass_weight = values[0];
@@ -3921,7 +4008,7 @@ void StrengthLoadPanel::run_analysis()
         std::shared_ptr<const SA::DenseRegionPreviewProfile> profile;
         if (result.succeeded()) {
             profile = std::make_shared<SA::DenseRegionPreviewProfile>(
-                SA::build_dense_region_preview_profile(mesh, result, [this] { return m_cancel.load(); }));
+                SA::build_dense_region_preview_profile(mesh, result, [this] { return m_cancel.load(); }, setup.solver.subdivisions));
             if (m_cancel.load()) {
                 result.status = SA::AnalysisStatus::Cancelled;
                 result.message = "Strength preview preparation was cancelled.";
@@ -3986,8 +4073,7 @@ void StrengthLoadPanel::on_analysis_finished()
     const bool ready = stored.succeeded();
     m_dense_button->Enable(ready);
     m_orientation_button->Enable(ready && !stored.orientation_recommendations.empty());
-    m_settings_button->Enable(ready && !stored.print_settings_candidates.empty() &&
-                              stored.print_settings_candidates.front().feasible);
+    m_settings_button->Enable(ready && !stored.print_settings_candidates.empty());
     refresh_study_tree();
     if (m_result_callback)
         m_result_callback();
@@ -4021,15 +4107,20 @@ bool StrengthLoadPanel::create_dense_modifier_from_preview(const SA::DenseRegion
     const SA::InfillSettings &infill = m_session->solved_setup.infill;
     m_plater->take_snapshot("Apply previewed strength dense-region modifier");
     ModelObject *object = m_plater->model().objects[size_t(index)];
-    ModelVolume *volume = object->add_volume(TriangleMesh(preview.modifier_mesh), ModelVolumeType::PARAMETER_MODIFIER, false);
-    volume->name = STRENGTH_MODIFIER_NAME;
-    // The preview mesh uses the same object coordinates as ModelObject::raw_mesh().
-    // Keep them intact; auto-centering would require an additional offset transform.
-    volume->set_transformation(Geometry::Transformation());
-    volume->config.set_key_value("sparse_infill_density", new ConfigOptionPercent(infill.dense_density * 100.0));
-    volume->config.set_key_value("sparse_infill_pattern",
-        new ConfigOptionEnum<Slic3r::InfillPattern>(print_pattern(infill.dense_pattern)));
-    volume->config.set_key_value("strength_analysis_modifier", new ConfigOptionBool(true));
+    std::vector<ModelVolume *> new_volumes;
+    for (size_t region = 0; region < preview.layers.size(); ++region) {
+        const auto &layer = preview.layers[region];
+        if (layer.mesh.empty()) continue;
+        ModelVolume *volume = object->add_volume(TriangleMesh(layer.mesh), ModelVolumeType::PARAMETER_MODIFIER, false);
+        new_volumes.push_back(volume);
+        volume->name = std::string(STRENGTH_MODIFIER_NAME) + " " + std::to_string(region + 1);
+        volume->set_transformation(Geometry::Transformation());
+        volume->config.set_key_value("sparse_infill_density", new ConfigOptionPercent(layer.density * 100.0));
+        volume->config.set_key_value("sparse_infill_pattern",
+            new ConfigOptionEnum<Slic3r::InfillPattern>(print_pattern(infill.dense_pattern)));
+        volume->config.set_key_value("strength_analysis_modifier", new ConfigOptionBool(true));
+    }
+    if (new_volumes.empty()) return false;
     object->config.set_key_value("sparse_infill_density", new ConfigOptionPercent(infill.background_density * 100.0));
     object->config.set_key_value("sparse_infill_pattern",
         new ConfigOptionEnum<Slic3r::InfillPattern>(print_pattern(infill.background_pattern)));
@@ -4037,7 +4128,7 @@ bool StrengthLoadPanel::create_dense_modifier_from_preview(const SA::DenseRegion
     // transform into its instances and change the object coordinates used by this preview.
     for (size_t volume_index = object->volumes.size(); volume_index-- > 0;) {
         const ModelVolume *candidate = object->volumes[volume_index];
-        if (candidate != volume && is_strength_dense_modifier(candidate))
+        if (std::find(new_volumes.begin(), new_volumes.end(), candidate) == new_volumes.end() && is_strength_dense_modifier(candidate))
             object->delete_volume(volume_index);
     }
     m_plater->changed_object(index);
@@ -4149,29 +4240,105 @@ void StrengthLoadPanel::apply_optimized_settings()
     const uint64_t revision = m_session->revision;
     load_selected_object();
     if (object_id != m_session->object_id || revision != m_session->revision ||
-        m_session->stale || m_session->result.print_settings_candidates.empty() ||
-        !m_session->result.print_settings_candidates.front().feasible)
+        m_session->stale || m_session->result.print_settings_candidates.empty())
         return;
     const int index = m_session->object_index;
     if (index < 0 || size_t(index) >= m_plater->model().objects.size())
         return;
-    const SA::PrintSettingsCandidate &candidate = m_session->result.print_settings_candidates.front();
+    const SA::PrintSettingsCandidate &suggested = m_session->result.print_settings_candidates.front();
+    SA::PrintSettingsCandidate current;
+    current.wall_loops = m_session->print_settings.wall_loops;
+    current.layer_height_mm = m_session->print_settings.layer_height_mm;
+    current.infill_density = m_session->setup.infill.background_density;
+    current.pattern = m_session->setup.infill.background_pattern;
+    wxDialog dialog(this, wxID_ANY, _L("Review suggested print settings"), wxDefaultPosition, wxDefaultSize,
+                    wxDEFAULT_DIALOG_STYLE | wxRESIZE_BORDER);
+    const int gap = FromDIP(8);
+    auto *root = new wxBoxSizer(wxVERTICAL);
+    auto *grid = new wxFlexGridSizer(4, gap, gap);
+    grid->AddGrowableCol(3, 1);
+    for (const auto &title : {_L("Apply"), _L("Setting"), _L("Current"), _L("Suggested / proposed")})
+        grid->Add(new wxStaticText(&dialog, wxID_ANY, title), 0, wxALIGN_CENTER_VERTICAL);
+    std::array<wxCheckBox *, 4> selected{};
+    auto *walls = number_input(&dialog, suggested.wall_loops);
+    auto *height = number_input(&dialog, suggested.layer_height_mm);
+    auto *density = number_input(&dialog, suggested.infill_density * 100.0);
+    auto *pattern = new wxChoice(&dialog, wxID_ANY, wxDefaultPosition, wxDefaultSize, infill_names());
+    pattern->SetSelection(int(suggested.pattern));
+    const std::array<wxString, 4> names{_L("Wall loops"), _L("Layer height (mm)"), _L("Infill density (%)"), _L("Infill pattern")};
+    const std::array<wxString, 4> values{number(current.wall_loops), number(current.layer_height_mm),
+        number(current.infill_density * 100.0), wxString::FromUTF8(SA::to_string(current.pattern))};
+    const std::array<wxWindow *, 4> inputs{walls, height, density, pattern};
+    for (size_t i = 0; i < selected.size(); ++i) {
+        selected[i] = new wxCheckBox(&dialog, wxID_ANY, wxEmptyString);
+        selected[i]->SetValue(true);
+        selected[i]->SetName(names[i]);
+        grid->Add(selected[i], 0, wxALIGN_CENTER_VERTICAL);
+        grid->Add(new wxStaticText(&dialog, wxID_ANY, names[i]), 0, wxALIGN_CENTER_VERTICAL);
+        grid->Add(new wxStaticText(&dialog, wxID_ANY, values[i]), 0, wxALIGN_CENTER_VERTICAL);
+        grid->Add(inputs[i], 1, wxEXPAND);
+    }
+    root->Add(grid, 0, wxEXPAND | wxALL, gap);
+    auto *prediction = new wxStaticText(&dialog, wxID_ANY, wxEmptyString);
+    root->Add(prediction, 0, wxEXPAND | wxALL, gap);
+    root->Add(new wxStaticText(&dialog, wxID_ANY,
+        _L("Live engineering estimates; print time is relative to the current settings. Slice for an absolute duration.\n"
+           "Safety factor requires a new solve after Apply; existing modifiers are not included in these estimates.")),
+        0, wxEXPAND | wxALL, gap);
+    root->Add(dialog.CreateStdDialogButtonSizer(wxOK | wxCANCEL), 0, wxEXPAND | wxALL, gap);
+    auto *apply = dynamic_cast<wxButton *>(dialog.FindWindow(wxID_OK));
+    apply->SetLabel(_L("Apply"));
+    SA::PrintSettingsCandidate candidate = current;
+    const auto update = [&] {
+        candidate = current;
+        double wall_value = current.wall_loops, layer_value = current.layer_height_mm, density_value = current.infill_density * 100.0;
+        bool valid = (!selected[0]->GetValue() || read_number(walls, wall_value)) &&
+            (!selected[1]->GetValue() || read_number(height, layer_value)) &&
+            (!selected[2]->GetValue() || read_number(density, density_value));
+        valid = valid && wall_value >= 1 && wall_value <= 100 && std::floor(wall_value) == wall_value &&
+            layer_value > 0.0 && layer_value <= 2.0 && density_value > 0.0 && density_value <= 100.0;
+        apply->Enable(valid);
+        if (!valid) { prediction->SetLabel(_L("Enter valid walls, layer height and density to preview.")); return; }
+        candidate.wall_loops = int(wall_value);
+        candidate.layer_height_mm = layer_value;
+        candidate.infill_density = density_value / 100.0;
+        if (selected[3]->GetValue()) candidate.pattern = SA::InfillPattern(pattern->GetSelection());
+        const auto estimate = SA::predict_print_settings(m_session->solved_setup, m_session->result, current, candidate);
+        prediction->SetLabel(wxString::Format(_L("Estimated weight: %.3f g\nEstimated minimum safety factor: %.4g\n"
+            "Estimated print time: %.1f%% of current"), estimate.estimated_mass_kg * 1000.0,
+            estimate.predicted_safety_factor, estimate.relative_print_time * 100.0));
+        if (m_session->solved_setup.gravity.enabled)
+            prediction->SetLabel(wxString::Format(_L("Estimated weight: %.3f g\nSafety factor: rerun required (gravity)\n"
+                "Estimated print time: %.1f%% of current"), estimate.estimated_mass_kg * 1000.0, estimate.relative_print_time * 100.0));
+        dialog.Layout();
+    };
+    for (auto *checkbox : selected) checkbox->Bind(wxEVT_CHECKBOX, [&](wxCommandEvent &) { update(); });
+    for (auto *input : {walls, height, density}) input->Bind(wxEVT_TEXT, [&](wxCommandEvent &) { update(); });
+    pattern->Bind(wxEVT_CHOICE, [&](wxCommandEvent &) { update(); });
+    update();
+    dialog.SetSizerAndFit(root);
+    dialog.CentreOnParent();
+    if (dialog.ShowModal() != wxID_OK) return;
+    if (std::none_of(selected.begin(), selected.end(), [](const wxCheckBox *check) { return check->GetValue(); })) return;
     m_plater->take_snapshot("Apply strength-optimized print settings");
     ModelObject *object = m_plater->model().objects[size_t(index)];
-    object->config.set_key_value("wall_loops", new ConfigOptionInt(candidate.wall_loops));
-    object->config.set_key_value("layer_height", new ConfigOptionFloat(candidate.layer_height_mm));
-    object->config.set_key_value("sparse_infill_density", new ConfigOptionPercent(candidate.infill_density * 100.0));
-    object->config.set_key_value("sparse_infill_pattern",
+    if (selected[0]->GetValue()) object->config.set_key_value("wall_loops", new ConfigOptionInt(candidate.wall_loops));
+    if (selected[1]->GetValue()) object->config.set_key_value("layer_height", new ConfigOptionFloat(candidate.layer_height_mm));
+    if (selected[2]->GetValue()) object->config.set_key_value("sparse_infill_density", new ConfigOptionPercent(candidate.infill_density * 100.0));
+    if (selected[3]->GetValue()) object->config.set_key_value("sparse_infill_pattern",
         new ConfigOptionEnum<Slic3r::InfillPattern>(print_pattern(candidate.pattern)));
     m_session->setup.infill.background_density = candidate.infill_density;
     m_session->setup.infill.background_pattern = candidate.pattern;
+    m_session->setup.infill.dense_density = std::max(m_session->setup.infill.dense_density, candidate.infill_density);
+    auto &regions = m_session->setup.infill.intermediate_densities;
+    regions.erase(std::remove_if(regions.begin(), regions.end(), [&](double value) { return value <= candidate.infill_density; }), regions.end());
     populate_from_setup();
     persist_setup(false);
     m_plater->changed_object(index);
+    m_plater->set_plater_dirty(true);
     mark_stale();
-    m_status_label->SetLabel(wxString::Format(_L("Applied %d walls, %.3g mm layers, %.3g%% %s infill. Rerun to validate."),
-        candidate.wall_loops, candidate.layer_height_mm, candidate.infill_density * 100.0,
-        wxString::FromUTF8(SA::to_string(candidate.pattern))));
+    m_status_label->SetLabel(_L("Applied selected print settings. Rerun to validate."));
+
 }
 
 class StrengthSimulationPanel::ResultCanvas final : public SoftwareViewport3D
@@ -4239,6 +4406,7 @@ public:
     void set_mode(int mode) { m_mode = mode; Refresh(); }
     void set_projection(int projection) { set_view(projection); }
     void set_deformation_scale(double scale) { m_deformation_scale = std::clamp(scale, 0.0, 10000.0); Refresh(); }
+    void set_show_model(bool value) { m_show_model = value; if (!value) clear_probe_card(); Refresh(); }
     void set_show_setup(bool value) { m_show_setup = value; Refresh(); }
     void set_show_wireframe(bool value) { m_show_wireframe = value; Refresh(); }
     void set_banded(bool value) { m_banded = value; Refresh(); }
@@ -4286,7 +4454,7 @@ protected:
             return;
         }
         if (!result.succeeded() || result.vertices.size() != mesh.vertices.size()) {
-            draw_reference_mesh(dc, camera, false);
+            if (m_show_model) draw_reference_mesh(dc, camera, false);
             if (m_show_setup)
                 draw_setup_glyphs(dc, camera);
             dc.SetTextForeground(wxColour(65, 72, 82));
@@ -4372,25 +4540,28 @@ protected:
                     result_bitmap.line(project(polygon[i].position, camera),
                                        project(polygon[(i + 1) % polygon.size()].position, camera), wxColour(62, 67, 73));
         }
-        result_bitmap.draw(dc);
+        if (m_show_model) result_bitmap.draw(dc);
 
-        if (m_show_wireframe && !m_section)
+        if (m_show_model && m_show_wireframe && !m_section)
             draw_reference_mesh(dc, camera, true);
         if (m_show_setup)
             draw_setup_glyphs(dc, camera);
         if (!m_section && m_show_dense_preview && m_dense_preview.available && !m_dense_preview.modifier_mesh.empty()) {
-            const wxColour colour = m_dense_preview.overlaps_preserve ? wxColour(207, 67, 67) : wxColour(118, 49, 190);
+            for (size_t layer_index = m_dense_preview.layers.size(); layer_index-- > 0;) {
+            const auto &layer = m_dense_preview.layers[layer_index];
+            if (layer.mesh.empty()) continue;
+            const wxColour colour = rainbow(0.1 + 0.8 * double(layer_index) / std::max(size_t(1), m_dense_preview.layers.size()));
             // X-ray the actual undeformed modifier mesh so interior reinforcement remains
             // visible through the contour surface. Depth-test the mask against itself.
             DepthBitmap mask(GetClientSize());
             std::vector<ScreenVertex> projected_mask;
-            projected_mask.reserve(m_dense_preview.modifier_mesh.vertices.size());
-            for (const Vec3f &vertex : m_dense_preview.modifier_mesh.vertices)
+            projected_mask.reserve(layer.mesh.vertices.size());
+            for (const Vec3f &vertex : layer.mesh.vertices)
                 projected_mask.push_back(project(vertex.cast<double>(), camera));
-            for (const Vec3i32 &triangle : m_dense_preview.modifier_mesh.indices) {
+            for (const Vec3i32 &triangle : layer.mesh.indices) {
                 if (!valid_triangle(triangle, projected_mask.size()))
                     continue;
-                const auto &vertices = m_dense_preview.modifier_mesh.vertices;
+                const auto &vertices = layer.mesh.vertices;
                 const Vec3d normal = (vertices[triangle[1]] - vertices[triangle[0]]).cast<double>().cross(
                     (vertices[triangle[2]] - vertices[triangle[0]]).cast<double>());
                 const double shade = normal.squaredNorm() > 1e-18 ?
@@ -4402,15 +4573,16 @@ protected:
             mask.draw(dc);
             const ScreenVertex center = project(m_dense_preview.region.center_mm, camera);
             dc.SetTextForeground(colour);
-            dc.DrawText(wxString::Format(_L("Stress-directed reinforcement %.1f%% (undeformed)"),
-                m_dense_preview.estimated_volume_fraction * 100.0), center.point + wxPoint(10, 8));
+            dc.DrawText(wxString::Format(_L("Region %zu: %.1f%% infill"), layer_index + 1, layer.density * 100.0),
+                center.point + FromDIP(wxPoint(10, 8 + int(layer_index) * 18)));
+            }
         }
 
-        if (!m_section) draw_extreme_marker(dc, minimum_vertex, _L("MIN"),
+        if (m_show_model && !m_section) draw_extreme_marker(dc, minimum_vertex, _L("MIN"),
                             m_mode == 0 ? wxColour(215, 52, 48) : wxColour(42, 92, 210));
-        if (!m_section) draw_extreme_marker(dc, maximum_vertex, _L("MAX"),
+        if (m_show_model && !m_section) draw_extreme_marker(dc, maximum_vertex, _L("MAX"),
                             m_mode == 0 ? wxColour(42, 92, 210) : wxColour(215, 52, 48));
-        draw_legend(dc, minimum, maximum);
+        if (m_show_model) draw_legend(dc, minimum, maximum);
         if (m_section) {
             dc.SetTextForeground(wxSystemSettings::GetColour(wxSYS_COLOUR_WINDOWTEXT));
             dc.DrawText(_L("Section: lower half along object Z • surface cut (uncapped)"), FromDIP(12), FromDIP(54));
@@ -4430,7 +4602,7 @@ protected:
 
     void clicked(const wxPoint &point, bool) override
     {
-        if (m_projected.empty())
+        if (!m_show_model || m_projected.empty())
             return;
         const indexed_triangle_set &mesh = display_mesh();
         bool found = false;
@@ -4474,6 +4646,7 @@ private:
     int m_mode{0};
     double m_deformation_scale{1.0};
     bool m_show_setup{true};
+    bool m_show_model{true};
     bool m_show_wireframe{true};
     bool m_banded{false};
     bool m_show_dense_preview{true};
@@ -4513,24 +4686,26 @@ private:
 
     bool previewed(size_t vertex) const
     {
-        return m_show_dense_preview && m_dense_preview.available && m_dense_preview.response_estimate_available &&
+        return m_dense_preview.available && m_dense_preview.response_estimate_available &&
             !m_dense_preview.overlaps_preserve &&
             std::binary_search(m_dense_preview.affected_vertices.begin(), m_dense_preview.affected_vertices.end(), vertex);
     }
 
     double preview_strength(size_t vertex) const
     {
-        return previewed(vertex) ? std::max(1e-12, m_dense_preview.local_strength_multiplier) : 1.0;
+        return previewed(vertex) && vertex < m_dense_preview.vertex_strength_multipliers.size() ?
+            std::max(1e-12, m_dense_preview.vertex_strength_multipliers[vertex]) : 1.0;
     }
 
     double preview_stiffness(size_t vertex) const
     {
-        return previewed(vertex) ? std::max(1e-12, m_dense_preview.local_stiffness_multiplier) : 1.0;
+        return previewed(vertex) && vertex < m_dense_preview.vertex_stiffness_multipliers.size() ?
+            std::max(1e-12, m_dense_preview.vertex_stiffness_multipliers[vertex]) : 1.0;
     }
 
     double preview_load_multiplier() const
     {
-        return m_show_dense_preview && m_dense_preview.available && m_dense_preview.response_estimate_available &&
+        return m_dense_preview.available && m_dense_preview.response_estimate_available &&
             m_session->solved_setup.gravity.enabled &&
             m_session->result.estimated_mass_kg > 1e-12 ?
             std::max(1.0, m_dense_preview.estimated_total_mass_kg / m_session->result.estimated_mass_kg) : 1.0;
@@ -4756,7 +4931,7 @@ StrengthSimulationPanel::StrengthSimulationPanel(wxWindow *parent, std::shared_p
         [this] { show_animation(); }, [this] { return m_session->result.succeeded() && !m_session->stale; });
     toolbar->add(results_group, "compare", _L("Compare"), "strength_results", true,
         [this] { show_comparison(); }, [this] { return m_animation_runs.size() >= 2; });
-    const auto display_group = toolbar->group(_L("Display"));
+    const auto display_group = toolbar->group(_L("View"));
     const auto inspect_group = toolbar->group(_L("Inspect"));
     const auto print_group = toolbar->group(_L("Print"));
     const auto tools_group = toolbar->group(_L("Tools"));
@@ -4779,6 +4954,9 @@ StrengthSimulationPanel::StrengthSimulationPanel(wxWindow *parent, std::shared_p
     controls->AddSpacer(gap);
     toolbar->command(tools_group, "fit", fit_view, _L("Fit"), "strength_fit");
     root->Add(controls, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
+    m_show_model = new wxCheckBox(this, wxID_ANY, _L("Model"));
+    m_show_model->SetValue(true);
+    m_show_model->Hide();
     m_show_setup = new wxCheckBox(this, wxID_ANY, _L("Show loads and constraints"));
     m_show_wireframe = new wxCheckBox(this, wxID_ANY, _L("Undeformed wireframe"));
     m_banded_contours = new wxCheckBox(this, wxID_ANY, _L("Banded contours"));
@@ -4796,7 +4974,7 @@ StrengthSimulationPanel::StrengthSimulationPanel(wxWindow *parent, std::shared_p
                                          FromDIP(wxSize(300, -1)), wxSL_HORIZONTAL);
     m_dense_volume_value = new wxStaticText(this, wxID_ANY, _L("15% of model volume"));
     m_apply_dense_button = new wxButton(this, wxID_ANY, _L("Create Slice Modifier"));
-    dense_row->Add(m_show_dense_preview, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
+    m_show_dense_preview->Hide();
     dense_row->Add(m_dense_volume_slider, 1, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
     dense_row->Add(m_dense_volume_value, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
     dense_row->Add(m_apply_dense_button, 0, wxALIGN_CENTER_VERTICAL);
@@ -4850,6 +5028,8 @@ StrengthSimulationPanel::StrengthSimulationPanel(wxWindow *parent, std::shared_p
             source->GetEventHandler()->ProcessEvent(event);
         }, {}, [source] { return source->GetValue(); });
     };
+    toggle(m_show_model, "model", _L("Model"), "strength_view", true);
+    toggle(m_show_dense_preview, "modifiers", _L("Modifiers"), "strength_dense", true);
     toggle(m_show_setup, "loads", _L("Loads"), "strength_force", true);
     toggle(m_show_wireframe, "wireframe", _L("Wireframe"), "strength_faces", false);
     toggle(m_banded_contours, "contours", _L("Contours"), "strength_results", true);
@@ -4876,6 +5056,7 @@ StrengthSimulationPanel::StrengthSimulationPanel(wxWindow *parent, std::shared_p
     m_result_mode->Bind(wxEVT_CHOICE, [this](wxCommandEvent &) { m_canvas->set_mode(m_result_mode->GetSelection()); });
     m_projection->Bind(wxEVT_CHOICE, [this](wxCommandEvent &) { m_canvas->set_projection(m_projection->GetSelection()); });
     fit_view->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { m_canvas->fit_view(); });
+    m_show_model->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent &) { m_canvas->set_show_model(m_show_model->GetValue()); });
     m_show_setup->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent &) { m_canvas->set_show_setup(m_show_setup->GetValue()); });
     m_show_wireframe->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent &) { m_canvas->set_show_wireframe(m_show_wireframe->GetValue()); });
     m_banded_contours->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent &) { m_canvas->set_banded(m_banded_contours->GetValue()); });
@@ -4883,6 +5064,11 @@ StrengthSimulationPanel::StrengthSimulationPanel(wxWindow *parent, std::shared_p
         double value = 1.0;
         if (read_number(m_deformation_scale, value)) m_canvas->set_deformation_scale(value);
     });
+    m_preview_timer.SetOwner(this);
+    Bind(wxEVT_TIMER, [this](wxTimerEvent &) {
+        if (m_preview_task.valid() && m_preview_task.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready)
+            update_dense_preview();
+    }, m_preview_timer.GetId());
     m_dense_volume_slider->Bind(wxEVT_SLIDER, [this](wxCommandEvent &) { update_dense_preview(); });
     m_size_to_safety_factor->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { show_target_safety_factor_popup(); });
     m_use_stress_threshold->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { size_dense_preview_to_threshold(); });
@@ -4906,6 +5092,13 @@ StrengthSimulationPanel::StrengthSimulationPanel(wxWindow *parent, std::shared_p
     });
 }
 
+StrengthSimulationPanel::~StrengthSimulationPanel()
+{
+    m_preview_timer.Stop();
+    if (m_preview_cancel) m_preview_cancel->store(true);
+    if (m_preview_task.valid()) m_preview_task.wait();
+}
+
 void StrengthSimulationPanel::show_animation()
 {
     if (m_synchronize_session) m_synchronize_session();
@@ -4914,9 +5107,15 @@ void StrengthSimulationPanel::show_animation()
         return;
     }
     update_dense_preview();
+    if (m_dense_volume_slider->GetValue() > 0 && m_dense_preview.modifier_mesh.empty()) {
+        wxMessageBox(m_dense_preview.available ? _L("The density contours are still being generated. Start animation after the preview is ready.") :
+            wxString::FromUTF8(m_dense_preview.warning), _L("Animate"), wxOK | wxICON_INFORMATION, this);
+        return;
+    }
     SA::TransientSettings options = m_session->print_settings;
     if (m_dense_preview.available) {
         options.dense_region_mesh = m_dense_preview.modifier_mesh;
+        options.dense_regions = m_dense_preview.layers;
         options.dense_volume_fraction = m_dense_volume_slider->GetValue() / 100.0;
     }
     double cell_budget = double(options.maximum_cells), history_budget = double(options.maximum_history_mb);
@@ -5044,6 +5243,11 @@ void StrengthSimulationPanel::show_animation()
     run.snapshot->solved_setup.infill.background_pattern = options.background_pattern;
     run.snapshot->solved_setup.infill.dense_density = std::max(options.background_density,
         run.snapshot->solved_setup.infill.dense_density);
+    auto &intermediate = run.snapshot->solved_setup.infill.intermediate_densities;
+    intermediate.erase(std::remove_if(intermediate.begin(), intermediate.end(), [&](double density) {
+        return density <= options.background_density;
+    }), intermediate.end());
+    for (auto &region : options.dense_regions) region.density = std::max(region.density, options.background_density);
     run.snapshot->solved_instance_transform = m_session->solved_instance_transform;
     run.snapshot->stale = false;
     std::atomic_bool cancelled{false};
@@ -5578,10 +5782,14 @@ void StrengthSimulationPanel::update_dense_preview()
     const auto update_modifier_button = [this] {
         m_apply_dense_button->SetLabel(_L("Create Slice Modifier"));
         m_apply_dense_button->Enable(!m_session->stale && m_dense_preview.applicable() &&
-                                    m_dense_volume_slider->GetValue() > 0 && bool(m_apply_dense_preview));
+                                    m_dense_volume_slider->GetValue() > 0 && !m_dense_preview.modifier_mesh.empty() && bool(m_apply_dense_preview));
     };
     const bool solved = m_session->result.succeeded() && !m_session->solved_mesh.empty() &&
         m_session->result.vertices.size() == m_session->solved_mesh.vertices.size();
+    if (!solved || m_session->stale) {
+        m_preview_timer.Stop();
+        if (m_preview_cancel) m_preview_cancel->store(true);
+    }
     if (!solved || m_probe_revision != m_session->solved_revision) {
         m_probe_vertex = size_t(-1);
         m_probe->SetLabel(_L("Point probe: click near a mesh vertex."));
@@ -5592,7 +5800,8 @@ void StrengthSimulationPanel::update_dense_preview()
     m_size_to_safety_factor->Disable();
     m_use_stress_threshold->Disable();
     m_show_dense_preview->Enable(solved);
-    m_dense_volume_value->SetLabel(wxString::Format(_L("%d%% of model volume"), m_dense_volume_slider->GetValue()));
+    m_dense_volume_value->SetLabel(wxString::Format(m_session->solved_setup.infill.intermediate_densities.empty() ?
+        _L("%d%% of model volume") : _L("%d%% of possible added weight"), m_dense_volume_slider->GetValue()));
     if (!solved) {
         m_dense_profile = {};
         m_dense_preview = {};
@@ -5618,9 +5827,38 @@ void StrengthSimulationPanel::update_dense_preview()
         Layout();
         return;
     }
-    m_dense_preview = SA::preview_dense_region(m_session->solved_mesh, m_session->solved_setup,
-                                                result, m_dense_volume_slider->GetValue() / 100.0,
-                                                m_dense_profile.get());
+    const int percent = m_dense_volume_slider->GetValue();
+    const uint64_t revision = m_session->solved_revision;
+    if (m_preview_task.valid() && m_preview_task.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
+        auto completed = m_preview_task.get();
+        if (m_preview_task_revision == revision && m_preview_task_percent == percent && !m_session->stale &&
+            !m_preview_cancel->load()) {
+            m_completed_preview = std::move(completed);
+            m_completed_preview_revision = revision;
+            m_completed_preview_percent = percent;
+        }
+    }
+    if (m_completed_preview_revision == revision && m_completed_preview_percent == percent) {
+        m_dense_preview = m_completed_preview;
+        m_preview_timer.Stop();
+    } else {
+        m_dense_preview = SA::preview_dense_region(m_session->solved_mesh, m_session->solved_setup,
+            result, percent / 100.0, m_dense_profile.get(), false);
+        if (m_preview_task.valid() && (m_preview_task_revision != revision || m_preview_task_percent != percent))
+            m_preview_cancel->store(true);
+        if (!m_preview_task.valid() && !m_session->stale) {
+            m_preview_task_revision = revision;
+            m_preview_task_percent = percent;
+            m_preview_cancel = std::make_shared<std::atomic_bool>(false);
+            m_preview_task = std::async(std::launch::async,
+                [mesh = m_session->solved_mesh, setup = m_session->solved_setup, result,
+                 profile = m_dense_profile, percent, cancel = m_preview_cancel] {
+                    return SA::preview_dense_region(mesh, setup, result, percent / 100.0, profile.get(), true, 0.0,
+                        [cancel] { return cancel->load(); });
+                });
+        }
+        if (!m_session->stale) m_preview_timer.Start(100);
+    }
     m_size_to_safety_factor->Enable(!m_session->stale && m_dense_preview.available &&
         m_dense_preview.response_estimate_available && !m_session->solved_setup.gravity.enabled);
     m_use_stress_threshold->Enable(!m_session->stale && m_dense_preview.available);
@@ -5645,6 +5883,11 @@ void StrengthSimulationPanel::update_dense_preview()
         } else {
             metrics += _L(" • Safety-factor and deformation estimates unavailable; contours and probes retain the baseline response.");
         }
+        if (m_dense_preview.modifier_mesh.empty() && percent > 0 && m_preview_task.valid())
+            metrics += _L(" • Building clipped contours… allocation estimates shown while computing.");
+        for (size_t i = 0; i < m_dense_preview.layers.size(); ++i)
+            metrics += wxString::Format(_L(" • Region %zu: %.1f%% infill, %.3g cm³"), i + 1,
+                m_dense_preview.layers[i].density * 100.0, m_dense_preview.layers[i].estimated_volume_m3 * 1e6);
         if (!m_dense_preview.warning.empty())
             metrics += "  " + wxString::FromUTF8(m_dense_preview.warning);
     }
@@ -5748,11 +5991,13 @@ void StrengthSimulationPanel::update_probe(size_t vertex_index)
         {_L("Maximum shear (MPa)"), wxString::Format("%.6g", value.maximum_shear_pa / 1e6)},
         {_L("Safety factor"), wxString::Format("%.6g", value.safety_factor)},
     };
-    if (m_show_dense_preview->GetValue() && m_dense_preview.applicable() && m_dense_preview.response_estimate_available) {
+    if (m_dense_preview.applicable() && m_dense_preview.response_estimate_available) {
         const bool strengthened = std::binary_search(m_dense_preview.affected_vertices.begin(),
                                                      m_dense_preview.affected_vertices.end(), vertex_index);
-        const double strength = strengthened ? std::max(1e-12, m_dense_preview.local_strength_multiplier) : 1.0;
-        const double stiffness = strengthened ? std::max(1e-12, m_dense_preview.local_stiffness_multiplier) : 1.0;
+        const double strength = strengthened && vertex_index < m_dense_preview.vertex_strength_multipliers.size() ?
+            std::max(1e-12, m_dense_preview.vertex_strength_multipliers[vertex_index]) : 1.0;
+        const double stiffness = strengthened && vertex_index < m_dense_preview.vertex_stiffness_multipliers.size() ?
+            std::max(1e-12, m_dense_preview.vertex_stiffness_multipliers[vertex_index]) : 1.0;
         const double load = m_session->solved_setup.gravity.enabled && m_session->result.estimated_mass_kg > 1e-12 ?
             std::max(1.0, m_dense_preview.estimated_total_mass_kg / m_session->result.estimated_mass_kg) : 1.0;
         const double preview_safety_factor = value.safety_factor * strength / load;
@@ -5761,7 +6006,7 @@ void StrengthSimulationPanel::update_probe(size_t vertex_index)
             preview_safety_factor, preview_displacement_mm);
         rows.push_back({_L("Dense-preview safety factor"), wxString::Format("%.6g", preview_safety_factor)});
         rows.push_back({_L("Dense-preview displacement (mm)"), wxString::Format("%.6g", preview_displacement_mm)});
-    } else if (m_show_dense_preview->GetValue() && m_dense_preview.available && !m_dense_preview.response_estimate_available) {
+    } else if (m_dense_preview.available && !m_dense_preview.response_estimate_available) {
         label += _L(" — Dense-preview response unavailable; baseline response shown.");
         rows.push_back({_L("Dense preview"), _L("Baseline response shown")});
     }

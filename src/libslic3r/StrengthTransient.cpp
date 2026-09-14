@@ -128,6 +128,20 @@ TransientResult analyze_transient(const indexed_triangle_set &mesh, const Setup 
             v = (basis.transpose() * v.cast<double>().cwiseProduct(setup.geometry_scale)).cast<float>();
         const auto dense_slices = dense_mesh.empty() ? std::vector<ExPolygons>(heights.size()) :
             slice_mesh_ex(dense_mesh, heights, check);
+        std::vector<std::vector<ExPolygons>> region_slices;
+        for (const auto &region : s.dense_regions) {
+            if (!std::isfinite(region.density) || region.density < setup.infill.background_density || region.density > 1.0)
+                return fail("Invalid reinforcement region density.");
+            auto region_mesh = region.mesh;
+            for (auto &vertex : region_mesh.vertices) {
+                if (!vertex.allFinite()) return fail("Invalid reinforcement region vertex.");
+                vertex = (basis.transpose() * vertex.cast<double>().cwiseProduct(setup.geometry_scale)).cast<float>();
+            }
+            for (const auto &triangle : region_mesh.indices)
+                if (triangle.minCoeff() < 0 || triangle.maxCoeff() >= int(region_mesh.vertices.size()))
+                    return fail("Invalid reinforcement region triangle.");
+            region_slices.push_back(region_mesh.empty() ? std::vector<ExPolygons>(heights.size()) : slice_mesh_ex(region_mesh, heights, check));
+        }
         const auto inside = [&](int layer, double px, double py) {
             const Point p(scale_(px), scale_(py));
             for (const ExPolygon &poly : slices[size_t(layer)]) if (poly.contains(p)) return true;
@@ -165,9 +179,19 @@ TransientResult analyze_transient(const indexed_triangle_set &mesh, const Setup 
                 bool dense = false;
                 for (const ExPolygon &poly : dense_slices[size_t(k)])
                     if (poly.contains(Point(scale_(px), scale_(py)))) { dense = true; break; }
+                double density = dense ? std::max(setup.infill.background_density, setup.infill.dense_density) : setup.infill.background_density;
+                if (!region_slices.empty()) {
+                    dense = false;
+                    density = setup.infill.background_density;
+                    for (size_t region = 0; region < region_slices.size(); ++region)
+                        for (const auto &poly : region_slices[region][size_t(k)])
+                            if (poly.contains(Point(scale_(px), scale_(py)))) {
+                                dense = true;
+                                density = std::max(density, s.dense_regions[region].density);
+                            }
+                }
                 if (dense) ++out.dense_cell_count;
-                const double solid = shell ? 1.0 : std::clamp(dense ?
-                    std::max(setup.infill.background_density, setup.infill.dense_density) : setup.infill.background_density, 0.01, 1.0);
+                const double solid = shell ? 1.0 : std::clamp(density, 0.01, 1.0);
                 grid[{i,j,k}] = cells.size();
                 cells.push_back({Vec3d(px, py, heights[size_t(k)]), Vec3d(dx, dy, thickness[size_t(k)]), Vec3d::Zero(), k, solid, dense});
                 if (cells.size() > s.maximum_cells || double(cells.size()) * (s.increments + 1) * sizeof(VertexResult) > double(s.maximum_history_mb) * 1024 * 1024)

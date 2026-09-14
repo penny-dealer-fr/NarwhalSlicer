@@ -459,6 +459,8 @@ TEST_CASE("Strength setup survives the Orca project 3MF path", "[StrengthAnalysi
     Setup setup;
     setup.material = *find_builtin_material("pc_generic");
     setup.criteria.minimum_safety_factor = 2.25;
+    setup.infill.intermediate_densities = {0.4, 0.3};
+    setup.solver.subdivisions = 12;
     const std::string encoded = serialize_setup_for_config(setup);
 
     Model source;
@@ -746,6 +748,7 @@ TEST_CASE("Dense-region preview scales physical volume and mass while retaining 
 {
     const indexed_triangle_set mesh = its_make_cube(20.0, 20.0, 20.0);
     Setup setup;
+    setup.infill.polygonal_contours = false;
     setup.infill.background_density = 0.20;
     setup.infill.dense_density = 0.65;
     const Result baseline = synthetic_result(mesh);
@@ -1183,7 +1186,9 @@ TEST_CASE("Reinforcement selects separate high-stress bodies before a low-stress
     const auto profile = build_dense_region_preview_profile(mesh, result);
     INFO(profile.warning);
     REQUIRE(profile.available);
-    const auto preview = preview_dense_region(mesh, Setup{}, result, 0.5, &profile);
+    Setup setup;
+    setup.infill.polygonal_contours = false;
+    const auto preview = preview_dense_region(mesh, setup, result, 0.5, &profile);
     REQUIRE(preview.applicable());
     REQUIRE_FALSE(preview.modifier_mesh.empty());
     bool left = false, right = false;
@@ -1273,8 +1278,10 @@ TEST_CASE("Interior-cell volumes retain sloped walls cavities and thin separated
     INFO(profile.warning);
     REQUIRE(profile.available);
     CHECK_THAT(profile.sampled_volume_mm3, WithinRel(expected, 1e-6));
+    Setup setup;
+    setup.infill.polygonal_contours = false;
     for (double fraction : {0.01, 0.15, 0.5, 1.0}) {
-        const auto preview = preview_dense_region(mesh, Setup{}, result, fraction, &profile);
+        const auto preview = preview_dense_region(mesh, setup, result, fraction, &profile);
         REQUIRE(preview.applicable());
         CHECK_THAT(preview.estimated_volume_fraction, WithinAbs(fraction, 0.02));
         CHECK_THAT(sliced_dense_volume(mesh, preview, profile), WithinRel(preview.estimated_volume_m3 * 1e9, 1e-5));
@@ -1663,4 +1670,225 @@ TEST_CASE("Fine animation grids and longer histories honor editable budgets and 
     const auto cancelled = analyze_transient(mesh, setup, settings, [&] { return cancel; }, [&](int progress) { if (progress >= 10) cancel = true; });
     CHECK(cancelled.status == AnalysisStatus::Cancelled);
     CHECK(cancelled.frames.empty());
+}
+
+TEST_CASE("Density strategy fields survive setup serialization", "[StrengthAnalysis][DensityRegions]")
+{
+    Setup setup;
+    CHECK(setup.infill.polygonal_contours);
+    CHECK(setup.infill.intermediate_densities.empty());
+    setup.infill.intermediate_densities = {0.50, 0.35};
+    setup.solver.subdivisions = 12;
+    Setup loaded;
+    REQUIRE(deserialize_setup(serialize_setup(setup), loaded));
+    CHECK(loaded.infill.polygonal_contours);
+    CHECK(loaded.infill.intermediate_densities == setup.infill.intermediate_densities);
+    CHECK(loaded.solver.subdivisions == 12);
+    auto legacy = nlohmann::json::parse(serialize_setup(setup));
+    legacy["infill"].erase("polygonal_contours");
+    legacy["infill"].erase("intermediate_densities");
+    legacy["solver"].erase("subdivisions");
+    REQUIRE(deserialize_setup(legacy.dump(), loaded));
+    CHECK(loaded.infill.polygonal_contours);
+    CHECK(loaded.infill.intermediate_densities.empty());
+    CHECK(loaded.solver.subdivisions == 40);
+}
+
+TEST_CASE("Multiple densities obey the added weight budget and endpoints", "[StrengthAnalysis][DensityRegions]")
+{
+    const auto mesh = its_make_cube(10., 10., 10.);
+    Setup setup = cube_setup(mesh);
+    setup.infill.polygonal_contours = false;
+    setup.infill.intermediate_densities = {0.45, 0.30};
+    const auto result = synthetic_result(mesh);
+    const auto profile = build_dense_region_preview_profile(mesh, result, {}, 8);
+    REQUIRE(profile.available);
+    const auto zero = preview_dense_region(mesh, setup, result, 0.0, &profile);
+    CHECK(zero.modifier_mesh.empty());
+    CHECK_THAT(zero.estimated_added_mass_kg, WithinAbs(0.0, 1e-12));
+    const auto full = preview_dense_region(mesh, setup, result, 1.0, &profile);
+    REQUIRE(full.available);
+    REQUIRE(full.layers.size() == 3);
+    CHECK_FALSE(full.layers[0].mesh.empty());
+    CHECK(full.layers[1].mesh.empty());
+    CHECK(full.layers[2].mesh.empty());
+    bool has_intermediate = false;
+    for (double fraction : {0.1, 0.25, 0.5, 0.75}) {
+        const auto preview = preview_dense_region(mesh, setup, result, fraction, &profile);
+        REQUIRE(preview.available);
+        CHECK(preview.estimated_added_mass_kg <= full.estimated_added_mass_kg * fraction + 1e-10);
+        for (size_t i = 1; i < preview.layers.size(); ++i) has_intermediate |= !preview.layers[i].mesh.empty();
+        std::vector<float> heights{1.13f, 3.37f, 5.21f, 7.63f, 9.17f};
+        std::vector<std::vector<ExPolygons>> slices;
+        for (const auto &layer : preview.layers) slices.push_back(slice_mesh_ex(layer.mesh, heights));
+        for (size_t a = 0; a < slices.size(); ++a)
+            for (size_t b = a + 1; b < slices.size(); ++b)
+                for (size_t z = 0; z < heights.size(); ++z)
+                    CHECK(intersection_ex(slices[a][z], slices[b][z]).empty());
+    }
+    CHECK(has_intermediate);
+}
+
+TEST_CASE("Polygonal modifiers stay inside a sloped part and report their actual mass", "[StrengthAnalysis][DensityContours]")
+{
+    auto mesh = its_make_cube(10., 10., 10.);
+    for (auto &vertex : mesh.vertices) vertex.x() += 0.37f * vertex.z();
+    Setup setup = cube_setup(mesh);
+    setup.infill.polygonal_contours = true;
+    const auto result = synthetic_result(mesh);
+    const auto profile = build_dense_region_preview_profile(mesh, result, {}, 8);
+    const auto preview = preview_dense_region(mesh, setup, result, 0.35, &profile);
+    INFO(preview.warning);
+    REQUIRE(preview.available);
+    REQUIRE_FALSE(preview.modifier_mesh.empty());
+    for (const auto &v : preview.modifier_mesh.vertices) {
+        CHECK(v.x() - 0.37 * v.z() >= -1e-4);
+        CHECK(v.x() - 0.37 * v.z() <= 10.0 + 1e-4);
+        CHECK(v.y() >= -1e-4);
+        CHECK(v.y() <= 10.0 + 1e-4);
+        CHECK(v.z() >= -1e-4);
+        CHECK(v.z() <= 10.0 + 1e-4);
+    }
+    CHECK_THAT(preview.estimated_volume_m3, WithinRel(std::abs(its_volume(preview.modifier_mesh)) * 1e-9, 1e-5));
+    std::vector<float> heights{0.17f, 2.37f, 5.21f, 7.63f, 9.87f};
+    const auto part = slice_mesh_ex(mesh, heights), modifier = slice_mesh_ex(preview.modifier_mesh, heights);
+    for (size_t z = 0; z < heights.size(); ++z)
+        for (const auto &outside : diff_ex(modifier[z], part[z]))
+            CHECK(outside.area() * SCALING_FACTOR * SCALING_FACTOR < 1e-4);
+    const auto full = preview_dense_region(mesh, setup, result, 1.0, &profile);
+    REQUIRE(full.available);
+    CHECK_THAT(double(its_volume(full.modifier_mesh)), WithinRel(double(its_volume(mesh)), 1e-6));
+}
+
+TEST_CASE("Print setting predictions recover the current values when changes are deselected", "[StrengthAnalysis][PrintSettingsPreview]")
+{
+    const auto mesh = its_make_cube(10., 10., 10.);
+    const auto setup = cube_setup(mesh);
+    const auto result = synthetic_result(mesh);
+    PrintSettingsCandidate current;
+    current.wall_loops = 3;
+    current.layer_height_mm = 0.16;
+    current.infill_density = setup.infill.background_density;
+    const auto unchanged = predict_print_settings(setup, result, current, current);
+    CHECK_THAT(unchanged.estimated_mass_kg, WithinRel(result.estimated_mass_kg, 1e-10));
+    CHECK_THAT(unchanged.predicted_safety_factor, WithinRel(result.minimum_safety_factor, 1e-10));
+    CHECK_THAT(unchanged.relative_print_time, WithinAbs(1.0, 1e-10));
+    auto proposed = current;
+    proposed.infill_density = 0.6;
+    const auto changed = predict_print_settings(setup, result, current, proposed);
+    CHECK(changed.estimated_mass_kg > unchanged.estimated_mass_kg);
+    CHECK(changed.predicted_safety_factor > unchanged.predicted_safety_factor);
+    CHECK(changed.relative_print_time > unchanged.relative_print_time);
+}
+
+TEST_CASE("Study subdivisions change the reinforcement sampling grid", "[StrengthAnalysis][DensityRegions]")
+{
+    const auto mesh = its_make_cube(10., 10., 10.);
+    const auto result = synthetic_result(mesh);
+    const auto coarse = build_dense_region_preview_profile(mesh, result, {}, 8);
+    const auto fine = build_dense_region_preview_profile(mesh, result, {}, 16);
+    REQUIRE(coarse.available);
+    REQUIRE(fine.available);
+    CHECK(fine.cells.size() > coarse.cells.size());
+    CHECK_THAT(fine.sampled_volume_mm3, WithinRel(coarse.sampled_volume_mm3, 1e-6));
+}
+
+TEST_CASE("Polygonal density bands do not overlap or fill a part cavity", "[StrengthAnalysis][DensityContours]")
+{
+    auto mesh = its_make_cube(12., 12., 12.);
+    auto cavity = its_make_cube(4., 4., 4.);
+    its_transform(cavity, identity3f().translate(Vec3f(4,4,4)));
+    for (auto &triangle : cavity.indices) std::swap(triangle[0], triangle[1]);
+    its_merge(mesh, cavity);
+    Setup setup = cube_setup(mesh);
+    setup.infill.intermediate_densities = {0.4};
+    const auto result = synthetic_result(mesh);
+    const auto profile = build_dense_region_preview_profile(mesh, result, {}, 8);
+    const auto preview = preview_dense_region(mesh, setup, result, 0.4, &profile);
+    INFO(preview.warning);
+    REQUIRE(preview.available);
+    REQUIRE(preview.layers.size() == 2);
+    REQUIRE_FALSE(preview.layers[1].mesh.empty());
+    const std::vector<float> heights{0.73f, 3.19f, 5.37f, 7.31f, 9.67f, 11.41f};
+    const auto part = slice_mesh_ex(mesh, heights);
+    const auto first = slice_mesh_ex(preview.layers[0].mesh, heights);
+    const auto second = slice_mesh_ex(preview.layers[1].mesh, heights);
+    for (size_t z = 0; z < heights.size(); ++z) {
+        for (const auto &overlap : intersection_ex(first[z], second[z]))
+            CHECK(overlap.area() * SCALING_FACTOR * SCALING_FACTOR < 1e-4);
+        for (const auto &outside : diff_ex(union_ex(first[z], second[z]), part[z]))
+            CHECK(outside.area() * SCALING_FACTOR * SCALING_FACTOR < 1e-4);
+    }
+    SphericalRegion preserve;
+    preserve.shape = RegionShape::Box;
+    preserve.center_mm = Vec3d(2,2,2);
+    preserve.size_mm = Vec3d(4,4,4);
+    setup.preserve_regions.push_back(preserve);
+    const auto protected_preview = preview_dense_region(mesh, setup, result, 1.0, &profile);
+    REQUIRE(protected_preview.available);
+    auto protected_mesh = its_make_cube(3.9,3.9,3.9);
+    const auto protected_slices = slice_mesh_ex(protected_mesh, heights);
+    const auto reinforced = slice_mesh_ex(protected_preview.modifier_mesh, heights);
+    for (size_t z = 0; z < heights.size(); ++z)
+        CHECK(intersection_ex(protected_slices[z], reinforced[z]).empty());
+}
+
+TEST_CASE("Multiple density contours survive repeated clipping against curved walls", "[StrengthAnalysis][DensityContours][Regression]")
+{
+    auto mesh = its_make_cylinder(10.0, 20.0, 0.31);
+    for (auto &v : mesh.vertices) v.x() += 0.137f * v.z();
+    auto setup = cube_setup(mesh);
+    setup.infill.background_density = 0.15;
+    setup.infill.dense_density = 0.85;
+    setup.infill.intermediate_densities = {0.65, 0.45, 0.30};
+    auto result = synthetic_result(mesh);
+    for (auto &v : result.vertices) {
+        v.von_mises_pa = 1e6 * (1.0 + 0.08 * v.position_mm.z());
+        v.safety_factor = 5e6 / v.von_mises_pa;
+    }
+    const auto profile = build_dense_region_preview_profile(mesh, result, {}, 16);
+    REQUIRE(profile.available);
+    for (double fraction : {0.15, 0.35, 0.65}) {
+        const auto preview = preview_dense_region(mesh, setup, result, fraction, &profile);
+        INFO(fraction);
+        INFO(preview.warning);
+        REQUIRE(preview.available);
+        CHECK_FALSE(preview.modifier_mesh.empty());
+    }
+}
+
+TEST_CASE("Animation uses each captured region density in its mechanical response", "[StrengthAnalysis][Transient][DensityRegions]")
+{
+    const auto mesh = its_make_cube(4,4,4);
+    auto setup = transient_cube_setup(10);
+    setup.infill.background_density = 0.2;
+    setup.infill.dense_density = 0.8;
+    setup.infill.intermediate_densities = {0.4};
+    auto settings = small_transient_settings();
+    settings.increments = 4;
+    settings.unload = false;
+    settings.plasticity = false;
+    settings.fracture = false;
+    DenseRegionLayer high, middle;
+    high.density = 0.8;
+    high.mesh = its_make_cube(2,4,4);
+    middle.density = 0.4;
+    middle.mesh = its_make_cube(2,4,4);
+    its_transform(middle.mesh, identity3f().translate(Vec3f(2,0,0)));
+    settings.dense_regions = {high, middle};
+    const auto mixed = analyze_transient(mesh, setup, settings);
+    INFO(mixed.message);
+    REQUIRE(mixed.succeeded());
+    CHECK(mixed.dense_cell_count == mixed.frames.front().cells.size());
+    settings.dense_regions[1].density = high.density;
+    const auto all_high = analyze_transient(mesh, setup, settings);
+    REQUIRE(all_high.succeeded());
+    settings.dense_regions[0].density = middle.density;
+    settings.dense_regions[1].density = middle.density;
+    const auto all_middle = analyze_transient(mesh, setup, settings);
+    REQUIRE(all_middle.succeeded());
+    CHECK(mixed.frames.back().probe_displacements_mm[0] > all_high.frames.back().probe_displacements_mm[0]);
+    CHECK(mixed.frames.back().probe_displacements_mm[0] < all_middle.frames.back().probe_displacements_mm[0]);
+    CHECK_THAT(mixed.settings.dense_regions[0].density, WithinAbs(0.8,1e-12));
+    CHECK_THAT(mixed.settings.dense_regions[1].density, WithinAbs(0.4,1e-12));
 }

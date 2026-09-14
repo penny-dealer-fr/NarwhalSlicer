@@ -29,6 +29,7 @@ struct TransientSettings {
     double background_density{0.15};
     InfillPattern background_pattern{InfillPattern::Gyroid};
     std::string unsupported_print_pattern;
+    std::vector<DenseRegionLayer> dense_regions; // Optional disjoint density-specific modifiers.
     indexed_triangle_set dense_region_mesh; // Immutable raw-object-space preview captured at run creation.
     double dense_volume_fraction{0.0};
     size_t increments{40};

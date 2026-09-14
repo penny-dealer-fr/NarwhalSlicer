@@ -6,6 +6,8 @@
 #include "libslic3r/ObjectID.hpp"
 
 #include <wx/scrolwin.h>
+#include <wx/timer.h>
+#include <future>
 
 #include <atomic>
 #include <functional>
@@ -198,6 +200,7 @@ public:
                             std::function<bool(const StrengthAnalysis::DenseRegionPreview &)> apply_dense_preview = {},
                             std::function<bool()> has_dense_modifier = {},
                             std::function<void()> remove_dense_modifier = {});
+    ~StrengthSimulationPanel() override;
     void activate();
     void refresh();
 
@@ -220,6 +223,14 @@ private:
     std::function<void()> m_remove_dense_modifier;
     std::shared_ptr<const StrengthAnalysis::DenseRegionPreviewProfile> m_dense_profile;
     StrengthAnalysis::DenseRegionPreview m_dense_preview;
+    StrengthAnalysis::DenseRegionPreview m_completed_preview;
+    std::future<StrengthAnalysis::DenseRegionPreview> m_preview_task;
+    std::shared_ptr<std::atomic_bool> m_preview_cancel;
+    wxTimer m_preview_timer;
+    uint64_t m_preview_task_revision{0};
+    int m_preview_task_percent{-1};
+    uint64_t m_completed_preview_revision{0};
+    int m_completed_preview_percent{-1};
     size_t m_probe_vertex{size_t(-1)};
     uint64_t m_probe_revision{0};
     wxStaticText *m_status{nullptr};
@@ -227,6 +238,7 @@ private:
     wxChoice *m_projection{nullptr};
     wxTextCtrl *m_deformation_scale{nullptr};
     wxCheckBox *m_show_setup{nullptr};
+    wxCheckBox *m_show_model{nullptr};
     wxCheckBox *m_show_wireframe{nullptr};
     wxCheckBox *m_banded_contours{nullptr};
     wxCheckBox *m_show_dense_preview{nullptr};

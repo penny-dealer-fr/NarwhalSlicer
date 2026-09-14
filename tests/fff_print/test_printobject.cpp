@@ -290,3 +290,57 @@ TEST_CASE("Initial layer height is honored", "[PrintObject]")
     REQUIRE_THAT(*layer_zs.begin(),            Catch::Matchers::WithinAbs(0.3, 1e-4));
     REQUIRE_THAT(*std::next(layer_zs.begin()), Catch::Matchers::WithinAbs(0.5, 1e-4));
 }
+
+TEST_CASE("Slicing polygonal density bands retains independent infill settings", "[PrintObject][StrengthAnalysis][DensityRegions]")
+{
+    namespace SA = Slic3r::StrengthAnalysis;
+    auto config = DynamicPrintConfig::full_print_config();
+    config.set_deserialize_strict({{"layer_height", 0.3}, {"initial_layer_print_height", 0.3}, {"nozzle_diameter", 0.4},
+        {"sparse_infill_density", 20}, {"sparse_infill_pattern", "gyroid"}, {"wall_loops", 1},
+        {"top_shell_layers", 0}, {"bottom_shell_layers", 0}, {"top_shell_thickness", 0}, {"bottom_shell_thickness", 0}});
+    Print print;
+    Model model;
+    init_print({cube(20)}, print, model, config);
+    auto &object = *model.objects.front();
+    const auto mesh = object.raw_mesh().its;
+    SA::Setup setup;
+    setup.infill.dense_density = 0.8;
+    setup.infill.intermediate_densities = {0.5, 0.3};
+    SA::Result result;
+    result.status = SA::AnalysisStatus::Success;
+    for (size_t i = 0; i < mesh.vertices.size(); ++i) {
+        SA::VertexResult vertex;
+        vertex.position_mm = mesh.vertices[i].cast<double>();
+        vertex.von_mises_pa = i == 0 ? 2e6 : 1e6;
+        vertex.safety_factor = i == 0 ? 1.0 : 2.0;
+        result.vertices.push_back(vertex);
+    }
+    const auto profile = SA::build_dense_region_preview_profile(mesh, result, {}, 12);
+    const auto preview = SA::preview_dense_region(mesh, setup, result, 0.35, &profile);
+    INFO(preview.warning);
+    REQUIRE(preview.available);
+    std::set<int> expected;
+    for (const auto &layer : preview.layers) {
+        if (layer.mesh.empty()) continue;
+        auto *volume = object.add_volume(TriangleMesh(layer.mesh), ModelVolumeType::PARAMETER_MODIFIER, false);
+        volume->config.set_key_value("sparse_infill_density", new ConfigOptionPercent(layer.density * 100));
+        volume->config.set_key_value("sparse_infill_pattern", new ConfigOptionEnum<InfillPattern>(ipGyroid));
+        volume->config.set_key_value("strength_analysis_modifier", new ConfigOptionBool(true));
+        expected.insert(int(std::lround(layer.density * 100)));
+    }
+    REQUIRE(expected.size() >= 2);
+    print.apply(model, config);
+    const auto output = gcode(print);
+    CHECK_FALSE(output.empty());
+    std::set<int> observed;
+    double filled_volume = 0.0;
+    for (const auto *layer : print.objects().front()->layers())
+        for (const auto *region : layer->regions()) {
+            const int density = int(std::lround(region->region().config().sparse_infill_density.value));
+            if (region->fills.total_volume() <= 0.0) continue;
+            filled_volume += region->fills.total_volume();
+            if (density > 20) observed.insert(density);
+        }
+    CHECK(observed == expected);
+    CHECK(filled_volume > 0.0);
+}

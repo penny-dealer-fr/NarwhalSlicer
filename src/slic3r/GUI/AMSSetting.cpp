@@ -702,7 +702,7 @@ void AMSSettingTypePanel::OnAmsTypeChanged(wxCommandEvent& event)
     auto obj_ = part->GetFilaSystem()->GetOwner();
     if (obj_) {
         if (obj_->is_in_printing() || obj_->is_in_upgrading())  {
-            MessageDialog dlg(this, _L("The printer is busy and cannot switch AMS type."), SLIC3R_APP_NAME + _L("Info"), wxOK | wxICON_INFORMATION);
+            MessageDialog dlg(this, _L("The printer is busy and cannot switch AMS type."), "NarwhalSlicer" + _L("Info"), wxOK | wxICON_INFORMATION);
             dlg.ShowModal();
             m_type_combobox->SetSelection(part->GetCurrentFirmwareIdxSel());
             return;
@@ -710,7 +710,7 @@ void AMSSettingTypePanel::OnAmsTypeChanged(wxCommandEvent& event)
 
         auto ext = obj_->GetExtderSystem()->GetCurrentExtder();
         if (ext && ext->HasFilamentInExt()) {
-            MessageDialog dlg(this, _L("Please unload all filament before switching."), SLIC3R_APP_NAME + _L("Info"), wxOK | wxICON_INFORMATION);
+            MessageDialog dlg(this, _L("Please unload all filament before switching."), "NarwhalSlicer" + _L("Info"), wxOK | wxICON_INFORMATION);
             dlg.SetButtonLabel(wxID_OK, _L("Confirm"));
             dlg.ShowModal();
             m_type_combobox->SetSelection(part->GetCurrentFirmwareIdxSel());
@@ -721,7 +721,7 @@ void AMSSettingTypePanel::OnAmsTypeChanged(wxCommandEvent& event)
             return;
         }
 
-        MessageDialog dlg(this, _L("AMS type switching needs firmware update, taking about 30s. Switch now?"), SLIC3R_APP_NAME + _L("Info"), wxOK | wxCANCEL | wxICON_INFORMATION);
+        MessageDialog dlg(this, _L("AMS type switching needs firmware update, taking about 30s. Switch now?"), "NarwhalSlicer" + _L("Info"), wxOK | wxCANCEL | wxICON_INFORMATION);
         dlg.SetButtonLabel(wxID_OK, _L("Confirm"));
         int rtn = dlg.ShowModal();
         if (rtn != wxID_OK) {
@@ -781,7 +781,7 @@ void AMSSettingArrangeAMSOrder::OnBtnRearrangeClicked(wxCommandEvent& event)
         MessageDialog dlg(this, _L("AMS ID will be reset. If you want a specific ID sequence, "
                                    "disconnect all AMS before resetting and connect them "
                                    "in the desired order after resetting."),
-                                   SLIC3R_APP_NAME + _L("Info"), wxOK | wxCANCEL | wxICON_INFORMATION);
+                                   "NarwhalSlicer" + _L("Info"), wxOK | wxCANCEL | wxICON_INFORMATION);
         int rtn = dlg.ShowModal();
         if (rtn == wxID_OK) {
             part->GetFilaSystem()->CtrlAmsReset();

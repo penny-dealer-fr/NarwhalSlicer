@@ -127,6 +127,9 @@ struct InfillSettings {
     InfillPattern dense_pattern{InfillPattern::Gyroid};
     double dense_density{0.65};
     double dense_stress_threshold{0.70};
+    bool polygonal_contours{true};
+    // Additional regions, strictly descending below dense_density and above background.
+    std::vector<double> intermediate_densities;
 };
 
 struct OptimizationCriteria {
@@ -144,6 +147,7 @@ struct OptimizationCriteria {
 
 struct SolverSettings {
     size_t maximum_vertices{50000};
+    size_t subdivisions{40}; // Longest-axis reinforcement sampling resolution (4..64).
     double transverse_stiffness_ratio{0.04};
     double regularization_ratio{1e-9};
 };
@@ -191,7 +195,7 @@ struct DenseRegionCell {
 
 // Prepared off the UI thread. Cells are ranked by interpolated solved stress (descending), then
 // grid index for deterministic ties. Exact polyhedral integration retains cavities and thin solids.
-// Grid planes and the emitted mesh use object coordinates; the slicer clips voxels to the model.
+// Grid planes and modifier meshes use object coordinates. Polygonal contours are clipped to the part.
 struct DenseRegionPreviewProfile {
     bool available{false};
     size_t vertex_count{0};
@@ -213,6 +217,12 @@ struct DenseRegionPreviewProfile {
 // Fast, deterministic what-if estimate for resizing the recommended dense infill modifier. The
 // preview deliberately does not claim to be a re-solved stress study: it applies the local
 // density/pattern response to the solved vertex field so the UI can update while a slider moves.
+struct DenseRegionLayer {
+    double density{0.0};
+    double estimated_volume_m3{0.0};
+    indexed_triangle_set mesh;
+};
+
 struct DenseRegionPreview {
     bool available{false};
     bool overlaps_preserve{false};
@@ -222,6 +232,9 @@ struct DenseRegionPreview {
     // Authoritative native PARAMETER_MODIFIER geometry in OBJECT COORDINATES. Empty when
     // generate_modifier_mesh=false; region is only a diagnostic enclosing box.
     indexed_triangle_set modifier_mesh;
+    std::vector<DenseRegionLayer> layers; // Descending densities; disjoint interiors.
+    std::vector<double> vertex_strength_multipliers;
+    std::vector<double> vertex_stiffness_multipliers;
     SphericalRegion region;
     size_t selected_cell_count{0};
     double target_volume_fraction{0.0};
@@ -281,6 +294,12 @@ struct PrintSettingsCandidate {
     double estimated_mass_kg{0.0};
     double score{0.0};
     bool feasible{false};
+};
+
+struct PrintSettingsPrediction {
+    double estimated_mass_kg{0.0};
+    double predicted_safety_factor{0.0};
+    double relative_print_time{1.0};
 };
 
 struct Result {
@@ -343,9 +362,10 @@ Result analyze(const indexed_triangle_set &mesh, const Setup &setup, const Cance
 // Builds a reusable cancellable stress-directed interior-cell profile. Work-limit or cancellation
 // failures are unavailable with an explicit warning, never a silently truncated profile.
 DenseRegionPreviewProfile build_dense_region_preview_profile(const indexed_triangle_set &mesh,
-                                                              const Result &result, const CancelPredicate &cancel = {});
+                                                              const Result &result, const CancelPredicate &cancel = {}, size_t subdivisions = 40);
 // Selects the volume-weighted ranked prefix, skipping every cell intersecting a preserve region.
-// The target is a share of total model volume; attainable share may be smaller due to preserves.
+// With one region, the target is model volume; with multiple regions it is possible added mass.
+// Preserves and sampling resolution may limit the attainable amount.
 // Metrics-only callers may suppress mesh generation. A stale supplied cache fails explicitly so
 // callers can rebuild off the UI thread. No profile supplied builds synchronously for headless use.
 // An optional relative stress cutoff limits the eligible cells, after preserve exclusion.
@@ -353,12 +373,16 @@ DenseRegionPreviewProfile build_dense_region_preview_profile(const indexed_trian
 DenseRegionPreview preview_dense_region(const indexed_triangle_set &mesh, const Setup &setup,
                                         const Result &result, double target_volume_fraction,
                                         const DenseRegionPreviewProfile *profile = nullptr,
-                                        bool generate_modifier_mesh = true, double minimum_stress_fraction = 0.0);
+                                        bool generate_modifier_mesh = true, double minimum_stress_fraction = 0.0,
+                                        const CancelPredicate &cancel = {});
 
 std::vector<InfillComparison> compare_infill_patterns(double solid_volume_m3, const Setup &setup, double reference_safety_factor);
 std::vector<MassStrengthPoint> estimate_mass_strength_curve(double solid_volume_m3, const Setup &setup, double reference_safety_factor);
 std::vector<OrientationRecommendation> recommend_orientations(const indexed_triangle_set &mesh, const Setup &setup,
                                                                double reference_safety_factor);
+PrintSettingsPrediction predict_print_settings(const Setup &setup, const Result &result,
+                                                const PrintSettingsCandidate &current,
+                                                const PrintSettingsCandidate &proposed);
 std::vector<PrintSettingsCandidate> recommend_print_settings(double solid_volume_m3, const Setup &setup,
                                                               double reference_safety_factor,
                                                               double reference_displacement_mm = 0.0);

@@ -1,8 +1,8 @@
 blank_issues_enabled: false
 contact_links:
-  - name: Community Support (Discord channel)
-    url: https://discord.gg/P4VE9UY9gJ
-    about: Please ask and answer support "how do I?"questions here.
-  - name: Discussion Forum
-    url: https://github.com/OrcaSlicer/OrcaSlicer/discussions
-    about: Please raise ideas and feature suggestions here.
+  - name: NarwhalSlicer source and documentation
+    url: https://github.com/penny-dealer-fr/NarwhalSlicer
+    about: Start with this fork’s README and strength-workflow documentation.
+  - name: Upstream OrcaSlicer documentation
+    url: https://www.orcaslicer.com/wiki
+    about: Reference for inherited slicer settings; NarwhalSlicer strength features are documented in this repository.

@@ -6,10 +6,10 @@ PRODUCTVERSION @SLIC3R_VERSION@
  {
   BLOCK "040904E4"
   {
-   VALUE "CompanyName", "SoftFever"
-   VALUE "FileDescription", "@SLIC3R_APP_NAME@"
+   VALUE "CompanyName", "NarwhalSlicer contributors"
+   VALUE "FileDescription", "NarwhalSlicer"
    VALUE "FileVersion", "@SLIC3R_BUILD_ID@"
-   VALUE "ProductName", "@SLIC3R_APP_NAME@"
+   VALUE "ProductName", "NarwhalSlicer"
    VALUE "ProductVersion", "@SLIC3R_BUILD_ID@"
    VALUE "InternalName", "@SLIC3R_APP_NAME@"
    VALUE "LegalCopyright", ""

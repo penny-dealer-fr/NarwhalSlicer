@@ -8,8 +8,10 @@
   <string>@SLIC3R_APP_NAME@ Copyright(C) 2026 OrcaSlicer Pte Ltd All Rights Reserved</string>
   <key>CFBundleIconFile</key>
   <string>Icon.icns</string>
+  <key>CFBundleDisplayName</key>
+  <string>NarwhalSlicer</string>
   <key>CFBundleName</key>
-  <string>@SLIC3R_APP_KEY@</string>
+  <string>NarwhalSlicer</string>
   <key>CFBundleShortVersionString</key>
   <string>@SLIC3R_APP_NAME@ @SLIC3R_BUILD_ID@</string>
   <key>CFBundleIdentifier</key>

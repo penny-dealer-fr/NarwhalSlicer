@@ -604,7 +604,7 @@ SendSystemInfoDialog::SendSystemInfoDialog(wxWindow* parent)
         if (semver.prerelease()) {
             is_beta = std::string{ semver.prerelease() }.find("beta") != std::string::npos;
         }
-        app_name = std::string(SLIC3R_APP_FULL_NAME) + " " + std::to_string(semver.maj())
+        app_name = std::string("Orca Slicer") + " " + std::to_string(semver.maj())
                                + "." + std::to_string(semver.min()) + " "
                                + (is_alpha ? "Alpha" : is_beta ? "Beta" : "");
     }

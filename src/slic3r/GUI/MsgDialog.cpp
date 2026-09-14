@@ -686,7 +686,7 @@ wxBoxSizer *Newer3mfVersionDialog::get_msg_sizer()
     wxString    msg_str;
     if (file_version_newer) { 
         text1 = new wxStaticText(this, wxID_ANY, _L("The 3MF file version is in Beta and it is newer than the current NarwhalSlicer version."));
-        wxStaticText *   text2       = new wxStaticText(this, wxID_ANY, _L("If you would like to try NarwhalSlicer Beta, you may click to"));
+        wxStaticText *   text2       = new wxStaticText(this, wxID_ANY, _L("For upstream OrcaSlicer beta releases, you may click to"));
         // ORCA standardized HyperLink
         HyperLink *      github_link = new HyperLink(this, _L("Download Beta Version"), "https://github.com/SoftFever/OrcaSlicer/releases");
         horizontal_sizer->Add(text2, 0, wxEXPAND, 0);

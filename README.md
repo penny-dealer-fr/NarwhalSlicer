@@ -5,13 +5,15 @@
 
 **An OrcaSlicer fork built for strength calibration, optimization, simulation, and testing.**
 
-[Source](https://github.com/penny-dealer-fr/NarwhalSlicer) · [Releases](https://github.com/penny-dealer-fr/NarwhalSlicer/releases) · [Strength workflow](docs/strength-analysis-workflow.md) · [License](LICENSE.txt)
+[Source](https://github.com/penny-dealer-fr/NarwhalSlicer/tree/Strength-Optimization) · [Releases](https://github.com/penny-dealer-fr/NarwhalSlicer/releases) · [Strength workflow](docs/strength-analysis-workflow.md) · [License](LICENSE.txt)
 
 </div>
 
 NarwhalSlicer brings strength-focused workflows into the OrcaSlicer desktop slicing environment. Set up loads and constraints, calibrate material behavior against physical tests, inspect simulated response, and apply localized reinforcement through native slicer modifiers.
 
 This is an independently maintained fork of [OrcaSlicer](https://github.com/OrcaSlicer/OrcaSlicer). OrcaSlicer’s website, releases, sponsors, and community accounts belong to the upstream project. OrcaCloud and printer-vendor services retain their own names and providers.
+
+Development currently lives on [`Strength-Optimization`](https://github.com/penny-dealer-fr/NarwhalSlicer/tree/Strength-Optimization). The `main` branch retains the upstream baseline.
 
 ## Project focus
 

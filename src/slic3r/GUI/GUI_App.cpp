@@ -3164,7 +3164,7 @@ bool GUI_App::on_init_inner()
                /* wxString tips = wxString::Format(_L("Click to download new version in default browser: %s"), version_info.version_str);
                 DownloadDialog dialog(this->mainframe,
                     tips,
-                    _L("New version of NarwhalSlicer"),
+                    _L("New upstream OrcaSlicer version"),
                     false,
                     wxCENTER | wxICON_INFORMATION);
 
@@ -3215,7 +3215,7 @@ bool GUI_App::on_init_inner()
                 wxString tips = wxString::Format(_L("Click to download new version in default browser: %s"), version_str);
                 DownloadDialog dialog(this->mainframe,
                     tips,
-                    _L("NarwhalSlicer needs an update"),
+                    _L("Upstream OrcaSlicer update"),
                     false,
                     wxCENTER | wxICON_INFORMATION);
                 dialog.SetExtendedMessage(description_text);

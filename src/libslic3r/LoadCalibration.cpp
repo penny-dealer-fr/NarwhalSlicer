@@ -16,12 +16,32 @@
 namespace Slic3r::LoadCalibration {
 const std::vector<Setting>& settings()
 {
-    static const std::vector<Setting>
-        list{{"sparse_infill_pattern"},  {"sparse_infill_density"}, {"wall_loops"},       {"top_surface_pattern"},
-             {"bottom_surface_pattern"}, {"layer_height"},          {"line_width"},       {"slow_down_layer_time"},
-             {"nozzle_temperature"},     {"bed_temperature"},       {"curr_bed_type"},    {"top_shell_layers"},
-             {"bottom_shell_layers"},    {"outer_wall_speed"},      {"inner_wall_speed"}, {"sparse_infill_speed"},
-             {"fan_max_speed"},          {"filament_flow_ratio"},   {"infill_direction"}};
+    static const std::vector<Setting> list{{"sparse_infill_pattern"},
+                                           {"sparse_infill_density"},
+                                           {"wall_loops"},
+                                           {"top_surface_pattern"},
+                                           {"bottom_surface_pattern"},
+                                           {"layer_height"},
+                                           {"line_width"},
+                                           {"slow_down_layer_time"},
+                                           {"nozzle_temperature"},
+                                           {"bed_temperature"},
+                                           {"curr_bed_type"},
+                                           {"top_shell_layers"},
+                                           {"bottom_shell_layers"},
+                                           {"outer_wall_speed"},
+                                           {"inner_wall_speed"},
+                                           {"sparse_infill_speed"},
+                                           {"fan_max_speed"},
+                                           {"filament_flow_ratio"},
+                                           {"infill_direction"},
+                                           {"alternate_extra_wall"},
+                                           {"inner_wall_line_width"},
+                                           {"sparse_infill_line_width"},
+                                           {"internal_solid_infill_line_width"},
+                                           {"inner_wall_flow_ratio"},
+                                           {"sparse_infill_flow_ratio"},
+                                           {"internal_solid_infill_flow_ratio"}};
     return list;
 }
 std::vector<std::string> range(double start, double end, double step)
@@ -49,6 +69,8 @@ DynamicPrintConfig setting_config(const DynamicPrintConfig& baseline, const std:
         const auto* def = print_config_def.get(option_key);
         if (!def)
             throw std::invalid_argument("Unknown setting: " + option_key);
+        if (def->type == coBool && value != "0" && value != "1")
+            throw std::invalid_argument("Boolean settings require No (0) or Yes (1).");
         if (def->type != coEnum) {
             size_t used    = 0;
             const double n = std::stod(value, &used);
@@ -70,6 +92,21 @@ DynamicPrintConfig setting_config(const DynamicPrintConfig& baseline, const std:
         if (key == "nozzle_temperature")
             assign("nozzle_temperature_initial_layer");
     }
+    if (key == "alternate_extra_wall") {
+        if (baseline.has("spiral_mode") && baseline.opt_bool("spiral_mode"))
+            throw std::invalid_argument("Disable spiral vase mode in Prepare before testing alternate extra walls.");
+        if (baseline.has("ensure_vertical_shell_thickness") && baseline.opt_serialize("ensure_vertical_shell_thickness") == "ensure_all")
+            result.set_deserialize_strict("ensure_vertical_shell_thickness", "ensure_moderate");
+    }
+    if (key == "inner_wall_flow_ratio" || key == "sparse_infill_flow_ratio" || key == "internal_solid_infill_flow_ratio") {
+        if (!baseline.has("set_other_flow_ratios") || !baseline.opt_bool("set_other_flow_ratios"))
+            for (const auto* role : {"outer_wall_flow_ratio", "inner_wall_flow_ratio", "overhang_flow_ratio", "sparse_infill_flow_ratio",
+                                     "internal_solid_infill_flow_ratio", "gap_fill_flow_ratio", "support_flow_ratio",
+                                     "support_interface_flow_ratio", "first_layer_flow_ratio"})
+                if (key != role)
+                    result.set_deserialize_strict(role, "1");
+        result.set_deserialize_strict("set_other_flow_ratios", "1");
+    }
     if (key == "layer_height" && result.opt_float("layer_height") <= 0)
         throw std::invalid_argument("Layer height must be positive.");
     // Generated studies are single-filament, single-extruder jobs using filament 1.
@@ -78,6 +115,10 @@ DynamicPrintConfig setting_config(const DynamicPrintConfig& baseline, const std:
 }
 void validate_sample(const Sample& s)
 {
+    if (s.related.size() > 1)
+        throw std::invalid_argument("A study supports one related parameter.");
+    for (const auto& [key, value] : s.related)
+        setting_config(DynamicPrintConfig{}, key, value);
     if (s.id.empty() || s.id.size() > 32 ||
         !std::all_of(s.id.begin(), s.id.end(), [](unsigned char c) { return std::isalnum(c) || c == '-'; }))
         throw std::invalid_argument("Invalid hook ID.");
@@ -98,7 +139,7 @@ Statistics summarize(const std::vector<Sample>& samples, const std::string& valu
     double m2 = 0, ratio = 0;
     size_t weighed = 0;
     for (const auto& s : samples) {
-        if (s.value != value || s.orientation != orientation)
+        if (sample_label(s) != value || s.orientation != orientation)
             continue;
         validate_sample(s);
         if (s.outcome == Outcome::NotTested) {
@@ -126,24 +167,51 @@ Statistics summarize(const std::vector<Sample>& samples, const std::string& valu
         r.mean_n_per_g = ratio / weighed;
     return r;
 }
-std::vector<Sample> make_samples(const std::vector<std::string>& values, int repeats)
+std::string sample_label(const Sample& sample)
 {
-    if (values.empty() || values.size() > 50 || repeats < 1 || repeats > 20 || values.size() * repeats * 2 > 200)
-        throw std::invalid_argument("Use 1–50 unique values, 1–20 repeats, and at most 200 hooks per study.");
-    if (std::set<std::string>(values.begin(), values.end()).size() != values.size())
+    std::string label = sample.value;
+    for (const auto& [key, value] : sample.related)
+        label += "; " + key + "=" + value;
+    return label;
+}
+DynamicPrintConfig sample_config(const DynamicPrintConfig& baseline, const std::string& setting, const Sample& sample)
+{
+    auto result = setting_config(baseline, setting, sample.value);
+    for (const auto& [key, value] : sample.related) {
+        if (key == setting)
+            throw std::invalid_argument("Related parameter must differ from the main parameter.");
+        result = setting_config(result, key, value);
+    }
+    return result;
+}
+std::vector<Sample> make_samples(const std::vector<std::string>& values,
+                                 int repeats,
+                                 const std::string& related_key,
+                                 const std::vector<std::string>& related_values)
+{
+    const size_t related_count = related_key.empty() ? 1 : related_values.size();
+    if (values.empty() || values.size() > 50 || related_count == 0 || related_count > 50 || values.size() * related_count > 50 ||
+        repeats < 1 || repeats > 20 || values.size() * related_count * repeats * 2 > 200)
+        throw std::invalid_argument("Use 1–50 unique combinations, 1–20 repeats, and at most 200 hooks per study.");
+    if (std::set<std::string>(values.begin(), values.end()).size() != values.size() ||
+        std::set<std::string>(related_values.begin(), related_values.end()).size() != related_values.size())
         throw std::invalid_argument("Setting values must be unique.");
     std::vector<Sample> result;
     for (const auto& v : values)
-        for (const auto& o : {"XY", "Z"})
-            for (int i = 0; i < repeats; ++i) {
-                std::ostringstream id;
-                id << "H" << std::setw(3) << std::setfill('0') << result.size() + 1 << "-" << o;
-                Sample s;
-                s.id          = id.str();
-                s.value       = v;
-                s.orientation = o;
-                result.push_back(s);
-            }
+        for (size_t j = 0; j < related_count; ++j)
+            for (const auto& o : {"XY", "Z"})
+                for (int i = 0; i < repeats; ++i) {
+                    std::ostringstream id;
+                    id << "H" << std::setw(3) << std::setfill('0') << result.size() + 1 << "-" << o;
+                    Sample s;
+                    s.id          = id.str();
+                    s.value       = v;
+                    s.orientation = o;
+                    if (!related_key.empty())
+                        s.related[related_key] = related_values[j];
+                    validate_sample(s);
+                    result.push_back(s);
+                }
     return result;
 }
 Model hook_model(const std::string& stl, const Sample& sample, const DynamicPrintConfig& config)
@@ -152,7 +220,7 @@ Model hook_model(const std::string& stl, const Sample& sample, const DynamicPrin
     if (model.objects.size() != 1)
         throw std::runtime_error("CNC Testhook must contain exactly one object.");
     auto* object = model.objects.front();
-    object->name = sample.id + " " + sample.value;
+    object->name = sample.id + " " + sample_label(sample);
     if (sample.orientation == "Z")
         object->rotate(0.5 * M_PI, X);
     if (object->instances.empty())
@@ -216,6 +284,8 @@ const std::vector<std::string>& plate_keys()
         for (const auto& setting : settings())
             if (setting.key != "bed_temperature" && !object_setting(setting.key)) keys.push_back(setting.key);
         keys.push_back("nozzle_temperature_initial_layer");
+        if (!object_setting("set_other_flow_ratios"))
+            keys.push_back("set_other_flow_ratios");
         for (const auto& key : {"hot_plate_temp", "textured_plate_temp", "cool_plate_temp", "textured_cool_plate_temp",
                                "eng_plate_temp", "supertack_plate_temp"}) {
             keys.emplace_back(key); keys.push_back(std::string(key)+"_initial_layer");
@@ -251,7 +321,7 @@ HookProject arrange_hooks(const std::string& stl, const std::vector<Sample>& sam
     if (samples.empty() || samples.size() > 200 || max_plates == 0)
         throw std::invalid_argument("Select between 1 and 200 hooks.");
     HookProject project;
-    project.config = setting_config(baseline, setting, samples.front().value);
+    project.config   = sample_config(baseline, setting, samples.front());
     const auto* area = baseline.option<ConfigOptionPoints>("printable_area");
     if (!area || area->values.size()<3) throw std::invalid_argument("A printable bed is required.");
     const BoundingBoxf bounds(area->values);
@@ -265,30 +335,41 @@ HookProject arrange_hooks(const std::string& stl, const std::vector<Sample>& sam
     }
     std::vector<Polygons> occupied;
     std::vector<std::string> plate_values;
-    const bool per_object = object_setting(setting);
     const bool isolated = setting == "slow_down_layer_time";
     for (const auto& sample : samples) {
         validate_sample(sample);
-        const auto config = setting_config(baseline,setting,sample.value);
+        const auto config = sample_config(baseline, setting, sample);
         auto hook = hook_model(stl,sample,config);
         auto* object = project.model.add_object(*hook.objects.front());
-        if (per_object) object->config.set_key_value(setting,config.option(setting)->clone());
+        std::set<std::string> object_keys{setting};
+        for (const auto& [key, value] : sample.related)
+            object_keys.insert(key);
+        for (const auto& key : baseline.diff(config))
+            object_keys.insert(key);
+        for (const auto& key : object_keys)
+            if (object_setting(key))
+                object->config.set_key_value(key, config.option(key)->clone());
+        const auto plate_signature = serialize_plate_settings(config);
         const auto box = object->bounding_box_exact();
         bool placed = false;
         for (size_t plate=0; !placed && plate<=project.plates.size(); ++plate) {
             if (plate == project.plates.size()) {
                 if (plate >= max_plates) throw std::invalid_argument("Selected hooks require too many plates. Open a smaller selection.");
                 HookPlate item;
-                if (!per_object) {
+                {
                     for (const auto& key : baseline.diff(config))
-                        if (key != "print_sequence") item.config.set_key_value(key,config.option(key)->clone());
+                        if (key != "print_sequence" && !object_setting(key))
+                            item.config.set_key_value(key, config.option(key)->clone());
                     // Also retain the first value when it equals the baseline.
                     for (const auto& key : plate_keys())
                         if (config.has(key)) item.config.set_key_value(key,config.option(key)->clone());
                 }
-                project.plates.push_back(std::move(item)); occupied.emplace_back(); plate_values.push_back(sample.value);
+                project.plates.push_back(std::move(item));
+                occupied.emplace_back();
+                plate_values.push_back(plate_signature);
             }
-            if ((!per_object && plate_values[plate] != sample.value) || (isolated && !occupied[plate].empty())) continue;
+            if ((plate_values[plate] != plate_signature) || (isolated && !occupied[plate].empty()))
+                continue;
             for (double y=bounds.min.y()+12; !placed && y+box.size().y()+12<=bounds.max.y(); y+=5)
                 for (double x=bounds.min.x()+12; !placed && x+box.size().x()+12<=bounds.max.x(); x+=5) {
                     Polygon footprint;
@@ -394,6 +475,8 @@ std::string serialize_samples(const std::vector<Sample>& samples)
                               {"orientation", s.orientation},
                               {"outcome", int(s.outcome)},
                               {"notes", s.notes}};
+        if (!s.related.empty())
+            row["related"] = s.related;
         row["load_n"]      = s.load_n ? nlohmann::json(*s.load_n) : nlohmann::json(nullptr);
         row["mass_g"]      = s.mass_g ? nlohmann::json(*s.mass_g) : nlohmann::json(nullptr);
         j.push_back(row);
@@ -414,6 +497,8 @@ std::vector<Sample> deserialize_samples(const std::string& text)
         s.orientation = row.at("orientation");
         s.outcome     = Outcome(row.at("outcome").get<int>());
         s.notes       = row.value("notes", "");
+        if (row.contains("related"))
+            s.related = row.at("related").get<std::map<std::string, std::string>>();
         if (!row.at("load_n").is_null())
             s.load_n = row.at("load_n").get<double>();
         if (!row.at("mass_g").is_null())

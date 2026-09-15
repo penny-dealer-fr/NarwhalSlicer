@@ -89,6 +89,10 @@ void validate(const Json& r)
         o.value("excluded", false);
         o.value("source", std::string());
         o.value("notes", std::string());
+        if (o.contains("parameters"))
+            for (const auto& p : o.at("parameters").get<std::vector<std::string>>())
+                if (!known_parameter(p))
+                    throw std::invalid_argument("Unknown experimental parameter.");
         auto context = o.at("context").get<Context>();
         if (context.size() > 100)
             throw std::invalid_argument("Oversized experimental context.");
@@ -155,11 +159,21 @@ void append_study(Json& r,
         const std::string property = sample.orientation == "XY" ? "ultimate_strength_xy_pa" : "ultimate_strength_z_pa";
         auto inputs                = context;
         inputs[parameter]          = sample.value;
+        std::vector<std::string> varied{parameter};
+        for (const auto& [key, value] : sample.related) {
+            if (key == parameter)
+                throw std::invalid_argument("Related parameter must differ from the main parameter.");
+            inputs[key] = value;
+            varied.push_back(key);
+            if (!updated["modes"].contains(key))
+                updated["modes"][key] = mode;
+        }
         Json row                   = {{"id", source + "/" + sample.id + "/" + property},
                                       {"source", source},
                                       {"hook", sample.id},
                                       {"property", property},
                                       {"parameter", parameter},
+                                      {"parameters", varied},
                                       {"value", sample.value},
                                       {"context", inputs},
                                       {"outcome", int(sample.outcome)},
@@ -199,10 +213,20 @@ Prediction predict(const Json& r, const std::string& property, const Context& su
         rows.push_back(&o);
         if (o.at("parameter") != "direct")
             parameters.insert(o.at("parameter").get<std::string>());
+        if (o.contains("parameters"))
+            for (const auto& p : o.at("parameters").get<std::vector<std::string>>())
+                if (p != "direct")
+                    parameters.insert(p);
     }
     // Simple and categorical modes only pool matching values; never fabricate category interpolation.
     std::set<std::string> numeric_parameters;
-    for (const auto& p : parameters) {
+    std::vector<std::string> ordered(parameters.begin(), parameters.end());
+    auto discrete = [&](const std::string& p) {
+        const auto* d = print_config_def.get(p);
+        return r.at("modes").value(p, "regressed") == "simple" || (d && (d->type == coEnum || d->type == coBool));
+    };
+    std::stable_sort(ordered.begin(), ordered.end(), [&](const auto& a, const auto& b) { return discrete(a) > discrete(b); });
+    for (const auto& p : ordered) {
         bool all_numeric = true;
         std::set<double> unique;
         for (auto* o : rows) {
@@ -215,8 +239,8 @@ Prediction predict(const Json& r, const std::string& property, const Context& su
             unique.insert(x);
         }
         const auto* definition = print_config_def.get(p);
-        if (r.at("modes").value(p, "regressed") == "regressed" && (!definition || definition->type != coEnum) && all_numeric &&
-            unique.size() >= 3)
+        if (r.at("modes").value(p, "regressed") == "regressed" &&
+            (!definition || (definition->type != coEnum && definition->type != coBool)) && all_numeric && unique.size() >= 3)
             numeric_parameters.insert(p);
         else {
             rows.erase(std::remove_if(rows.begin(), rows.end(),

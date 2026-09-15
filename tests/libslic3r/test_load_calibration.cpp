@@ -200,3 +200,69 @@ TEST_CASE("Selected hooks share plates without overlap and remain on the bed aft
     auto isolated = LC::arrange_hooks(stl, LC::make_samples({"5", "10"}, 1), config, "slow_down_layer_time");
     REQUIRE(isolated.plates.size() == 4);
 }
+TEST_CASE("Pattern and density studies preserve every combination through serialization and arrangement", "[LoadCalibration]")
+{
+    auto samples = LC::make_samples({"gyroid", "grid"}, 2, "sparse_infill_density", {"20", "30", "50"});
+    REQUIRE(samples.size() == 24);
+    auto restored = LC::deserialize_samples(LC::serialize_samples(samples));
+    REQUIRE(restored[4].related.at("sparse_infill_density") == "30");
+    REQUIRE(LC::sample_label(restored[0]) != LC::sample_label(restored[4]));
+    REQUIRE(LC::summarize(restored, LC::sample_label(restored[0]), "XY").untested == 2);
+    auto config = DynamicPrintConfig::full_print_config();
+    config.set_deserialize_strict("printable_area", "0x0,200x0,200x200,0x200");
+    config.set_deserialize_strict("printable_height", "200");
+    config.set_deserialize_strict("bed_exclude_area", "");
+    const auto stl = (boost::filesystem::path(TEST_DATA_DIR).parent_path().parent_path() / "resources/handy_models/CNC_Testhook.stl")
+                         .string();
+    const auto project = LC::arrange_hooks(stl, restored, config, "sparse_infill_pattern");
+    REQUIRE(project.model.objects.size() == 24);
+    for (size_t i = 0; i < restored.size(); ++i) {
+        const auto& c = project.model.objects[i]->config;
+        REQUIRE(c.opt_serialize("sparse_infill_pattern") == restored[i].value);
+        REQUIRE_THAT(c.opt_float("sparse_infill_density"), WithinAbs(std::stod(restored[i].related.at("sparse_infill_density")), 1e-6));
+    }
+    ScopedTemporaryFile file(".3mf");
+    auto saved = LC::arrange_hooks(stl, restored, config, "sparse_infill_pattern");
+    LC::store_project(file.string(), saved);
+    ScopedSlic3rTemporaryDir temporary;
+    Model loaded;
+    DynamicPrintConfig loaded_config;
+    ConfigSubstitutionContext substitutions(ForwardCompatibilitySubstitutionRule::Enable);
+    PlateDataPtrs plates;
+    std::vector<Preset*> presets;
+    bool bbl = false, orca = false;
+    Semver version;
+    REQUIRE(load_bbs_3mf(file.string().c_str(), &loaded_config, &substitutions, &loaded, &plates, &presets, &bbl, &orca, &version, nullptr,
+                         LoadStrategy::LoadModel | LoadStrategy::LoadConfig));
+    REQUIRE(loaded.objects.size() == restored.size());
+    for (size_t i = 0; i < restored.size(); ++i) {
+        REQUIRE(loaded.objects[i]->config.opt_serialize("sparse_infill_pattern") == restored[i].value);
+        REQUIRE_THAT(loaded.objects[i]->config.opt_float("sparse_infill_density"),
+                     WithinAbs(std::stod(restored[i].related.at("sparse_infill_density")), 1e-6));
+        REQUIRE_THAT(loaded.objects[i]->bounding_box_exact().min.z(), WithinAbs(0, .001));
+    }
+    release_PlateData_list(plates);
+    for (auto* preset : presets)
+        delete preset;
+    REQUIRE_THROWS(LC::make_samples({"grid", "gyroid"}, 20, "sparse_infill_density", {"20", "30", "50"}));
+}
+TEST_CASE("Internal flow calibration enables its gate without changing exterior flow", "[LoadCalibration]")
+{
+    auto config = DynamicPrintConfig::full_print_config();
+    config.set_deserialize_strict("set_other_flow_ratios", "0");
+    config.set_deserialize_strict("outer_wall_flow_ratio", "1.2");
+    auto result = LC::setting_config(config, "inner_wall_flow_ratio", "1.1");
+    REQUIRE(result.opt_bool("set_other_flow_ratios"));
+    REQUIRE_THAT(result.opt_float("inner_wall_flow_ratio"), WithinAbs(1.1, 1e-6));
+    REQUIRE_THAT(result.opt_float("outer_wall_flow_ratio"), WithinAbs(1, 1e-6));
+    REQUIRE_THAT(result.opt_float("first_layer_flow_ratio"), WithinAbs(1, 1e-6));
+    config.set_deserialize_strict("set_other_flow_ratios", "1");
+    REQUIRE_THAT(LC::setting_config(config, "sparse_infill_flow_ratio", "1.1").opt_float("outer_wall_flow_ratio"), WithinAbs(1.2, 1e-6));
+    REQUIRE(LC::setting_config(config, "alternate_extra_wall", "1").opt_bool("alternate_extra_wall"));
+    REQUIRE_FALSE(LC::setting_config(config, "alternate_extra_wall", "0").opt_bool("alternate_extra_wall"));
+    for (const auto* value : {"0", "1"})
+        REQUIRE(LC::setting_config(config, "alternate_extra_wall", value).opt_serialize("ensure_vertical_shell_thickness") == "ensure_moderate");
+    REQUIRE_THROWS(LC::setting_config(config, "alternate_extra_wall", "0.5"));
+    for (const auto* key : {"inner_wall_line_width", "sparse_infill_line_width", "internal_solid_infill_line_width"})
+        REQUIRE_THAT(LC::setting_config(config, key, "0.45").option<ConfigOptionFloatOrPercent>(key)->value, WithinAbs(.45, 1e-6));
+}

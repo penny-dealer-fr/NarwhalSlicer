@@ -131,3 +131,25 @@ TEST_CASE("Thermal fits hold at measured limits and equivalent numeric settings 
     numeric.erase("reference");
     REQUIRE_THROWS(ME::validate(numeric));
 }
+TEST_CASE("Each infill pattern learns an independent density curve", "[MaterialExperiments]")
+{
+    auto record  = ME::create(StrengthAnalysis::builtin_materials().front());
+    auto samples = LC::make_samples({"grid", "gyroid"}, 2, "sparse_infill_density", {"20", "30", "50"});
+    for (auto& s : samples) {
+        s.outcome            = LC::Outcome::Failed;
+        const double density = std::stod(s.related.at("sparse_infill_density"));
+        s.load_n             = s.value == "grid" ? 100 + 5 * density : 50 + 15 * density;
+    }
+    ME::append_study(record, "factorial", "sparse_infill_pattern", {{"sparse_infill_pattern", "grid"}, {"sparse_infill_density", "30"}},
+                     samples, .1, .05, "regressed");
+    const auto grid = ME::predict(record, "ultimate_strength_xy_pa", {{"sparse_infill_pattern", "grid"}, {"sparse_infill_density", "35"}});
+    const auto gyroid = ME::predict(record, "ultimate_strength_xy_pa",
+                                    {{"sparse_infill_pattern", "gyroid"}, {"sparse_infill_density", "75"}});
+    REQUIRE(grid.points == 6);
+    REQUIRE(grid.configurations == 3);
+    REQUIRE_THAT(grid.value, WithinRel(27.5e6, .05));
+    REQUIRE_THAT(gyroid.value, WithinRel(117.5e6, .08));
+    REQUIRE_FALSE(ME::predict(record, "ultimate_strength_xy_pa", {{"sparse_infill_pattern", "cubic"}}).experimental);
+    ME::append_study(record, "factorial", "sparse_infill_pattern", {}, samples, .1, .05, "regressed");
+    REQUIRE(record["observations"].size() == 24);
+}

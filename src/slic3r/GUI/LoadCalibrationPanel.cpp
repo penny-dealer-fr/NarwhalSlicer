@@ -14,6 +14,7 @@
 #include <boost/filesystem/fstream.hpp>
 #include <wx/button.h>
 #include <wx/choice.h>
+#include <wx/checklst.h>
 #include <wx/clrpicker.h>
 #include <wx/grid.h>
 #include <wx/msgdlg.h>
@@ -117,6 +118,13 @@ struct LoadCalibrationPanel::Impl
     LoadCalibrationPanel* panel;
     wxChoice *setting{}, *study_choice{}, *unit{}, *base{}, *target{}, *group{}, *calculation{};
     wxTextCtrl *values{}, *start{}, *end{}, *step{}, *material{}, *type{}, *xy{}, *z{}, *summary{};
+    wxCheckListBox* categories{};
+    wxChoice* related_mode{};
+    wxTextCtrl* related_values{};
+    wxStaticText* related_label{};
+    std::vector<wxWindow*> numeric_controls, categorical_controls, related_controls;
+    std::vector<std::string> category_values;
+    std::string related_key;
     wxSpinCtrl* repeats{};
     wxColourPickerCtrl* color{};
     std::string legacy_color;
@@ -211,20 +219,85 @@ struct LoadCalibrationPanel::Impl
         base->SetSelection(0);
         target->SetSelection(0);
     }
-    void setting_help()
+    static std::vector<std::string> split_values(const std::string& text)
+    {
+        std::vector<std::string> list;
+        std::istringstream input(text);
+        std::string value;
+        while (std::getline(input, value, ',')) {
+            const auto a = value.find_first_not_of(" \t\r\n"), b = value.find_last_not_of(" \t\r\n");
+            if (a != std::string::npos)
+                list.push_back(value.substr(a, b - a + 1));
+        }
+        return list;
+    }
+    void related_help()
+    {
+        related_values->Enable(related_mode->GetSelection() != 0);
+        if (related_mode->GetSelection() == 1) {
+            const auto list = split_values(utf8(related_values));
+            if (list.size() > 1)
+                related_values->ChangeValue(wxString::FromUTF8(list.front()));
+        }
+    }
+    void setting_help(bool restoring = false)
     {
         const std::string key = LC::settings()[setting->GetSelection()].key;
-        const auto* def       = print_config_def.get(key);
-        wxString text         = _L("Enter comma-separated values, or fill the numeric range and click Use range.");
-        if (def && !def->enum_values.empty()) {
-            text = _L("Available values: ");
-            for (const auto& value : def->enum_values)
-                text += wxString::FromUTF8(value) + "  ";
+        const auto* def        = print_config_def.get(key);
+        const bool categorical = def && (def->type == coEnum || def->type == coBool);
+        for (auto* control : numeric_controls)
+            control->Show(!categorical);
+        for (auto* control : categorical_controls)
+            control->Show(categorical);
+        category_values.clear();
+        categories->Clear();
+        if (categorical) {
+            category_values     = def->type == coBool ? std::vector<std::string>{"0", "1"} : def->enum_values;
+            const auto selected = split_values(utf8(values));
+            for (size_t i = 0; i < category_values.size(); ++i) {
+                categories->Append(def->type == coBool ?
+                                       (i == 0 ? _L("No") : _L("Yes")) :
+                                       (i < def->enum_labels.size() ? _(def->enum_labels[i]) : wxString::FromUTF8(category_values[i])));
+                categories->Check(unsigned(i),
+                                  restoring ? std::find(selected.begin(), selected.end(), category_values[i]) != selected.end() : i < 2);
+            }
         }
-        if (key == "slow_down_layer_time")
-            text += _L(" Minimum layer time is a cooling target; actual layer time can be longer.");
-        help->SetLabel(text);
+        related_key = key == "sparse_infill_pattern"            ? "sparse_infill_density" :
+                      key == "alternate_extra_wall"             ? "wall_loops" :
+                      key == "inner_wall_flow_ratio"            ? "inner_wall_line_width" :
+                      key == "sparse_infill_flow_ratio"         ? "sparse_infill_line_width" :
+                      key == "internal_solid_infill_flow_ratio" ? "internal_solid_infill_line_width" :
+                                                                  "";
+        for (auto* control : related_controls)
+            control->Show(!related_key.empty());
+        if (!related_key.empty()) {
+            related_label->SetLabel(_L("Related parameter: ") + _(print_config_def.get(related_key)->label));
+            related_mode->SetSelection(0);
+            related_values->ChangeValue(related_key == "sparse_infill_density" ? "20,30,50" :
+                                        related_key == "wall_loops"            ? "2,3,4" :
+                                                                                 "0.4,0.45,0.5");
+            if (restoring && !samples.empty() && samples.front().related.count(related_key)) {
+                std::set<std::string> seen;
+                wxString joined;
+                for (const auto& sample : samples) {
+                    const auto it = sample.related.find(related_key);
+                    if (it != sample.related.end() && seen.insert(it->second).second) {
+                        if (!joined.empty())
+                            joined += ",";
+                        joined += wxString::FromUTF8(it->second);
+                    }
+                }
+                related_mode->SetSelection(seen.size() > 1 ? 2 : 1);
+                related_values->ChangeValue(joined);
+            }
+        }
+        related_help();
+        help->SetLabel(categorical ? _L("Check every value to test. Related sweeps print every selected combination in both XY and Z.") :
+                                     _L("Enter comma-separated values, or fill the numeric range and click Use range."));
+        if (key == "alternate_extra_wall")
+            help->SetLabel(help->GetLabel() + _L(" Ensure vertical shell thickness uses Moderate for both No and Yes when Prepare is set to All."));
         help->Wrap(panel->FromDIP(850));
+        panel->Layout();
         panel->FitInside();
     }
     void table()
@@ -238,7 +311,7 @@ struct LoadCalibrationPanel::Impl
         for (size_t i = 0; i < samples.size(); ++i) {
             const auto& s = samples[i];
             grid->SetCellValue(int(i), 0, wxString::FromUTF8(s.id));
-            grid->SetCellValue(int(i), 1, wxString::FromUTF8(s.value));
+            grid->SetCellValue(int(i), 1, wxString::FromUTF8(LC::sample_label(s)));
             grid->SetCellValue(int(i), 2, wxString::FromUTF8(s.orientation));
             for (int c = 0; c < 3; ++c)
                 grid->SetReadOnly(int(i), c);
@@ -253,8 +326,8 @@ struct LoadCalibrationPanel::Impl
             if (s.mass_g)
                 grid->SetCellValue(int(i), 5, wxString::Format("%.6g", *s.mass_g));
             grid->SetCellValue(int(i), 6, wxString::FromUTF8(s.notes));
-            if (seen.insert(s.value).second)
-                group->Append(wxString::FromUTF8(s.value));
+            if (seen.insert(LC::sample_label(s)).second)
+                group->Append(wxString::FromUTF8(LC::sample_label(s)));
         }
         unit->SetSelection(0);
         displayed_unit = 0;
@@ -354,15 +427,18 @@ struct LoadCalibrationPanel::Impl
             if (LC::settings()[i].key == study.at("setting").get<std::string>())
                 setting->SetSelection(int(i));
         wxString restored_values;
-        for (unsigned i = 0; i < group->GetCount(); ++i) {
-            if (i)
+        std::set<std::string> restored_seen;
+        for (const auto& sample : samples) {
+            if (!restored_seen.insert(sample.value).second)
+                continue;
+            if (!restored_values.empty())
                 restored_values += ",";
-            restored_values += group->GetString(i);
+            restored_values += wxString::FromUTF8(sample.value);
         }
         values->ChangeValue(restored_values);
         if (!samples.empty())
             repeats->SetValue(int(std::count_if(samples.begin(), samples.end(), [&](const LC::Sample& sample) {
-                return sample.value == samples.front().value && sample.orientation == "XY";
+                return LC::sample_label(sample) == LC::sample_label(samples.front()) && sample.orientation == "XY";
             })));
         for (size_t i = 0; i < load_materials().size(); ++i)
             if (load_materials()[i].key == study.value("base_key", ""))
@@ -370,7 +446,7 @@ struct LoadCalibrationPanel::Impl
         const auto selected = wxString::FromUTF8(study.value("selected_value", ""));
         if (group->FindString(selected) != wxNOT_FOUND)
             group->SetStringSelection(selected);
-        setting_help();
+        setting_help(true);
         report();
         status->SetLabel(wxString::FromUTF8(path.string()));
     }
@@ -382,20 +458,24 @@ struct LoadCalibrationPanel::Impl
             persist(false);
         if (utf8(material).empty() || utf8(type).empty() || color_value().empty())
             throw std::invalid_argument("Enter material name, type, and color.");
-        std::vector<std::string> list;
-        std::istringstream input(utf8(values));
-        std::string v;
-        while (std::getline(input, v, ',')) {
-            const auto a = v.find_first_not_of(" \t\r\n"), b = v.find_last_not_of(" \t\r\n");
-            if (a != std::string::npos)
-                list.push_back(v.substr(a, b - a + 1));
+        auto list = split_values(utf8(values));
+        if (categories->IsShown()) {
+            list.clear();
+            for (unsigned i = 0; i < categories->GetCount(); ++i)
+                if (categories->IsChecked(i))
+                    list.push_back(category_values.at(i));
         }
-        auto planned          = LC::make_samples(list, repeats->GetValue());
-        const auto baseline   = wxGetApp().preset_bundle->full_config_secure();
+        const auto related = !related_key.empty() && related_mode->GetSelection() != 0 ? split_values(utf8(related_values)) :
+                                                                                         std::vector<std::string>{};
+        if (!related_key.empty() && related_mode->GetSelection() == 1 && related.size() != 1)
+            throw std::invalid_argument("Enter one related value for Fixed, or choose Sweep for multiple values.");
+        const bool use_related = !related_key.empty() && related_mode->GetSelection() != 0;
+        auto planned           = LC::make_samples(list, repeats->GetValue(), use_related ? related_key : "", related);
+        const auto baseline    = wxGetApp().preset_bundle->full_config_secure();
         const std::string key = LC::settings()[setting->GetSelection()].key;
         std::vector<DynamicPrintConfig> configs;
-        for (const auto& s : planned)
-            configs.push_back(LC::setting_config(baseline, key, s.value));
+        for (const auto& sample : planned)
+            configs.push_back(LC::sample_config(baseline, key, sample));
         const auto stl = (boost::filesystem::path(resources_dir()) / "handy_models" / "CNC_Testhook.stl").string();
         // Validate geometry before creating a persistent study or starting the worker.
         LC::hook_model(stl, planned.front(), configs.front());
@@ -510,7 +590,7 @@ struct LoadCalibrationPanel::Impl
             baseline.set_deserialize_strict(it.key(), it.value().get<std::string>());
         std::vector<DynamicPrintConfig> configs;
         for (const auto& sample : samples)
-            configs.push_back(LC::setting_config(baseline, study.at("setting").get<std::string>(), sample.value));
+            configs.push_back(LC::sample_config(baseline, study.at("setting").get<std::string>(), sample));
         run_worker(std::move(configs), (current_path / "CNC_Testhook.stl").string());
     }
     void save_material()
@@ -554,7 +634,13 @@ struct LoadCalibrationPanel::Impl
         ME::append_study(record, current_path.filename().string(), study.at("setting"), ME::context_from_config(baseline_config()), samples,
                          number(xy), number(z), mode);
         calibrated.experimental_context                                         = ME::context_from_config(baseline_config());
-        calibrated.experimental_context[study.at("setting").get<std::string>()] = value;
+        for (const auto& sample : samples)
+            if (LC::sample_label(sample) == value) {
+                calibrated.experimental_context[study.at("setting").get<std::string>()] = sample.value;
+                for (const auto& [key, v] : sample.related)
+                    calibrated.experimental_context[key] = v;
+                break;
+            }
         calibrated.experimental_data                                            = record.dump();
         calibrated                                                              = ME::evaluate(calibrated, calibrated.experimental_context);
         calibrated.name                                                         = utf8(material) + " -- CALIBRATED";
@@ -601,15 +687,22 @@ LoadCalibrationPanel::LoadCalibrationPanel(wxWindow* parent) : wxScrolledWindow(
         return label;
     };
     add_text(_L("Load calibration — CNC Testhook"));
-    add_text(_L("Sweep one setting using the current printer, process, and first filament. Every repeat gets an XY hook and a Z hook, each "
+    add_text(_L("Sweep a setting and optional related values using the current printer, process, and first filament. Every repeat gets an "
+                "XY hook and a Z hook, each "
                 "on its own plate, so temperatures and cooling tests stay independent. Z hooks stand upright; configure support and brim "
                 "in Prepare before generating. Each plate is saved as a project and automatically sliced to G-code."));
     auto* form = new wxFlexGridSizer(2, gap, gap);
     form->AddGrowableCol(1, 1);
     root->Add(form, 0, wxEXPAND | wxALL, gap);
-    auto field = [&](const wxString& label, wxWindow* control) {
-        form->Add(new wxStaticText(this, wxID_ANY, label), 0, wxALIGN_CENTER_VERTICAL);
+    std::vector<wxWindow*>* control_group = nullptr;
+    auto field                            = [&](const wxString& label, wxWindow* control) {
+        auto* caption = new wxStaticText(this, wxID_ANY, label);
+        form->Add(caption, 0, wxALIGN_CENTER_VERTICAL);
         form->Add(control, 1, wxEXPAND);
+        if (control_group) {
+            control_group->push_back(caption);
+            control_group->push_back(control);
+        }
     };
     auto text = [&](const wxString& label, const wxString& value) {
         auto* c = new wxTextCtrl(this, wxID_ANY, value);
@@ -630,12 +723,28 @@ LoadCalibrationPanel::LoadCalibrationPanel(wxWindow* parent) : wxScrolledWindow(
     }
     m->setting->SetSelection(1);
     field(_L("Setting to vary"), m->setting);
+    control_group = &m->categorical_controls;
+    m->categories = new wxCheckListBox(this, wxID_ANY, wxDefaultPosition, FromDIP(wxSize(500, 150)));
+    field(_L("Values to test"), m->categories);
+    control_group      = &m->numeric_controls;
     m->values          = text(_L("Setting values (comma-separated)"), "15,30,50");
     m->start           = text(_L("Range start"), "15");
     m->end             = text(_L("Range end"), "50");
     m->step            = text(_L("Range increment"), "5");
     auto* range_button = new wxButton(this, wxID_ANY, _L("Use range"));
     field(wxEmptyString, range_button);
+    control_group    = &m->related_controls;
+    m->related_label = new wxStaticText(this, wxID_ANY, _L("Related parameter"));
+    field(wxEmptyString, m->related_label);
+    m->related_mode = new wxChoice(this, wxID_ANY);
+    m->related_mode->Append(_L("Use current Prepare setting"));
+    m->related_mode->Append(_L("Fixed value for all tests"));
+    m->related_mode->Append(_L("Sweep every combination"));
+    m->related_mode->SetSelection(0);
+    field(_L("Related values"), m->related_mode);
+    m->related_values = text(_L("Value(s), comma-separated"), "20,30,50");
+    m->related_mode->Bind(wxEVT_CHOICE, [this](wxCommandEvent&) { m->related_help(); });
+    control_group = nullptr;
     m->repeats = new wxSpinCtrl(this, wxID_ANY);
     m->repeats->SetRange(1, 20);
     m->repeats->SetValue(3);
@@ -884,7 +993,10 @@ public:
 struct CalibratedMaterialsPanel::Impl
 {
     CalibratedMaterialsPanel* panel;
-    wxChoice *materials{}, *parameter{}, *property{}, *mode{};
+    wxChoice *materials{}, *parameter{}, *property{}, *mode{}, *curve_category{};
+    wxStaticText* curve_category_label{};
+    std::string curve_category_key;
+    std::vector<std::string> curve_category_values;
     wxTextCtrl *name{}, *type{}, *query{}, *low{}, *high{}, *details{};
     wxColourPickerCtrl* color{};
     wxGrid *sheet{}, *data{};
@@ -980,6 +1092,34 @@ struct CalibratedMaterialsPanel::Impl
         const auto p = parameter_key();
         mode->SetSelection(record["modes"].value(p, "regressed") == "simple" ? 1 : 0);
         query->ChangeValue(wxString::FromUTF8(context.count(p) ? context[p] : ""));
+        curve_category_key.clear();
+        curve_category_values.clear();
+        curve_category->Clear();
+        for (auto it = record["modes"].begin(); it != record["modes"].end(); ++it) {
+            const auto* def = print_config_def.get(it.key());
+            if (it.key() != p && def && (def->type == coEnum || def->type == coBool)) {
+                curve_category_key = it.key();
+                curve_category_label->SetLabel(_L("Curve for: ") + _(def->label));
+                std::set<std::string> seen;
+                for (const auto& o : record["observations"]) {
+                    const auto c = o.at("context").get<ME::Context>();
+                    if (c.count(it.key()) && seen.insert(c.at(it.key())).second) {
+                        curve_category_values.push_back(c.at(it.key()));
+                        curve_category->Append(def->type == coBool ? (c.at(it.key()) == "1" ? _L("Yes") : _L("No")) :
+                                                                     wxString::FromUTF8(c.at(it.key())));
+                    }
+                }
+                break;
+            }
+        }
+        curve_category->Show(!curve_category_values.empty());
+        curve_category_label->Show(!curve_category_values.empty());
+        if (!curve_category_values.empty()) {
+            auto selected = std::find(curve_category_values.begin(), curve_category_values.end(), context[curve_category_key]);
+            size_t index  = selected == curve_category_values.end() ? 0 : size_t(selected - curve_category_values.begin());
+            curve_category->SetSelection(int(index));
+            context[curve_category_key] = curve_category_values[index];
+        }
         const auto prop = property_key();
         low->Clear();
         high->Clear();
@@ -1028,7 +1168,12 @@ struct CalibratedMaterialsPanel::Impl
             data->AppendRows(1);
             data->SetCellValue(row, 0, wxString::FromUTF8(o.at("id").get<std::string>()));
             data->SetCellValue(row, 1, wxString::FromUTF8(o.at("parameter").get<std::string>()));
-            data->SetCellValue(row, 2, wxString::FromUTF8(o.at("value").get<std::string>()));
+            std::string settings = o.at("value").get<std::string>();
+            if (o.contains("parameters"))
+                for (const auto& key : o.at("parameters").get<std::vector<std::string>>())
+                    if (key != o.at("parameter").get<std::string>() && o.at("context").contains(key))
+                        settings += "; " + key + "=" + o.at("context").at(key).get<std::string>();
+            data->SetCellValue(row, 2, wxString::FromUTF8(settings));
             data->SetCellValue(row, 3, o["measured"].is_null() ? wxString() : wxString::Format("%.6g", o["measured"].get<double>()));
             data->SetCellValue(row, 4,
                                o.value("excluded", false) ? _L("Excluded") :
@@ -1054,6 +1199,9 @@ struct CalibratedMaterialsPanel::Impl
             if (o["property"] != prop || o.value("excluded", false) || o["outcome"] != 1 || o["measured"].is_null())
                 continue;
             const auto inputs = o.at("context").get<ME::Context>();
+            if (!curve_category_key.empty() &&
+                (!inputs.count(curve_category_key) || inputs.at(curve_category_key) != context[curve_category_key]))
+                continue;
             if (!inputs.count(param))
                 continue;
             double x;
@@ -1080,7 +1228,8 @@ struct CalibratedMaterialsPanel::Impl
         }
         if (record["modes"].value(param, "regressed") == "simple")
             graph->line.clear();
-        graph->caption = wxString::FromUTF8(prop + " by " + param);
+        graph->caption = wxString::FromUTF8(
+            prop + " by " + param + (curve_category_key.empty() ? "" : " — " + curve_category_key + "=" + context[curve_category_key]));
         graph->Refresh();
         panel->FitInside();
     }
@@ -1293,6 +1442,18 @@ CalibratedMaterialsPanel::CalibratedMaterialsPanel(wxWindow* parent) : wxScrolle
     root->Add(form, 0, wxEXPAND | wxALL, gap);
     m->parameter = new wxChoice(this, wxID_ANY);
     field(_L("Parameter"), m->parameter);
+    m->curve_category_label = new wxStaticText(this, wxID_ANY, _L("Curve for"));
+    m->curve_category       = new wxChoice(this, wxID_ANY);
+    form->Add(m->curve_category_label, 0, wxALIGN_CENTER_VERTICAL);
+    form->Add(m->curve_category, 1, wxEXPAND);
+    m->curve_category->Bind(wxEVT_CHOICE, [this](wxCommandEvent&) {
+        m->guarded([&] {
+            const int selected = m->curve_category->GetSelection();
+            if (selected >= 0)
+                m->context[m->curve_category_key] = m->curve_category_values.at(size_t(selected));
+            m->render();
+        });
+    });
     m->property = new wxChoice(this, wxID_ANY);
     for (const auto& p : ME::properties())
         m->property->Append(_(p.label));

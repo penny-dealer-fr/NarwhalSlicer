@@ -51,3 +51,32 @@ TEST_CASE("CNC testhook plates slice in XY and Z with the swept settings", "[Loa
     });
     REQUIRE(extrusions > 100);
 }
+TEST_CASE("Related pattern and density combinations each produce their own sliced hook", "[LoadCalibration]")
+{
+    auto baseline  = Test::multifilament_config(1, {{"printable_area", "0x0,200x0,200x200,0x200"},
+                                                    {"printable_height", "200"},
+                                                    {"layer_change_gcode", "G92 E0"},
+                                                    {"layer_height", "0.3"}});
+    const auto stl = (boost::filesystem::path(TEST_DATA_DIR).parent_path().parent_path() / "resources/handy_models/CNC_Testhook.stl")
+                         .string();
+    auto samples    = LoadCalibration::make_samples({"grid", "gyroid"}, 1, "sparse_infill_density", {"20", "50"});
+    size_t exported = 0;
+    for (const auto& sample : samples) {
+        INFO(LoadCalibration::sample_label(sample));
+        auto config = LoadCalibration::sample_config(baseline, "sparse_infill_pattern", sample);
+        auto model  = LoadCalibration::hook_model(stl, sample, config);
+        Print print;
+        print.set_status_silent();
+        LoadCalibration::prepare_print(print, model, config);
+        REQUIRE(print.validate().string.empty());
+        print.process();
+        ScopedTemporaryFile file(".gcode");
+        print.export_gcode(file.string(), nullptr);
+        std::ifstream input(file.string());
+        std::string gcode((std::istreambuf_iterator<char>(input)), {});
+        REQUIRE(gcode.find("; sparse_infill_pattern = " + sample.value) != std::string::npos);
+        REQUIRE(gcode.find("; sparse_infill_density = " + sample.related.at("sparse_infill_density")) != std::string::npos);
+        ++exported;
+    }
+    REQUIRE(exported == 8);
+}

@@ -24,6 +24,7 @@ struct Sample
     Outcome outcome{Outcome::NotTested};
     std::optional<double> load_n, mass_g;
     std::string notes;
+    std::map<std::string, std::string> related;
 };
 struct Statistics
 {
@@ -33,7 +34,12 @@ struct Statistics
 };
 Statistics summarize(const std::vector<Sample>& samples, const std::string& value, const std::string& orientation);
 void validate_sample(const Sample& sample);
-std::vector<Sample> make_samples(const std::vector<std::string>& values, int repeats);
+std::vector<Sample> make_samples(const std::vector<std::string>& values,
+                                 int repeats,
+                                 const std::string& related_key                 = {},
+                                 const std::vector<std::string>& related_values = {});
+std::string sample_label(const Sample& sample);
+DynamicPrintConfig sample_config(const DynamicPrintConfig& baseline, const std::string& setting, const Sample& sample);
 // One hook per plate deliberately isolates thermal history and prevents replicate identity ambiguity.
 Model hook_model(const std::string& stl, const Sample& sample, const DynamicPrintConfig& config);
 void store_project(const std::string& path, Model& model, DynamicPrintConfig& config);

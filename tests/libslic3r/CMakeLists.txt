@@ -8,6 +8,8 @@ add_executable(${_TEST_NAME}_tests
     test_arachne_walls.cpp
     test_arrange.cpp
     test_bambu_networking.cpp
+    test_load_calibration.cpp
+    test_material_experiments.cpp
     test_calib.cpp
     test_clipper_offset.cpp
     test_clipper_utils.cpp
@@ -31,6 +33,7 @@ add_executable(${_TEST_NAME}_tests
     test_nozzle_volume_type.cpp
     test_step.cpp
     test_stl.cpp
+    test_strength_analysis.cpp
     test_triangle_selector.cpp
     test_meshboolean.cpp
     test_marchingsquares.cpp

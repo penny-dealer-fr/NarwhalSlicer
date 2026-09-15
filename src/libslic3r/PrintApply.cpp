@@ -560,10 +560,12 @@ static inline bool model_volume_solid_or_modifier(const ModelVolume &mv)
 
 static inline Transform3f trafo_for_bbox(const Transform3d &object_trafo, const Transform3d &volume_trafo)
 {
-    Transform3d m = object_trafo * volume_trafo;
+    // Ignore only the shared instance placement. Part/modifier offsets must remain in
+    // the same object frame or the broad-phase overlap test can discard a valid modifier.
+    Transform3d m = object_trafo;
     m.translation().x() = 0.;
     m.translation().y() = 0.;
-    return m.cast<float>();
+    return (m * volume_trafo).cast<float>();
 }
 
 static inline bool trafos_differ_in_rotation_by_z_and_mirroring_by_xy_only(const Transform3d &t1, const Transform3d &t2)

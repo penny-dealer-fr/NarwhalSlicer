@@ -69,6 +69,8 @@ set(SLIC3R_GUI_SOURCES
     GUI/calib_dlg.hpp
     GUI/Calibration.cpp
     GUI/Calibration.hpp
+    GUI/LoadCalibrationPanel.cpp
+    GUI/LoadCalibrationPanel.hpp
     GUI/CalibrationPanel.cpp
     GUI/CalibrationPanel.hpp
     GUI/CalibrationWizardCaliPage.cpp
@@ -337,6 +339,8 @@ set(SLIC3R_GUI_SOURCES
     GUI/LinuxDisplayBackend.hpp
     GUI/MainFrame.cpp
     GUI/MainFrame.hpp
+    GUI/StrengthAnalysisPanel.cpp
+    GUI/StrengthAnalysisPanel.hpp
     GUI/MarkdownTip.cpp
     GUI/MarkdownTip.hpp
     GUI/MediaFilePanel.cpp

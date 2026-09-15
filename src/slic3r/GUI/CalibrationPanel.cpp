@@ -3,6 +3,7 @@
 #include "GUI_App.hpp"
 #include "MainFrame.hpp"
 #include "CalibrationPanel.hpp"
+#include "LoadCalibrationPanel.hpp"
 #include "I18N.hpp"
 #include "SelectMachine.hpp"
 #include "SelectMachinePop.hpp"
@@ -498,6 +499,9 @@ void CalibrationPanel::init_tabpanel() {
     //auto padding_size = m_tabpanel->GetBtnsListCtrl()->GetPaddingSize(0);
     //m_tabpanel->GetBtnsListCtrl()->SetPaddingSize({ FromDIP(15), padding_size.y });
 
+    m_tabpanel->AddPage(new LoadCalibrationPanel(m_tabpanel), _L("Load"), false);
+    m_tabpanel->AddPage(new CalibratedMaterialsPanel(m_tabpanel), _L("Materials"), false);
+
     m_initialized = true;
 }
 
@@ -684,6 +688,7 @@ void CalibrationPanel::set_default()
 
 void CalibrationPanel::msw_rescale()
 {
+    if (auto* load = dynamic_cast<LoadCalibrationPanel*>(m_tabpanel->GetPage(CALI_MODE_COUNT))) load->rescale();
     for (int i = 0; i < (int)CALI_MODE_COUNT; i++) {
         m_cali_panels[i]->msw_rescale();
     }
@@ -691,6 +696,8 @@ void CalibrationPanel::msw_rescale()
 
 void CalibrationPanel::on_sys_color_changed()
 {
+    if (auto* load = dynamic_cast<LoadCalibrationPanel*>(m_tabpanel->GetPage(CALI_MODE_COUNT))) load->update_colors();
+    if (auto* materials = dynamic_cast<CalibratedMaterialsPanel*>(m_tabpanel->GetPage(CALI_MODE_COUNT + 1))) materials->update_colors();
     for (int i = 0; i < (int)CALI_MODE_COUNT; i++) {
         m_cali_panels[i]->on_sys_color_changed();
     }

@@ -379,7 +379,7 @@ void PhysicalPrinterDialog::build_printhost_settings(ConfigOptionsGroup* m_optgr
 
         line.widget = [ca_file_hint](wxWindow* parent) {
             std::string info = _u8L("HTTPS CA File") + ":\n\t" +
-                (boost::format(_u8L("On this system, %s uses HTTPS certificates from the system Certificate Store or Keychain.")) % SLIC3R_APP_NAME).str() +
+                (boost::format(_u8L("On this system, %s uses HTTPS certificates from the system Certificate Store or Keychain.")) % "NarwhalSlicer").str() +
                 "\n\t" + _u8L("To use a custom CA file, please import your CA file into Certificate Store / Keychain.");
 
             //auto txt = new wxStaticText(parent, wxID_ANY, from_u8((boost::format("%1%\n\n\t%2%") % info % ca_file_hint).str()));

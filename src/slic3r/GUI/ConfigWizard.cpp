@@ -499,10 +499,10 @@ PageWelcome::PageWelcome(ConfigWizard *parent)
 #else
             _utf8(L("Welcome to the %s Configuration Wizard"))
 #endif
-            ) % SLIC3R_APP_NAME).str()), _L("Welcome"))
+            ) % "NarwhalSlicer").str()), _L("Welcome"))
     , welcome_text(append_text(from_u8((boost::format(
         _utf8(L("Hello, welcome to %s! This %s helps you with the initial configuration; just a few settings and you will be ready to print.")))
-        % SLIC3R_APP_NAME
+        % "NarwhalSlicer"
         % _utf8(ConfigWizard::name())).str())
     ))
     , cbox_reset(append(
@@ -1474,7 +1474,7 @@ void PageTemperatures::apply_custom_config(DynamicPrintConfig& config)
 
 ConfigWizardIndex::ConfigWizardIndex(wxWindow *parent)
     : wxPanel(parent)
-    , bg(ScalableBitmap(parent, "OrcaSlicer_192px_transparent.png", 192))
+    , bg(ScalableBitmap(parent, "NarwhalSlicer.png", 192))
     , bullet_black(ScalableBitmap(parent, "bullet_black.png"))
     , bullet_blue(ScalableBitmap(parent, "bullet_blue.png"))
     , bullet_white(ScalableBitmap(parent, "bullet_white.png"))
@@ -2629,7 +2629,7 @@ bool ConfigWizard::priv::check_sla_selected()
 // Public
 
 ConfigWizard::ConfigWizard(wxWindow *parent)
-    : DPIDialog(parent, wxID_ANY, wxString(SLIC3R_APP_NAME) + " - " + _(name()), wxDefaultPosition, wxDefaultSize, wxDEFAULT_DIALOG_STYLE /*| wxRESIZE_BORDER*/)
+    : DPIDialog(parent, wxID_ANY, wxString("NarwhalSlicer") + " - " + _(name()), wxDefaultPosition, wxDefaultSize, wxDEFAULT_DIALOG_STYLE /*| wxRESIZE_BORDER*/)
     , p(new priv(this))
 {
     this->SetFont(wxGetApp().normal_font());

@@ -604,7 +604,7 @@ SendSystemInfoDialog::SendSystemInfoDialog(wxWindow* parent)
         if (semver.prerelease()) {
             is_beta = std::string{ semver.prerelease() }.find("beta") != std::string::npos;
         }
-        app_name = std::string(SLIC3R_APP_FULL_NAME) + " " + std::to_string(semver.maj())
+        app_name = std::string("Orca Slicer") + " " + std::to_string(semver.maj())
                                + "." + std::to_string(semver.min()) + " "
                                + (is_alpha ? "Alpha" : is_beta ? "Beta" : "");
     }
@@ -633,7 +633,7 @@ SendSystemInfoDialog::SendSystemInfoDialog(wxWindow* parent)
     wxString html = GUI::format_wxstr(
             "<html><body bgcolor=%1%><font color=%2%>"
             "<table><tr><td>"
-            "<img src = \"" + resources_dir() + "/images/OrcaSlicer_192px.png\" />"
+            "<img src = \"" + resources_dir() + "/images/NarwhalSlicer_192px.png\" />"
             "</td><td align=\"left\">"
             + text0 + "<br / ><br / >"
             + text1 + "<br /><br />"

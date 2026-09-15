@@ -105,6 +105,7 @@ body
 {
 	width: 18px;
 	height: 18px;
+	object-fit: contain;
 	flex: 0 0 auto;
 }
 
@@ -272,7 +273,9 @@ body
 
 #BBLIcon
 {
-	height:96px; /*ORCA use bigger icon to fit logo size*/
+	width: 96px;
+	height: 96px;
+	object-fit: contain;
 }
 
 #UserAvatarIcon
@@ -351,7 +354,7 @@ body
 {
 	width: 20px;
 	height: 20px;
-	border-radius: 5px;
+	object-fit: contain;
 	display: block;
 }
 

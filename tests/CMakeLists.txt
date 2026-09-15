@@ -75,6 +75,15 @@ endfunction()
 
 # Register Catch2 tags as CTest labels so `ctest -L`/`-LE` can filter by tag.
 function(orcaslicer_discover_tests TARGET)
+    # Catch discovery executes the just-linked binary. On macOS an unsigned or
+    # stale-signed executable can be killed before main, failing the build even
+    # though compilation/linking succeeded. Sign our local test executable first.
+    if (APPLE AND NOT CMAKE_CROSSCOMPILING)
+        add_custom_command(TARGET ${TARGET} POST_BUILD
+            COMMAND /usr/bin/codesign --force --sign - "$<TARGET_FILE:${TARGET}>"
+            COMMENT "Ad-hoc signing ${TARGET} before Catch2 discovery"
+            VERBATIM)
+    endif()
     catch_discover_tests(${TARGET} ADD_TAGS_AS_LABELS)
 endfunction()
 

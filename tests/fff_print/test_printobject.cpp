@@ -4,6 +4,8 @@
 #include "libslic3r/Print.hpp"
 #include "libslic3r/Layer.hpp"
 #include "libslic3r/GCodeReader.hpp"
+#include "libslic3r/StrengthAnalysis.hpp"
+#include "libslic3r/TriangleMeshSlicer.hpp"
 
 #include "test_helpers.hpp"
 
@@ -12,6 +14,164 @@
 
 using namespace Slic3r;
 using namespace Slic3r::Test;
+
+TEST_CASE("Resizing and removing strength modifiers updates generated infill", "[PrintObject][StrengthAnalysis]")
+{
+    namespace SA = Slic3r::StrengthAnalysis;
+    DynamicPrintConfig config = DynamicPrintConfig::full_print_config();
+    config.set_deserialize_strict({
+        {"layer_height", 0.3}, {"initial_layer_print_height", 0.3}, {"nozzle_diameter", 0.4},
+        {"sparse_infill_density", 20}, {"sparse_infill_pattern", "rectilinear"},
+        {"wall_loops", 1}, {"top_shell_layers", 0}, {"bottom_shell_layers", 0},
+        {"top_shell_thickness", 0}, {"bottom_shell_thickness", 0}
+    });
+    Print print;
+    Model model;
+    init_print({cube(20)}, print, model, config);
+    ModelObject &object = *model.objects.front();
+    const int scale_case = GENERATE(0, 1, 2);
+    const Vec3d geometry_scale = scale_case == 0 ? Vec3d::Ones() :
+        (scale_case == 1 ? Vec3d(2.0, 2.0, 2.0) : Vec3d(2.0, 0.5, 1.5));
+    object.instances.front()->set_scaling_factor(geometry_scale);
+    object.invalidate_bounding_box();
+    object.ensure_on_bed();
+    CAPTURE(scale_case, geometry_scale.x(), geometry_scale.y(), geometry_scale.z());
+    const double physical_volume_mm3 = 8000.0 * geometry_scale.prod();
+    const indexed_triangle_set mesh = object.raw_mesh().its;
+    SA::Setup setup;
+    setup.geometry_scale = geometry_scale;
+    // Once a response has been solved, either orientation mode uses the same native
+    // reinforcement/slicing path; changing the mode must not suppress its modifier.
+    setup.follow_prepare_orientation = GENERATE(true, false);
+    setup.infill.background_pattern = SA::InfillPattern::Rectilinear;
+    setup.infill.background_density = 0.2;
+    setup.infill.dense_pattern = SA::InfillPattern::Gyroid;
+    setup.infill.dense_density = 0.65;
+    SA::Result result;
+    result.geometry_scale = geometry_scale;
+    result.status = SA::AnalysisStatus::Success;
+    result.vertices.resize(mesh.vertices.size());
+    for (size_t i = 0; i < result.vertices.size(); ++i) {
+        result.vertices[i].position_mm = mesh.vertices[i].cast<double>();
+        result.vertices[i].von_mises_pa = i == 0 ? 2e6 : 1e6;
+        result.vertices[i].safety_factor = i == 0 ? 1.0 : 2.0;
+    }
+    const SA::DenseRegionPreviewProfile profile = SA::build_dense_region_preview_profile(mesh, result);
+    REQUIRE(profile.available);
+
+    struct SlicedInfill { double volume_mm3{0.0}; double dense_volume_mm3{0.0}; };
+    const auto slice_infill = [&]() {
+        print.apply(model, config);
+        print.process();
+        const ModelObject &sliced_object = *model.objects.front();
+        if (scale_case == 2 && sliced_object.volumes.size() == 2) {
+            MeshSlicingParamsEx parameters;
+            parameters.trafo = sliced_object.instances.front()->get_matrix();
+            std::vector<float> planes;
+            for (const Layer *layer : print.objects().front()->layers())
+                planes.push_back(float(layer->slice_z));
+            const auto mask_slices = slice_mesh_ex(sliced_object.volumes.back()->mesh().its, planes, parameters);
+            double mask_volume = 0.0;
+            for (size_t layer = 0; layer < mask_slices.size(); ++layer)
+                for (const auto &polygon : mask_slices[layer])
+                    mask_volume += polygon.area() * SCALING_FACTOR * SCALING_FACTOR * print.objects().front()->layers()[layer]->height;
+            CHECK_THAT(mask_volume,
+                       Catch::Matchers::WithinAbs(std::abs(its_volume(sliced_object.volumes.back()->mesh().its)) *
+                           geometry_scale.prod(), physical_volume_mm3 * 0.02));
+        }
+        SlicedInfill sliced;
+        for (const Layer *layer : print.objects().front()->layers()) {
+            for (const LayerRegion *region : layer->regions()) {
+                sliced.volume_mm3 += region->fills.total_volume();
+                if (region->region().config().sparse_infill_density.value > 20.0) {
+                    CHECK_THAT(region->region().config().sparse_infill_density.value,
+                               Catch::Matchers::WithinAbs(65.0, 1e-8));
+                    CHECK(region->region().config().sparse_infill_pattern.value == ipGyroid);
+                    for (const Surface &surface : region->slices.surfaces)
+                        sliced.dense_volume_mm3 += surface.expolygon.area() * SCALING_FACTOR * SCALING_FACTOR * layer->height;
+                }
+            }
+        }
+        return sliced;
+    };
+    const auto apply_preview = [&](double fraction) {
+        const auto preview = SA::preview_dense_region(mesh, setup, result, fraction, &profile, true, 0.0);
+        REQUIRE(preview.applicable());
+        CHECK_THAT(preview.estimated_volume_m3 * 1e9 / physical_volume_mm3,
+                   Catch::Matchers::WithinAbs(preview.estimated_volume_fraction, 1e-8));
+        // Use the same native parameter volume, coordinates, and keys as the GUI apply action.
+        REQUIRE_FALSE(preview.modifier_mesh.empty());
+        std::map<std::pair<int, int>, size_t> edge_counts;
+        double signed_volume = 0.0;
+        for (const auto &face : preview.modifier_mesh.indices) {
+            const Vec3d a = preview.modifier_mesh.vertices[face[0]].cast<double>();
+            const Vec3d b = preview.modifier_mesh.vertices[face[1]].cast<double>();
+            const Vec3d c = preview.modifier_mesh.vertices[face[2]].cast<double>();
+            signed_volume += a.dot(b.cross(c)) / 6.0;
+            for (int edge = 0; edge < 3; ++edge) {
+                int first = face[edge], second = face[(edge + 1) % 3];
+                if (first > second) std::swap(first, second);
+                ++edge_counts[{first, second}];
+            }
+        }
+        CHECK_THAT(std::abs(signed_volume) * geometry_scale.prod() / physical_volume_mm3,
+                   Catch::Matchers::WithinAbs(preview.estimated_volume_fraction, 1e-6));
+        const size_t nonmanifold_edges = std::count_if(edge_counts.begin(), edge_counts.end(),
+            [](const auto &edge) { return edge.second != 2; });
+        INFO("Mask fraction " << fraction);
+        CHECK(nonmanifold_edges == 0);
+        auto *modifier = object.add_volume(TriangleMesh(preview.modifier_mesh), ModelVolumeType::PARAMETER_MODIFIER, false);
+        modifier->set_transformation(Geometry::Transformation());
+        modifier->config.set_key_value("sparse_infill_density", new ConfigOptionPercent(65.0));
+        modifier->config.set_key_value("sparse_infill_pattern", new ConfigOptionEnum<InfillPattern>(ipGyroid));
+        modifier->config.set_key_value("strength_analysis_modifier", new ConfigOptionBool(true));
+        object.config.set_key_value("sparse_infill_density", new ConfigOptionPercent(20.0));
+        object.config.set_key_value("sparse_infill_pattern", new ConfigOptionEnum<InfillPattern>(ipRectilinear));
+        // Keep two volumes alive during replacement: deleting first collapses the remaining
+        // part transform into its instances and changes the preview's object coordinate frame.
+        if (object.volumes.size() > 2)
+            object.delete_volume(1);
+        REQUIRE(object.volumes.size() == 2);
+        CHECK(object.raw_mesh().its.vertices == mesh.vertices);
+    };
+
+    const SlicedInfill baseline = slice_infill();
+    REQUIRE(baseline.volume_mm3 > 0.0);
+    CHECK_THAT(baseline.dense_volume_mm3, Catch::Matchers::WithinAbs(0.0, 1e-8));
+    apply_preview(0.15);
+    const SlicedInfill small = slice_infill();
+    CHECK_THAT(small.dense_volume_mm3 / physical_volume_mm3, Catch::Matchers::WithinAbs(0.15, 0.02));
+    CHECK(small.volume_mm3 > baseline.volume_mm3);
+    apply_preview(0.50);
+    const SlicedInfill large = slice_infill();
+    CHECK_THAT(large.dense_volume_mm3 / physical_volume_mm3, Catch::Matchers::WithinAbs(0.50, 0.02));
+    CHECK(large.dense_volume_mm3 > small.dense_volume_mm3);
+    CHECK(large.volume_mm3 > small.volume_mm3);
+    apply_preview(1.0);
+    const SlicedInfill full = slice_infill();
+    CHECK_THAT(full.dense_volume_mm3 / physical_volume_mm3, Catch::Matchers::WithinAbs(1.0, 0.02));
+    CHECK(full.volume_mm3 > large.volume_mm3);
+    const Model reinforced_snapshot = model;
+    const auto part_transform = object.volumes.front()->get_transformation();
+    const auto instance_transform = object.instances.front()->get_transformation();
+    object.delete_volume(1);
+    object.volumes.front()->set_transformation(part_transform);
+    object.instances.front()->set_transformation(instance_transform);
+    object.invalidate_bounding_box();
+    CHECK(object.raw_mesh().its.vertices == mesh.vertices);
+    const SlicedInfill removed = slice_infill();
+    CHECK_THAT(removed.dense_volume_mm3, Catch::Matchers::WithinAbs(0.0, 1e-8));
+    CHECK_THAT(removed.volume_mm3, Catch::Matchers::WithinRel(baseline.volume_mm3, 1e-6));
+    const Model removed_snapshot = model;
+    // Model restoration (as used by main Undo/Redo) must invalidate the same sliced regions.
+    model = reinforced_snapshot;
+    const SlicedInfill restored = slice_infill();
+    CHECK_THAT(restored.dense_volume_mm3, Catch::Matchers::WithinRel(full.dense_volume_mm3, 1e-6));
+    CHECK_THAT(restored.volume_mm3, Catch::Matchers::WithinRel(full.volume_mm3, 1e-6));
+    model = removed_snapshot;
+    const SlicedInfill redone = slice_infill();
+    CHECK_THAT(redone.volume_mm3, Catch::Matchers::WithinRel(baseline.volume_mm3, 1e-6));
+}
 
 SCENARIO("Object layer heights", "[PrintObject]") {
     GIVEN("A 20mm cube") {
@@ -129,4 +289,58 @@ TEST_CASE("Initial layer height is honored", "[PrintObject]")
     REQUIRE(layer_zs.size() > 1);
     REQUIRE_THAT(*layer_zs.begin(),            Catch::Matchers::WithinAbs(0.3, 1e-4));
     REQUIRE_THAT(*std::next(layer_zs.begin()), Catch::Matchers::WithinAbs(0.5, 1e-4));
+}
+
+TEST_CASE("Slicing polygonal density bands retains independent infill settings", "[PrintObject][StrengthAnalysis][DensityRegions]")
+{
+    namespace SA = Slic3r::StrengthAnalysis;
+    auto config = DynamicPrintConfig::full_print_config();
+    config.set_deserialize_strict({{"layer_height", 0.3}, {"initial_layer_print_height", 0.3}, {"nozzle_diameter", 0.4},
+        {"sparse_infill_density", 20}, {"sparse_infill_pattern", "gyroid"}, {"wall_loops", 1},
+        {"top_shell_layers", 0}, {"bottom_shell_layers", 0}, {"top_shell_thickness", 0}, {"bottom_shell_thickness", 0}});
+    Print print;
+    Model model;
+    init_print({cube(20)}, print, model, config);
+    auto &object = *model.objects.front();
+    const auto mesh = object.raw_mesh().its;
+    SA::Setup setup;
+    setup.infill.dense_density = 0.8;
+    setup.infill.intermediate_densities = {0.5, 0.3};
+    SA::Result result;
+    result.status = SA::AnalysisStatus::Success;
+    for (size_t i = 0; i < mesh.vertices.size(); ++i) {
+        SA::VertexResult vertex;
+        vertex.position_mm = mesh.vertices[i].cast<double>();
+        vertex.von_mises_pa = i == 0 ? 2e6 : 1e6;
+        vertex.safety_factor = i == 0 ? 1.0 : 2.0;
+        result.vertices.push_back(vertex);
+    }
+    const auto profile = SA::build_dense_region_preview_profile(mesh, result, {}, 12);
+    const auto preview = SA::preview_dense_region(mesh, setup, result, 0.35, &profile);
+    INFO(preview.warning);
+    REQUIRE(preview.available);
+    std::set<int> expected;
+    for (const auto &layer : preview.layers) {
+        if (layer.mesh.empty()) continue;
+        auto *volume = object.add_volume(TriangleMesh(layer.mesh), ModelVolumeType::PARAMETER_MODIFIER, false);
+        volume->config.set_key_value("sparse_infill_density", new ConfigOptionPercent(layer.density * 100));
+        volume->config.set_key_value("sparse_infill_pattern", new ConfigOptionEnum<InfillPattern>(ipGyroid));
+        volume->config.set_key_value("strength_analysis_modifier", new ConfigOptionBool(true));
+        expected.insert(int(std::lround(layer.density * 100)));
+    }
+    REQUIRE(expected.size() >= 2);
+    print.apply(model, config);
+    const auto output = gcode(print);
+    CHECK_FALSE(output.empty());
+    std::set<int> observed;
+    double filled_volume = 0.0;
+    for (const auto *layer : print.objects().front()->layers())
+        for (const auto *region : layer->regions()) {
+            const int density = int(std::lround(region->region().config().sparse_infill_density.value));
+            if (region->fills.total_volume() <= 0.0) continue;
+            filled_volume += region->fills.total_volume();
+            if (density > 20) observed.insert(density);
+        }
+    CHECK(observed == expected);
+    CHECK(filled_volume > 0.0);
 }
